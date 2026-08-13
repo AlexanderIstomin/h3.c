@@ -147,6 +147,76 @@ int h3_schedule_build(int steps, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+/* Regularized incomplete beta via Lentz's continued fraction, and its
+ * inverse by bisection. Only exercised at schedule build time. */
+static double h3_betacf(double a, double b, double x) {
+    const double tiny = 1e-30;
+    double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+    double c = 1.0, d = 1.0 - qab * x / qap;
+    if (fabs(d) < tiny) d = tiny;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= 200; m++) {
+        double m2 = 2.0 * m;
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;
+        if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if (fabs(d) < tiny) d = tiny;
+        c = 1.0 + aa / c;
+        if (fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        double delta = d * c;
+        h *= delta;
+        if (fabs(delta - 1.0) < 3e-9) break;
+    }
+    return h;
+}
+
+static double h3_betai(double a, double b, double x) {
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    double bt = exp(lgamma(a + b) - lgamma(a) - lgamma(b) +
+                    a * log(x) + b * log(1.0 - x));
+    if (x < (a + 1.0) / (a + b + 2.0)) return bt * h3_betacf(a, b, x) / a;
+    return 1.0 - bt * h3_betacf(b, a, 1.0 - x) / b;
+}
+
+static double h3_betai_inverse(double a, double b, double target) {
+    double low = 0.0, high = 1.0;
+    for (int iteration = 0; iteration < 80; iteration++) {
+        double middle = 0.5 * (low + high);
+        if (h3_betai(a, b, middle) < target) low = middle;
+        else high = middle;
+    }
+    return 0.5 * (low + high);
+}
+
+static float h3_shift_base(double base, double shift) {
+    return (float)(shift * base / (1.0 + (shift - 1.0) * base));
+}
+
+int h3_beta_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = evaluations;
+    const double alpha = 0.6, beta = 0.6;
+    for (int index = 0; index < evaluations; index++) {
+        double quantile = 1.0 - (double)index / (double)evaluations;
+        double base = h3_betai_inverse(alpha, beta, quantile);
+        schedule->video[index] = h3_shift_base(base, H3_VIDEO_SIGMA_SHIFT);
+        schedule->audio[index] = h3_shift_base(base, H3_AUDIO_SIGMA_SHIFT);
+    }
+    schedule->video[evaluations] = 0.0f;
+    schedule->audio[evaluations] = 0.0f;
+    return 1;
+}
+
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     if (!schedule || evaluations < 2 || evaluations > H3_MAX_STEPS) return 0;
     memset(schedule, 0, sizeof(*schedule));
