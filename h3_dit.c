@@ -35,25 +35,33 @@ typedef struct {
     h3_gpu_tensor *qkv;
     h3_gpu_tensor *qkv_int8;
     h3_gpu_tensor *qkv_scales;
+    uint32_t qkv_convrot_group;
     h3_gpu_tensor *q_norm;
     h3_gpu_tensor *k_norm;
     h3_gpu_tensor *out;
     h3_gpu_tensor *out_int8;
     h3_gpu_tensor *out_scales;
+    uint32_t out_convrot_group;
     h3_gpu_tensor *fc1;
     h3_gpu_tensor *fc2;
     h3_gpu_tensor *fc1_int8;
     h3_gpu_tensor *fc1_scales;
+    uint32_t fc1_convrot_group;
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
+    uint32_t fc2_convrot_group;
 } h3_dit_block;
 
 enum {
     STREAM_QKV,
+    STREAM_QKV_SCALES,
     STREAM_OUT,
+    STREAM_OUT_SCALES,
     STREAM_FC1,
+    STREAM_FC1_SCALES,
     STREAM_FC2,
-    STREAM_MATRICES
+    STREAM_FC2_SCALES,
+    STREAM_TENSORS
 };
 
 typedef struct {
@@ -61,10 +69,12 @@ typedef struct {
     uint64_t file_offset;
     size_t elements;
     unsigned field;
+    h3_dtype dtype;
 } h3_dit_stream_source;
 
 typedef struct {
-    h3_dit_stream_source sources[STREAM_MATRICES];
+    h3_dit_stream_source sources[STREAM_TENSORS];
+    unsigned count;
 } h3_dit_stream_layer;
 
 struct h3_dit {
@@ -76,6 +86,7 @@ struct h3_dit {
     int int8_mlp;
     int int8_qkv;
     int int8_attention_out;
+    int prequantized_int8;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
     int use_slower_row_major_attention_output;
@@ -542,6 +553,34 @@ static int load_block_norms(h3_dit *dit, h3_dit_block *block,
     return 1;
 }
 
+static int load_prequantized_block(h3_dit *dit, h3_dit_block *block,
+                                   const char *prefix,
+                                   char *error, size_t error_size) {
+    char name[160];
+    if (!load_block_norms(dit, block, prefix, error, error_size)) return 0;
+#define LOAD_I8(weight_field, scale_field, group_field, suffix, rows, columns) \
+do {                                                                            \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
+    if (!h3_weight_load_i8_linear(dit->weights, dit->gpu, name, rows, columns, \
+                                  &block->weight_field, &block->scale_field,    \
+                                  error, error_size) ||                         \
+        !h3_weight_i8_linear_convrot_group(                                    \
+            dit->weights, name, &block->group_field, error, error_size))       \
+        return 0;                                                               \
+} while (0)
+    LOAD_I8(qkv_int8, qkv_scales, qkv_convrot_group,
+            "attn.qkv_proj.weight",
+            INNER * 3, HIDDEN);
+    LOAD_I8(out_int8, out_scales, out_convrot_group,
+            "attn.out_proj.weight", HIDDEN, INNER);
+    LOAD_I8(fc1_int8, fc1_scales, fc1_convrot_group,
+            "mlp.fc1.weight", FFN * 2, HIDDEN);
+    LOAD_I8(fc2_int8, fc2_scales, fc2_convrot_group,
+            "mlp.fc2.weight", HIDDEN, FFN);
+#undef LOAD_I8
+    return 1;
+}
+
 static void free_block(h3_dit_block *block) {
     free_tensor(&block->norm1);
     free_tensor(&block->norm2);
@@ -578,8 +617,9 @@ static int compare_stream_sources(const void *left, const void *right) {
 
 static int prepare_stream_source(h3_dit *dit,
                                  h3_dit_stream_source *source,
-                                 const char *name, uint64_t rows,
-                                 uint64_t columns, unsigned field,
+                                 const char *name, h3_dtype dtype,
+                                 int ndim, const uint64_t *shape,
+                                 unsigned field,
                                  char *error, size_t error_size) {
     const h3_st_header *header = NULL;
     const h3_st_tensor *tensor = h3_weight_find(dit->weights, name, &header);
@@ -588,64 +628,168 @@ static int prepare_stream_source(h3_dit *dit,
              name);
         return 0;
     }
-    if (!header || tensor->dtype != H3_DTYPE_BF16 || tensor->ndim != 2 ||
-        tensor->shape[0] != rows || tensor->shape[1] != columns ||
-        rows > SIZE_MAX / columns) {
+    if (!header || tensor->dtype != dtype || tensor->ndim != ndim) {
         fail(error, error_size, "streaming weight has the wrong schema: %s",
              name);
         return 0;
     }
+    uint64_t elements = 1;
+    for (int dimension = 0; dimension < ndim; dimension++) {
+        if (tensor->shape[dimension] != shape[dimension] ||
+            (shape[dimension] && elements > UINT64_MAX / shape[dimension])) {
+            fail(error, error_size,
+                 "streaming weight has the wrong schema: %s", name);
+            return 0;
+        }
+        elements *= shape[dimension];
+    }
+    if (elements > SIZE_MAX) {
+        fail(error, error_size, "streaming weight is too large: %s", name);
+        return 0;
+    }
     source->path = header->path;
     source->file_offset = tensor->file_offset;
-    source->elements = (size_t)(rows * columns);
+    source->elements = (size_t)elements;
     source->field = field;
+    source->dtype = dtype;
     return 1;
+}
+
+static int prepare_prequantized_stream_linear(
+                                 h3_dit *dit, h3_dit_stream_layer *stream,
+                                 const char *weight_name,
+                                 uint64_t rows, uint64_t columns,
+                                 unsigned weight_field, unsigned scale_field,
+                                 uint32_t *convrot_group,
+                                 char *error, size_t error_size) {
+    if (stream->count + 2 > STREAM_TENSORS) {
+        fail(error, error_size, "too many tensors in DiT stream layer");
+        return 0;
+    }
+    const uint64_t weight_shape[] = {rows, columns};
+    if (!prepare_stream_source(
+            dit, &stream->sources[stream->count++], weight_name,
+            H3_DTYPE_I8, 2, weight_shape, weight_field,
+            error, error_size)) return 0;
+    char scale_name[192];
+    int length = snprintf(scale_name, sizeof(scale_name), "%s_scale",
+                          weight_name);
+    if (length < 0 || (size_t)length >= sizeof(scale_name)) {
+        fail(error, error_size, "DiT stream scale name is too long");
+        return 0;
+    }
+    const h3_st_tensor *scale = h3_weight_find(
+        dit->weights, scale_name, NULL);
+    const uint64_t scale_shape_1d[] = {rows};
+    const uint64_t scale_shape_2d[] = {rows, 1};
+    if (!scale || scale->dtype != H3_DTYPE_F32 ||
+        !((scale->ndim == 1 && scale->shape[0] == rows) ||
+          (scale->ndim == 2 && scale->shape[0] == rows &&
+           scale->shape[1] == 1)) ||
+        !prepare_stream_source(
+            dit, &stream->sources[stream->count++], scale_name,
+            H3_DTYPE_F32, scale->ndim,
+            scale->ndim == 1 ? scale_shape_1d : scale_shape_2d,
+            scale_field, error, error_size)) {
+        if (!error || !error[0])
+            fail(error, error_size,
+                 "streaming scale has the wrong schema: %s", scale_name);
+        return 0;
+    }
+    return h3_weight_i8_linear_convrot_group(
+        dit->weights, weight_name, convrot_group, error, error_size);
 }
 
 static int prepare_stream_layer(h3_dit *dit, unsigned layer,
                                 char *error, size_t error_size) {
     char name[160];
     h3_dit_stream_layer *stream = &dit->stream_layers[layer];
-#define SOURCE(index, suffix, rows, columns, field) do {                        \
+    memset(stream, 0, sizeof(*stream));
+    if (dit->prequantized_int8) {
+#define I8_SOURCE(suffix, rows, columns, weight_field, scale_field, group) do { \
     snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);              \
-    if (!prepare_stream_source(dit, &stream->sources[index], name,             \
-                               rows, columns, field, error, error_size))        \
+    if (!prepare_prequantized_stream_linear(                                  \
+            dit, stream, name, rows, columns, weight_field, scale_field,      \
+            &dit->blocks[layer].group, error, error_size)) return 0;           \
+} while (0)
+        I8_SOURCE("attn.qkv_proj.weight", INNER * 3, HIDDEN,
+                  STREAM_QKV, STREAM_QKV_SCALES, qkv_convrot_group);
+        I8_SOURCE("attn.out_proj.weight", HIDDEN, INNER,
+                  STREAM_OUT, STREAM_OUT_SCALES, out_convrot_group);
+        I8_SOURCE("mlp.fc1.weight", FFN * 2, HIDDEN,
+                  STREAM_FC1, STREAM_FC1_SCALES, fc1_convrot_group);
+        I8_SOURCE("mlp.fc2.weight", HIDDEN, FFN,
+                  STREAM_FC2, STREAM_FC2_SCALES, fc2_convrot_group);
+#undef I8_SOURCE
+    } else {
+#define SOURCE(suffix, rows, columns, field) do {                               \
+    snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);              \
+    const uint64_t shape[] = {rows, columns};                                  \
+    if (!prepare_stream_source(dit, &stream->sources[stream->count++], name,   \
+                               H3_DTYPE_BF16, 2, shape, field,                 \
+                               error, error_size))                             \
         return 0;                                                               \
 } while (0)
-    SOURCE(0, "attn.qkv_proj.weight", INNER * 3, HIDDEN, STREAM_QKV);
-    SOURCE(1, "attn.out_proj.weight", HIDDEN, INNER, STREAM_OUT);
-    SOURCE(2, "mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1);
-    SOURCE(3, "mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2);
+        SOURCE("attn.qkv_proj.weight", INNER * 3, HIDDEN, STREAM_QKV);
+        SOURCE("attn.out_proj.weight", HIDDEN, INNER, STREAM_OUT);
+        SOURCE("mlp.fc1.weight", FFN * 2, HIDDEN, STREAM_FC1);
+        SOURCE("mlp.fc2.weight", HIDDEN, FFN, STREAM_FC2);
 #undef SOURCE
-    qsort(stream->sources, STREAM_MATRICES, sizeof(stream->sources[0]),
+    }
+    qsort(stream->sources, stream->count, sizeof(stream->sources[0]),
           compare_stream_sources);
     return 1;
 }
 
 static int allocate_stream_slot(h3_dit *dit, h3_dit_block *slot,
                                 char *error, size_t error_size) {
-    slot->qkv = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)INNER * 3 * HIDDEN);
-    slot->out = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)HIDDEN * INNER);
-    slot->fc1 = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)FFN * 2 * HIDDEN);
-    slot->fc2 = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)HIDDEN * FFN);
-    if (!slot->qkv || !slot->out || !slot->fc1 || !slot->fc2) {
-        fail(error, error_size, "cannot allocate BF16 SSD layer slot: %s",
-             h3_gpu_error(dit->gpu));
-        return 0;
+    if (dit->prequantized_int8) {
+        slot->qkv_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)INNER * 3 * HIDDEN);
+        slot->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
+        slot->out_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * INNER);
+        slot->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+        slot->fc1_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)FFN * 2 * HIDDEN);
+        slot->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
+        slot->fc2_int8 = h3_gpu_tensor_new_i8(
+            dit->gpu, (size_t)HIDDEN * FFN);
+        slot->fc2_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
+        if (slot->qkv_int8 && slot->qkv_scales &&
+            slot->out_int8 && slot->out_scales &&
+            slot->fc1_int8 && slot->fc1_scales &&
+            slot->fc2_int8 && slot->fc2_scales) return 1;
+    } else {
+        slot->qkv = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)INNER * 3 * HIDDEN);
+        slot->out = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)HIDDEN * INNER);
+        slot->fc1 = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)FFN * 2 * HIDDEN);
+        slot->fc2 = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)HIDDEN * FFN);
+        if (slot->qkv && slot->out && slot->fc1 && slot->fc2) return 1;
     }
-    return 1;
+    fail(error, error_size, "cannot allocate bounded DiT layer slot: %s",
+             h3_gpu_error(dit->gpu));
+    return 0;
 }
 
 static h3_gpu_tensor *stream_slot_target(h3_dit_block *slot,
-                                         unsigned field) {
-    if (field == STREAM_QKV) return slot->qkv;
-    if (field == STREAM_OUT) return slot->out;
-    if (field == STREAM_FC1) return slot->fc1;
-    if (field == STREAM_FC2) return slot->fc2;
+                                         unsigned field, h3_dtype dtype) {
+    if (field == STREAM_QKV)
+        return dtype == H3_DTYPE_I8 ? slot->qkv_int8 : slot->qkv;
+    if (field == STREAM_QKV_SCALES) return slot->qkv_scales;
+    if (field == STREAM_OUT)
+        return dtype == H3_DTYPE_I8 ? slot->out_int8 : slot->out;
+    if (field == STREAM_OUT_SCALES) return slot->out_scales;
+    if (field == STREAM_FC1)
+        return dtype == H3_DTYPE_I8 ? slot->fc1_int8 : slot->fc1;
+    if (field == STREAM_FC1_SCALES) return slot->fc1_scales;
+    if (field == STREAM_FC2)
+        return dtype == H3_DTYPE_I8 ? slot->fc2_int8 : slot->fc2;
+    if (field == STREAM_FC2_SCALES) return slot->fc2_scales;
     return NULL;
 }
 
@@ -666,19 +810,33 @@ static int read_stream_layer(h3_dit_stream_job *job) {
     job->ok = 1;
     job->bytes = 0;
     job->error[0] = '\0';
-    for (unsigned index = 0; index < STREAM_MATRICES; index++) {
+    for (unsigned index = 0; index < layer->count; index++) {
         const h3_dit_stream_source *source = &layer->sources[index];
-        h3_gpu_tensor *target = stream_slot_target(slot, source->field);
-        if (!target || !h3_gpu_tensor_stream_file_bf16(
+        h3_gpu_tensor *target = stream_slot_target(
+            slot, source->field, source->dtype);
+        int ok = 0;
+        if (target && source->dtype == H3_DTYPE_BF16)
+            ok = h3_gpu_tensor_stream_file_bf16(
                 target, source->path, source->file_offset, source->elements,
-                job->error, sizeof(job->error))) {
+                job->error, sizeof(job->error));
+        else if (target && source->dtype == H3_DTYPE_I8)
+            ok = h3_gpu_tensor_stream_file_i8(
+                target, source->path, source->file_offset, source->elements,
+                job->error, sizeof(job->error));
+        else if (target && source->dtype == H3_DTYPE_F32)
+            ok = h3_gpu_tensor_read_file_f32(
+                target, source->path, source->file_offset, source->elements,
+                job->error, sizeof(job->error));
+        if (!ok) {
             if (!job->error[0])
                 snprintf(job->error, sizeof(job->error),
-                         "invalid BF16 streaming destination");
+                         "invalid %s streaming destination",
+                         h3_dtype_name(source->dtype));
             job->ok = 0;
             break;
         }
-        job->bytes += (uint64_t)source->elements * sizeof(uint16_t);
+        job->bytes += (uint64_t)source->elements *
+                      h3_dtype_size(source->dtype);
     }
     job->seconds = stream_now() - started;
     return job->ok;
@@ -1248,7 +1406,17 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         }
         char prefix[64];
         snprintf(prefix, sizeof(prefix), "blocks.%u.", index);
-        if (dit->ssd_streaming) {
+        if (dit->prequantized_int8) {
+            if (dit->ssd_streaming) {
+                if (!load_block_norms(
+                        dit, &dit->blocks[index], prefix,
+                        error, error_size) ||
+                    !prepare_stream_layer(dit, index, error, error_size))
+                    return 0;
+            } else if (!load_prequantized_block(
+                    dit, &dit->blocks[index], prefix,
+                    error, error_size)) return 0;
+        } else if (dit->ssd_streaming) {
             if (!load_block_norms(dit, &dit->blocks[index], prefix,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
@@ -1475,12 +1643,14 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    if (!dit->fused_mlp) {
+    if (!dit->fused_mlp || dit->prequantized_int8) {
         dit->fc1 = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN * 2);
     }
-    if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp) {
+    if (!dit->fused_mlp || dit->nax_mlp || dit->int8_mlp ||
+        dit->prequantized_int8) {
         dit->activated = h3_gpu_tensor_new_bf16(dit->gpu, sequence * FFN);
-        if ((!dit->fused_mlp && !dit->fc1) || !dit->activated) {
+        if (((!dit->fused_mlp || dit->prequantized_int8) && !dit->fc1) ||
+            !dit->activated) {
             fail(error, error_size,
                  "cannot allocate diagnostic DiT MLP tensors: %s",
                  h3_gpu_error(dit->gpu));
@@ -1627,16 +1797,28 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
+    const h3_st_tensor *core_qkv = h3_weight_find(
+        dit->weights, "blocks.0.attn.qkv_proj.weight", NULL);
+    if (!core_qkv || (core_qkv->dtype != H3_DTYPE_BF16 &&
+                      core_qkv->dtype != H3_DTYPE_I8)) {
+        fail(error, error_size,
+             "DiT core QKV must use BF16 or pre-quantized I8 weights");
+        goto failed;
+    }
+    dit->prequantized_int8 = core_qkv->dtype == H3_DTYPE_I8;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
-    dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
+    dit->int8_mlp = !dit->prequantized_int8 && !dit->ssd_streaming &&
+                    dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->ssd_streaming && !use_slower_bf16_qkv &&
+    dit->int8_qkv = !dit->prequantized_int8 && !dit->ssd_streaming &&
+                    !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_attention_out = !dit->ssd_streaming &&
+    dit->int8_attention_out = !dit->prequantized_int8 &&
+                              !dit->ssd_streaming &&
                               !use_slower_bf16_attention_output &&
                               dit->sequence >= 128 &&
                               h3_gpu_has_int8_mlp(dit->gpu);
@@ -1898,7 +2080,27 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
-    if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
+    if (dit->prequantized_int8) {
+        if (weight->qkv_convrot_group)
+            OP(h3_gpu_convrot_bf16(
+                dit->gpu, dit->mod_attention, dit->mod_attention,
+                rows, HIDDEN, weight->qkv_convrot_group),
+               "DiT QKV ConvRot");
+        OP(h3_gpu_linear_i8_weight_bf16(
+            dit->gpu, dit->qkv, dit->mod_attention,
+            weight->qkv_int8, weight->qkv_scales, NULL,
+            rows, HIDDEN, INNER * 3), "DiT pre-quantized QKV projection");
+        /* Comfy's compact checkpoint preserves the projection's ordinary
+         * [Q-all-heads | K-all-heads | V-all-heads] row order.  The released
+         * MiniMax tree uses the per-head interleaved order handled by the
+         * grouped helper below, but applying that interpretation here mixes
+         * Q, K, and V rows and leaves denoising as structured noise. */
+        OP(h3_gpu_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin,
+            rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "DiT pre-quantized QKV norm/RoPE");
+    } else if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
             dit->int8_activation, dit->int8_activation_scales,
@@ -1933,7 +2135,18 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
-    if (int8_attention_output) {
+    if (dit->prequantized_int8) {
+        if (weight->out_convrot_group)
+            OP(h3_gpu_convrot_bf16(
+                dit->gpu, dit->attention_heads, dit->attention_heads,
+                rows, INNER, weight->out_convrot_group),
+               "DiT attention-output ConvRot");
+        OP(h3_gpu_linear_i8_weight_bf16(
+            dit->gpu, dit->attention_output, dit->attention_heads,
+            weight->out_int8, weight->out_scales, NULL,
+            rows, INNER, HIDDEN),
+           "DiT pre-quantized attention output");
+    } else if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
                 dit->gpu, dit->attention_output, dit->int8_activation,
@@ -1982,7 +2195,29 @@ static int run_block(h3_dit *dit, unsigned index, int step,
     }
     h3_gpu_tensor *mlp_output = dit->activation_aliases ?
         dit->attention_output : dit->mlp_output;
-    if (dit->int8_mlp &&
+    if (dit->prequantized_int8) {
+        if (weight->fc1_convrot_group)
+            OP(h3_gpu_convrot_bf16(
+                dit->gpu, dit->mod_mlp, dit->mod_mlp,
+                rows, HIDDEN, weight->fc1_convrot_group),
+               "DiT FC1 ConvRot");
+        OP(h3_gpu_linear_i8_weight_bf16(
+            dit->gpu, dit->fc1, dit->mod_mlp,
+            weight->fc1_int8, weight->fc1_scales, NULL,
+            rows, HIDDEN, FFN * 2), "DiT pre-quantized MLP input");
+        OP(h3_gpu_swiglu_bf16(
+            dit->gpu, dit->activated, dit->fc1, rows, FFN),
+           "DiT pre-quantized SwiGLU");
+        if (weight->fc2_convrot_group)
+            OP(h3_gpu_convrot_bf16(
+                dit->gpu, dit->activated, dit->activated,
+                rows, FFN, weight->fc2_convrot_group),
+               "DiT FC2 ConvRot");
+        OP(h3_gpu_linear_i8_weight_bf16(
+            dit->gpu, mlp_output, dit->activated,
+            weight->fc2_int8, weight->fc2_scales, NULL,
+            rows, FFN, HIDDEN), "DiT pre-quantized MLP output");
+    } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
         OP(h3_gpu_mlp_int8_bf16(
@@ -2048,8 +2283,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
 }
 
 static int encode_forward(h3_dit *dit, int step, int begin, int submit,
-                          int disable_command_split, char *error,
-                          size_t error_size) {
+                          int disable_command_split,
+                          h3_dit_progress progress, void *progress_opaque,
+                          char *error, size_t error_size) {
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
@@ -2177,6 +2413,12 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             ? 0 : command_block_interval(dit);
         if (dit->ssd_streaming) command_blocks = 0;
         unsigned completed_blocks = 0;
+        char block_phase[64];
+        snprintf(block_phase, sizeof(block_phase),
+                 "denoise step %d/%d transformer", step + 1,
+                 h3_dit_schedule_steps(dit->schedule));
+        report(progress, progress_opaque, block_phase, 0,
+               (int)dit->active_block_count);
         int carried_attention_adaln = 0;
         int carried_attention_input_quantized = 0;
         for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
@@ -2231,10 +2473,21 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 h3_dit_block *slot =
                     &dit->stream_slots[dit->stream_ready_slot];
                 streamed_weight = dit->blocks[block];
-                streamed_weight.qkv = slot->qkv;
-                streamed_weight.out = slot->out;
-                streamed_weight.fc1 = slot->fc1;
-                streamed_weight.fc2 = slot->fc2;
+                if (dit->prequantized_int8) {
+                    streamed_weight.qkv_int8 = slot->qkv_int8;
+                    streamed_weight.qkv_scales = slot->qkv_scales;
+                    streamed_weight.out_int8 = slot->out_int8;
+                    streamed_weight.out_scales = slot->out_scales;
+                    streamed_weight.fc1_int8 = slot->fc1_int8;
+                    streamed_weight.fc1_scales = slot->fc1_scales;
+                    streamed_weight.fc2_int8 = slot->fc2_int8;
+                    streamed_weight.fc2_scales = slot->fc2_scales;
+                } else {
+                    streamed_weight.qkv = slot->qkv;
+                    streamed_weight.out = slot->out;
+                    streamed_weight.fc1 = slot->fc1;
+                    streamed_weight.fc2 = slot->fc2;
+                }
                 weight = &streamed_weight;
 
                 unsigned future = next_active_block(dit, block);
@@ -2299,6 +2552,8 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 OP(h3_gpu_begin(dit->gpu),
                    "continue after streamed DiT block");
             }
+            report(progress, progress_opaque, block_phase,
+                   (int)completed_blocks, (int)dit->active_block_count);
         }
         if (use_token_reduction &&
             token_reduction_end == H3_DIT_BLOCKS &&
@@ -2439,9 +2694,11 @@ int h3_dit_reset_run(h3_dit *dit,
     return 1;
 }
 
-int h3_dit_forward(h3_dit *dit, int step,
+static int h3_dit_forward_with_progress(
+                   h3_dit *dit, int step,
                    const float *video_latent, const float *audio_latent,
                    float *video_velocity, float *audio_velocity,
+                   h3_dit_progress progress, void *progress_opaque,
                    char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
     if (!dit || step < 0 || step >= h3_dit_schedule_steps(dit->schedule) ||
@@ -2478,7 +2735,9 @@ int h3_dit_forward(h3_dit *dit, int step,
             (size_t)dit->audio_condition_rows * AUDIO_CHANNELS,
             audio_rows, audio_row_elements);
     if (!ok) fail(error, error_size, "cannot pack/write DiT input latents");
-    if (ok) ok = encode_forward(dit, step, 1, 1, 0, error, error_size);
+    if (ok) ok = encode_forward(dit, step, 1, 1, 0,
+                                progress, progress_opaque,
+                                error, error_size);
     if (ok) ok = h3_gpu_tensor_read_bf16(dit->video_output_bf16, video_out,
                                          video_row_elements) &&
                  h3_gpu_tensor_read_bf16(dit->audio_output_bf16, audio_out,
@@ -2503,6 +2762,15 @@ int h3_dit_forward(h3_dit *dit, int step,
     free(video_rows); free(audio_rows); free(video_out); free(audio_out);
     free(video_f32); free(audio_f32);
     return ok;
+}
+
+int h3_dit_forward(h3_dit *dit, int step,
+                   const float *video_latent, const float *audio_latent,
+                   float *video_velocity, float *audio_velocity,
+                   char *error, size_t error_size) {
+    return h3_dit_forward_with_progress(
+        dit, step, video_latent, audio_latent,
+        video_velocity, audio_velocity, NULL, NULL, error, error_size);
 }
 
 int h3_dit_get_gpu_stats(const h3_dit *dit, h3_gpu_stats *stats) {
@@ -2694,6 +2962,7 @@ static int denoise_euler_gpu(h3_dit *dit, float *video_latent,
             }
             if (ok) ok = encode_forward(dit, step, 0, 0,
                                         disable_command_split,
+                                        progress, progress_opaque,
                                         error, error_size);
             if (ok) {
                 last_evaluated = step;
@@ -2815,9 +3084,10 @@ int h3_dit_denoise(h3_dit *dit, float *video_latent, float *audio_latent,
     int ok = 1;
     for (int step = 0; step < dit->sigmas.steps && ok; step++) {
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
-        ok = h3_dit_forward(dit, step, video_latent, audio_latent,
+        ok = h3_dit_forward_with_progress(
+                            dit, step, video_latent, audio_latent,
                             video_velocity, audio_velocity,
-                            error, error_size);
+                            progress, progress_opaque, error, error_size);
         float sigma = dit->sigmas.video[step];
         float timestep = 1.0f - sigma;
         float sigma_from_timestep = 1.0f - timestep;
@@ -2922,8 +3192,10 @@ int h3_dit_denoise_euler_preview(
         report(progress, progress_opaque, "denoise", step, dit->sigmas.steps);
         int evaluate = selected[step];
         if (evaluate) {
-            ok = h3_dit_forward(dit, step, video_latent, audio_latent,
+            ok = h3_dit_forward_with_progress(
+                                dit, step, video_latent, audio_latent,
                                 video_velocity, audio_velocity,
+                                progress, progress_opaque,
                                 error, error_size);
             if (ok && reuse_interval > 1) {
                 if (last_evaluated >= 0) {
@@ -3048,8 +3320,9 @@ void h3_dit_free(h3_dit *dit) {
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
-                "h3: BF16 SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
+                "h3: %s SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
                 "unhidden wait %.3fs\n",
+                dit->prequantized_int8 ? "I8/F32" : "BF16",
                 gib, dit->stream_read_seconds,
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,

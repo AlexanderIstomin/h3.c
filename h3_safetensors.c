@@ -539,6 +539,23 @@ static int h3_has_suffix(const char *value, const char *suffix) {
     return length >= suffix_length && !strcmp(value + length - suffix_length, suffix);
 }
 
+int h3_st_inventory_file(const char *path, h3_component_info *info,
+                         char *error, size_t error_size) {
+    if (!path || !info) return 0;
+    memset(info, 0, sizeof(*info));
+    h3_st_header header;
+    if (!h3_st_read_header(path, &header, error, error_size)) return 0;
+    info->files = 1;
+    info->bytes = header.file_size;
+    info->tensors = header.tensor_count;
+    for (size_t index = 0; index < header.tensor_count; index++) {
+        info->tensor_bytes += header.tensors[index].data_end -
+                              header.tensors[index].data_begin;
+    }
+    h3_st_free_header(&header);
+    return 1;
+}
+
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size) {
     if (!directory || !info) return 0;
@@ -559,21 +576,17 @@ int h3_st_inventory_dir(const char *directory, h3_component_info *info,
             return 0;
         }
         snprintf(path, length, "%s/%s", directory, entry->d_name);
-        h3_st_header header;
-        int ok = h3_st_read_header(path, &header, error, error_size);
+        h3_component_info file_info;
+        int ok = h3_st_inventory_file(path, &file_info, error, error_size);
         free(path);
         if (!ok) {
             closedir(stream);
             return 0;
         }
-        info->files++;
-        info->bytes += header.file_size;
-        info->tensors += header.tensor_count;
-        for (size_t index = 0; index < header.tensor_count; index++) {
-            info->tensor_bytes += header.tensors[index].data_end -
-                                  header.tensors[index].data_begin;
-        }
-        h3_st_free_header(&header);
+        info->files += file_info.files;
+        info->bytes += file_info.bytes;
+        info->tensors += file_info.tensors;
+        info->tensor_bytes += file_info.tensor_bytes;
     }
     closedir(stream);
     if (!info->files) {

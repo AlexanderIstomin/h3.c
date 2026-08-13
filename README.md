@@ -128,7 +128,7 @@ against a 29-pass reference; an independent surfer test measured 0.547. The
 four-pass denoise took about 3.5 seconds on M5 Max, versus 26.4 seconds for the
 reference.
 
-For a low-memory run, add `--ssd-streaming`:
+For a low-memory released-BF16 run, add `--ssd-streaming`:
 
 ```sh
 ./h3 --profile \
@@ -153,9 +153,11 @@ their full peaks to it; the OS, media buffers, and output resolution still need
 headroom. `--show` keeps a preview VAE resident and adds roughly 10 GiB, so omit
 it for the lowest-memory run.
 
-SSD streaming is an explicit memory/speed tradeoff and is not the default. It
-cannot be combined with `--use-int8-row-fc2`. In an interactive session, use
-`!ssd-streaming on`.
+For released BF16 weights, SSD streaming is an explicit memory/speed tradeoff
+and is not the default. It cannot be combined with `--use-int8-row-fc2`. In an
+interactive session, use `!ssd-streaming on`. Optimized prequantized I8/F32
+packages select bounded SSD streaming automatically because retaining all 50
+matrix sets would defeat their portable-memory purpose.
 
 ### 3. Move toward reference quality
 
@@ -539,15 +541,58 @@ time; M3 uses the faster copied-buffer path. `H3_ZERO_COPY_WEIGHTS=0` disables
 the M5 selection for diagnostics.
 The streamed Qwen text encoder preallocates a small ring of future layer
 buffers and fills them on eight I/O workers while Metal executes the current
-layer. The default ring depth is two layers on M3/older hardware and three on
-M5, where the target machine has 128 GiB. `H3_QWEN_PREFETCH=0` restores the
-single-layer synchronous reference path; values 1-8 select the worker count,
-and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
+layer. Released BF16 checkpoints default to two future layers on M3/older
+hardware and three on M5. Optimized I8/F32 checkpoints default to one future
+layer on pre-M5 and two on M5, read large matrices uncached, and gather only
+the prompt's rows from the BF16 embedding table. `H3_QWEN_PREFETCH=0` restores
+the single-layer synchronous reference path; values 1-8 select the worker
+count, and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
 
-`--ssd-streaming` is a separate, more aggressive residency mode for the DiT.
-Only its small per-block normalization weights remain resident. Two complete
-BF16 matrix slots alternate while a background reader fills the next slot in
-checkpoint-offset order; the current Metal command buffer runs concurrently.
+### Prequantized checkpoint compatibility
+
+The portable pre-M5 path can load row-major I8 DiT matrices and their F32
+per-output scales without expanding the stored matrix to BF16. For compatible
+Comfy INT8 checkpoints it reads the adjacent quantization marker, applies the
+normalized H256 ConvRot transform to each activation group, and executes QKV,
+attention-output, FC1, and FC2 projections directly from the serialized
+weights. Compact AdaLN checkpoints are detected by `adaln_t_table`; their F32
+curve is interpolated per timestep and projected through the F16 `[output, 8]`
+block and final-layer weights without applying the released model's SiLU time
+embedding.
+
+`make real-int8 H3_OPTIMIZED_MODEL=/path/to/package` validates those paths
+against the real block-0 matrices and precomputes every compact AdaLN block on
+Metal. `h3_real_optimized_qwen_test` runs the optimized language stack with
+the same bounded ring; passing `50` as its final argument checks every layer.
+The same target runs both optimized VAE probes. The compact AudioVAE stores
+ordinary F32 convolutions with weight normalization already applied, so the
+decoder streams its seven stages without rebuilding normalized weights. Its
+one-token probe peaks at 0.141 GiB of tracked Metal storage. The 4.8 GB
+VideoVAE retains the released tensor schema in F16; h3.c reads its embedded
+latent statistics and converts directly into one shared F32 block buffer at a
+time. Its complete 36-block, five-frame probe peaks at 0.252 GiB, with 9.031
+GiB of cumulative allocations.
+
+The optimized DiT uses two alternating slots containing each block's I8
+matrices and F32 scales. A real 50-layer forward on M1 Pro read 18.315 GiB,
+completed in 7.254 seconds, and peaked at 1.487 GiB of tracked Metal residency.
+A prompt-only, two-step end-to-end smoke then completed tokenizer, all 50 Qwen
+layers, two full denoiser evaluations, both VAEs, and FFmpeg muxing into a
+22-frame H.264/AAC file. The optimized format is therefore enabled for FL2VA
+generation. Visual-reference conditioning is still rejected because this
+package has no adapted Ref2VA/vision path.
+
+The VideoVAE's bounded path rereads the transformer for every spatial or
+temporal tile, which trades throughput for compatibility on 16/32 GB Macs.
+Native F16 execution or a layer-major cross-tile schedule can remove that
+traffic later.
+
+`--ssd-streaming` is a separate, more aggressive residency mode for a released
+BF16 DiT and is automatic for optimized I8/F32 packages. Only small per-block
+normalization weights remain resident. Two complete matrix slots alternate
+while a background reader fills the next slot in checkpoint-offset order; the
+current Metal command buffer runs concurrently. Optimized slots contain I8
+matrices and their F32 output scales instead of BF16 matrices.
 Darwin uncached reads avoid retaining a second copy in the filesystem cache.
 The first active block is prefetched again during the final block, so a cached
 interactive DiT is ready for its next denoiser evaluation. Measurements reached

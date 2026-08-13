@@ -163,7 +163,8 @@ failed:
 
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
-                             int render_width, int render_height) {
+                             int render_width, int render_height,
+                             int ssd_streaming) {
     h3_key key = {0};
     if (!h3_key_append(
             &key,
@@ -174,7 +175,7 @@ static char *h3_prepared_key(const char *conditioning,
             params->steps, params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
-            params->ssd_streaming,
+            ssd_streaming,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
             params->use_slower_bf16_attention_output,
@@ -378,30 +379,130 @@ static char *h3_path(const char *root, const char *relative) {
     return result;
 }
 
-static int h3_require_file(h3_ctx *ctx, const char *relative) {
-    char *path = h3_path(ctx->model_dir, relative);
+static int h3_require_root_file(const char *root, const char *relative,
+                                char *error, size_t error_size) {
+    char *path = h3_path(root, relative);
     if (!path) {
-        h3_set_error(ctx, "out of memory resolving model path");
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory resolving model path");
         return 0;
     }
     int exists = h3_is_file(path);
-    if (!exists) h3_set_error(ctx, "missing required model file: %s", path);
+    if (!exists && error && error_size)
+        snprintf(error, error_size, "missing required model file: %s", path);
     free(path);
     return exists;
 }
 
-static int h3_inventory(h3_ctx *ctx, const char *relative,
-                        h3_component_info *info) {
-    char *path = h3_path(ctx->model_dir, relative);
+static int h3_inventory_root(const char *root, const char *relative,
+                             int single_file, h3_component_info *info,
+                             char *error, size_t error_size) {
+    char *path = h3_path(root, relative);
     if (!path) {
-        h3_set_error(ctx, "out of memory resolving component path");
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory resolving component path");
         return 0;
     }
-    char detail[384];
-    int ok = h3_st_inventory_dir(path, info, detail, sizeof(detail));
-    if (!ok) h3_set_error(ctx, "%s", detail);
+    int ok = single_file ?
+        h3_st_inventory_file(path, info, error, error_size) :
+        h3_st_inventory_dir(path, info, error, error_size);
     free(path);
     return ok;
+}
+
+static int h3_probe_released(const char *root, h3_model_info *model,
+                             char *error, size_t error_size) {
+    if (!h3_require_root_file(root, "FL2VA/transformer/config.json",
+                              error, error_size) ||
+        !h3_require_root_file(root, "FL2VA/tokenizer/tokenizer.json",
+                              error, error_size) ||
+        !h3_inventory_root(root, "FL2VA/text_encoder", 0,
+                           &model->text_encoder, error, error_size) ||
+        !h3_inventory_root(root, "FL2VA/transformer", 0,
+                           &model->fl2va_transformer, error, error_size) ||
+        !h3_inventory_root(root, "FL2VA/video_vae/source", 0,
+                           &model->video_vae, error, error_size) ||
+        !h3_inventory_root(root, "FL2VA/audio_vae", 0,
+                           &model->audio_vae, error, error_size)) return 0;
+
+    char *ref_index = h3_path(
+        root, "Ref2VA/transformer/model.safetensors.index.json");
+    if (!ref_index) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "out of memory resolving optional Ref2VA path");
+        return 0;
+    }
+    int has_ref2va = h3_is_file(ref_index);
+    free(ref_index);
+    if (has_ref2va && !h3_inventory_root(
+            root, "Ref2VA/transformer", 0, &model->ref2va_transformer,
+            error, error_size)) return 0;
+    model->layout = H3_MODEL_LAYOUT_RELEASED_DIRECTORY;
+    model->generation_supported = 1;
+    return 1;
+}
+
+static int h3_probe_optimized_int8(const char *root, h3_model_info *model,
+                                   char *error, size_t error_size) {
+    static const char transformer[] =
+        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+    static const char text_encoder[] =
+        "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
+    static const char video_vae[] =
+        "vae/minimax_h3_video_vae_fp16.safetensors";
+    static const char audio_vae[] =
+        "vae/minimax_h3_audio_vae_fp32.safetensors";
+    if (!h3_require_root_file(root, transformer, error, error_size) ||
+        !h3_require_root_file(root, text_encoder, error, error_size) ||
+        !h3_require_root_file(root, video_vae, error, error_size) ||
+        !h3_require_root_file(root, audio_vae, error, error_size) ||
+        !h3_inventory_root(root, transformer, 1,
+                           &model->fl2va_transformer, error, error_size) ||
+        !h3_inventory_root(root, text_encoder, 1,
+                           &model->text_encoder, error, error_size) ||
+        !h3_inventory_root(root, video_vae, 1,
+                           &model->video_vae, error, error_size) ||
+        !h3_inventory_root(root, audio_vae, 1,
+                           &model->audio_vae, error, error_size)) return 0;
+    model->layout = H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE;
+    model->generation_supported = 1;
+    return 1;
+}
+
+int h3_probe_model_dir(const char *model_dir, h3_model_info *model,
+                       char *error, size_t error_size) {
+    if (error && error_size) error[0] = '\0';
+    if (!model_dir || !*model_dir || !model) {
+        if (error && error_size)
+            snprintf(error, error_size, "model directory is required");
+        return 0;
+    }
+    memset(model, 0, sizeof(*model));
+    char *released_marker = h3_path(
+        model_dir, "FL2VA/transformer/config.json");
+    char *optimized_marker = h3_path(
+        model_dir,
+        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors");
+    if (!released_marker || !optimized_marker) {
+        free(released_marker);
+        free(optimized_marker);
+        if (error && error_size)
+            snprintf(error, error_size, "out of memory resolving model layout");
+        return 0;
+    }
+    int released = h3_is_file(released_marker);
+    int optimized = h3_is_file(optimized_marker);
+    free(released_marker);
+    free(optimized_marker);
+    if (optimized)
+        return h3_probe_optimized_int8(model_dir, model, error, error_size);
+    if (released) return h3_probe_released(model_dir, model, error, error_size);
+    if (error && error_size)
+        snprintf(error, error_size,
+                 "unrecognized H3 model layout: expected FL2VA or the pinned "
+                 "optimized INT8 package");
+    return 0;
 }
 
 h3_ctx *h3_load_dir(const char *model_dir) {
@@ -421,30 +522,8 @@ h3_ctx *h3_load_dir(const char *model_dir) {
         free(ctx);
         return NULL;
     }
-    if (!h3_require_file(ctx, "FL2VA/transformer/config.json") ||
-        !h3_require_file(ctx, "FL2VA/tokenizer/tokenizer.json") ||
-        !h3_inventory(ctx, "FL2VA/text_encoder", &ctx->model.text_encoder) ||
-        !h3_inventory(ctx, "FL2VA/transformer", &ctx->model.fl2va_transformer) ||
-        !h3_inventory(ctx, "FL2VA/video_vae/source", &ctx->model.video_vae) ||
-        !h3_inventory(ctx, "FL2VA/audio_vae", &ctx->model.audio_vae)) {
-        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
-        h3_free(ctx);
-        return NULL;
-    }
-    /* Ref2VA is selected only by ordered-reference requests. Keep prompt-only
-     * FL2VA usable while that optional 62 GiB checkpoint is not installed. */
-    char *ref_index = h3_path(
-        ctx->model_dir, "Ref2VA/transformer/model.safetensors.index.json");
-    if (!ref_index) {
-        h3_set_error(ctx, "out of memory resolving optional Ref2VA path");
-        snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
-        h3_free(ctx);
-        return NULL;
-    }
-    int has_ref2va = h3_is_file(ref_index);
-    free(ref_index);
-    if (has_ref2va && !h3_inventory(
-            ctx, "Ref2VA/transformer", &ctx->model.ref2va_transformer)) {
+    if (!h3_probe_model_dir(ctx->model_dir, &ctx->model,
+                            ctx->error, sizeof(ctx->error))) {
         snprintf(h3_global_error, sizeof(h3_global_error), "%s", ctx->error);
         h3_free(ctx);
         return NULL;
@@ -551,8 +630,7 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         return 0;
     }
     if (params->ssd_streaming && params->use_int8_row_fc2) {
-        h3_set_error(ctx, "SSD streaming uses original BF16 weights and cannot "
-                         "be combined with int8 row FC2");
+        h3_set_error(ctx, "SSD streaming cannot be combined with int8 row FC2");
         return 0;
     }
     if (params->use_int8_row_fc2 && params->use_slower_bf16_mlp) {
@@ -849,11 +927,27 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                        const h3_params *params) {
     if (!ctx) return NULL;
     ctx->error[0] = '\0';
+    if (!ctx->model.generation_supported) {
+        h3_set_error(ctx,
+            "this checkpoint layout is valid for inspection but is not "
+            "supported for generation");
+        return NULL;
+    }
     if (!prompt || !*prompt) {
         h3_set_error(ctx, "prompt must not be empty");
         return NULL;
     }
     if (!h3_valid_params(ctx, params)) return NULL;
+    int optimized = ctx->model.layout ==
+        H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE;
+    if (optimized && (params->reference_count || params->first_frame ||
+                      params->last_frame)) {
+        h3_set_error(ctx,
+            "the optimized INT8 package currently supports prompt-only FL2VA "
+            "generation; visual references are not supported yet");
+        return NULL;
+    }
+    int dit_ssd_streaming = optimized ? 1 : params->ssd_streaming;
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
@@ -920,14 +1014,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int decoder_is_cached = 0;
     char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
-    char *text_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/text_encoder" : "FL2VA/text_encoder");
-    char *dit_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/transformer" : "FL2VA/transformer");
-    char *vae_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
-    char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
-        "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    char *text_path = h3_path(ctx->model_dir, optimized ?
+        "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors" :
+        (ref2va ? "Ref2VA/text_encoder" : "FL2VA/text_encoder"));
+    char *dit_path = h3_path(ctx->model_dir, optimized ?
+        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors" :
+        (ref2va ? "Ref2VA/transformer" : "FL2VA/transformer"));
+    char *vae_path = h3_path(ctx->model_dir, optimized ?
+        "vae/minimax_h3_video_vae_fp16.safetensors" :
+        (ref2va ? "Ref2VA/video_vae/source" : "FL2VA/video_vae/source"));
+    char *audio_vae_path = h3_path(ctx->model_dir, optimized ?
+        "vae/minimax_h3_audio_vae_fp32.safetensors" :
+        (ref2va ? "Ref2VA/audio_vae" : "FL2VA/audio_vae"));
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
         !audio_vae_path) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
@@ -940,7 +1038,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         goto cleanup;
     }
     prepared_key = h3_prepared_key(
-        conditioning_key, params, render_width, render_height);
+        conditioning_key, params, render_width, render_height,
+        dit_ssd_streaming);
     if (!prepared_key) {
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
@@ -1479,7 +1578,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
-            params->ssd_streaming,
+            dit_ssd_streaming,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
@@ -1500,7 +1599,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
-            params->ssd_streaming,
+            dit_ssd_streaming,
             spatial_rope_scale,
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,

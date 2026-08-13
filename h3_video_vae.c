@@ -87,6 +87,7 @@ typedef struct {
     int latent_w;
     int latent_t;
     int output_frames;
+    int stream_weights;
 } vae_context;
 
 struct h3_video_vae_decoder {
@@ -122,8 +123,26 @@ static void free_tensor(h3_gpu_tensor **tensor) {
 static h3_gpu_tensor *load_f32(vae_context *vae, const char *name, int ndim,
                                const uint64_t *shape, char *error,
                                size_t error_size) {
-    return h3_weight_load_f32(vae->weights, vae->gpu, name, ndim, shape,
-                              error, error_size);
+    const h3_st_tensor *tensor = h3_weight_find(vae->weights, name, NULL);
+    if (!tensor) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return NULL;
+    }
+    if (tensor->dtype == H3_DTYPE_F32)
+        return h3_weight_load_f32(vae->weights, vae->gpu, name, ndim, shape,
+                                  error, error_size);
+    if (tensor->dtype == H3_DTYPE_F16)
+        return h3_weight_load_f16_as_f32(
+            vae->weights, vae->gpu, name, ndim, shape, error, error_size);
+    fail(error, error_size, "video VAE weight %s has unsupported dtype %s",
+         name, h3_dtype_name(tensor->dtype));
+    return NULL;
+}
+
+static int checkpoint_streams_f16(const h3_weight_store *weights) {
+    const h3_st_tensor *tensor = h3_weight_find(
+        weights, "decoder.transformer_blocks.0.attn.to_qkv.weight", NULL);
+    return tensor && tensor->dtype == H3_DTYPE_F16;
 }
 
 static h3_gpu_tensor *f1(vae_context *vae, const char *name, uint64_t width,
@@ -268,8 +287,26 @@ static int parse_float_array(const char *json, const char *key, float *values,
 }
 
 static int load_latent_normalization(const char *weight_directory,
+                                     const h3_weight_store *weights,
                                      float *mean, float *deviation,
                                      char *error, size_t error_size) {
+    if (h3_weight_find(weights, "latents_mean", NULL) ||
+        h3_weight_find(weights, "latents_std", NULL)) {
+        int ok = h3_weight_read_f32_vector(
+                     weights, "latents_mean", mean, LATENT_CHANNELS,
+                     error, error_size) &&
+                 h3_weight_read_f32_vector(
+                     weights, "latents_std", deviation, LATENT_CHANNELS,
+                     error, error_size);
+        if (ok) for (int channel = 0; channel < LATENT_CHANNELS; channel++) {
+            if (deviation[channel] <= 0.0f) {
+                fail(error, error_size,
+                     "video VAE latent standard deviation is invalid");
+                return 0;
+            }
+        }
+        return ok;
+    }
     size_t path_size = strlen(weight_directory) + strlen("/../config.json") + 1;
     char *path = malloc(path_size);
     if (!path) {
@@ -576,6 +613,28 @@ static int run_resident_tile(vae_context *vae, char *error,
     return 1;
 }
 
+static int run_tile(vae_context *vae, h3_video_vae_progress progress,
+                    void *progress_opaque, char *error, size_t error_size) {
+    if (!vae->stream_weights)
+        return run_resident_tile(vae, error, error_size);
+    return load_input_weights(vae, error, error_size) &&
+           run_decoder(vae, progress, progress_opaque, error, error_size);
+}
+
+typedef struct {
+    h3_video_vae_progress progress;
+    void *opaque;
+    int unit;
+    int units;
+} chunked_progress;
+
+static void report_chunked_progress(int completed, int total, void *opaque) {
+    chunked_progress *state = opaque;
+    if (!state || !state->progress || total < 1) return;
+    state->progress(state->unit * total + completed,
+                    state->units * total, state->opaque);
+}
+
 static int unpack_frame_range(vae_context *vae, int first_frame,
                               int frame_count, h3_video_frames *output,
                               char *error, size_t error_size) {
@@ -866,7 +925,7 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
             ok = prepare_input(&decoder->vae, input,
                                decoder->latent_mean, decoder->latent_std,
                                error, error_size) &&
-                 run_resident_tile(&decoder->vae, error, error_size);
+                 run_tile(&decoder->vae, NULL, NULL, error, error_size);
             free(input);
             if (!ok) break;
             h3_video_frames tile;
@@ -912,9 +971,11 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
     decoder->latent_w = latent_width;
     int tile_pixels = configured_tile_pixels(
         latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
-    int ok = load_latent_normalization(
-        weight_directory, decoder->latent_mean, decoder->latent_std,
-        error, error_size) &&
+    vae_context *vae = &decoder->vae;
+    vae->weights = h3_weight_store_open(weight_directory, error, error_size);
+    int ok = vae->weights && load_latent_normalization(
+        weight_directory, vae->weights,
+        decoder->latent_mean, decoder->latent_std, error, error_size) &&
         tile_axis_build(latent_height * SPATIAL_RATIO, tile_pixels,
                         &decoder->y_axis, error, error_size) &&
         tile_axis_build(latent_width * SPATIAL_RATIO, tile_pixels,
@@ -922,7 +983,6 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
     if (ok && getenv("H3_PROFILE"))
         fprintf(stderr, "h3: resident video VAE tiles %dx%d at %d pixels\n",
                 decoder->x_axis.count, decoder->y_axis.count, tile_pixels);
-    vae_context *vae = &decoder->vae;
     if (ok) {
         vae->latent_h = decoder->y_axis.length / SPATIAL_RATIO;
         vae->latent_w = decoder->x_axis.length / SPATIAL_RATIO;
@@ -931,15 +991,14 @@ h3_video_vae_decoder *h3_video_vae_decoder_load(
         vae->patches = (uint32_t)(CHUNK_LATENT_TIME * vae->latent_h *
                                   vae->latent_w);
         vae->sequence = vae->patches + SUFFIX;
-        vae->weights = h3_weight_store_open(weight_directory,
-                                             error, error_size);
-        if (vae->weights)
-            vae->gpu = h3_gpu_create(shader_source_path, error, error_size);
+        vae->stream_weights = checkpoint_streams_f16(vae->weights);
+        vae->gpu = h3_gpu_create(shader_source_path, error, error_size);
         if (vae->gpu)
             h3_gpu_profile_set_label(vae->gpu, "resident video VAE decoder");
         ok = vae->weights && vae->gpu &&
-             load_resident_weights(vae, progress, progress_opaque,
-                                   error, error_size) &&
+             (vae->stream_weights ||
+              load_resident_weights(vae, progress, progress_opaque,
+                                    error, error_size)) &&
              prepare_rope(vae, error, error_size) &&
              allocate_activations(vae, error, error_size);
     }
@@ -1082,9 +1141,11 @@ static int decode_chunked(const char *weight_directory,
         vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu)
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");
+    vae.stream_weights = checkpoint_streams_f16(vae.weights);
     ok = vae.weights && vae.gpu &&
-         load_resident_weights(&vae, progress, progress_opaque,
-                               error, error_size) &&
+         (vae.stream_weights ||
+          load_resident_weights(&vae, progress, progress_opaque,
+                                error, error_size)) &&
          prepare_rope(&vae, error, error_size) &&
          allocate_activations(&vae, error, error_size);
     int tile_count = y_axis.count * x_axis.count;
@@ -1121,17 +1182,25 @@ static int decode_chunked(const char *weight_directory,
                     break;
                 }
                 free_tensor(&vae.latent);
+                int tile_index = tile_y * x_axis.count + tile_x;
+                chunked_progress chunk_progress = {
+                    progress, progress_opaque,
+                    chunk * tile_count + tile_index,
+                    chunks * tile_count
+                };
                 ok = prepare_input(&vae, input, latent_mean, latent_std,
                                    error, error_size) &&
-                     run_resident_tile(&vae, error, error_size);
+                     run_tile(&vae,
+                              progress ? report_chunked_progress : NULL,
+                              &chunk_progress, error, error_size);
                 free(input);
                 if (!ok) break;
-                h3_video_frames tile;
-                memset(&tile, 0, sizeof(tile));
-                ok = unpack_frames(&vae, &tile, error, error_size);
+                h3_video_frames tile_frames;
+                memset(&tile_frames, 0, sizeof(tile_frames));
+                ok = unpack_frames(&vae, &tile_frames, error, error_size);
                 if (ok) {
                     int index = tile_y * x_axis.count + tile_x;
-                    tiles[index] = tile.rgb;
+                    tiles[index] = tile_frames.rgb;
                 }
             }
         h3_video_frames decoded;
@@ -1211,8 +1280,14 @@ int h3_video_vae_decode(const char *weight_directory,
     vae.patches = (uint32_t)(CHUNK_LATENT_TIME * latent_height * latent_width);
     vae.sequence = vae.patches + SUFFIX;
     float latent_mean[LATENT_CHANNELS], latent_std[LATENT_CHANNELS];
-    if (!load_latent_normalization(weight_directory, latent_mean, latent_std,
-                                   error, error_size)) return 0;
+    vae.weights = h3_weight_store_open(weight_directory, error, error_size);
+    if (!vae.weights ||
+        !load_latent_normalization(weight_directory, vae.weights,
+                                   latent_mean, latent_std,
+                                   error, error_size)) {
+        cleanup(&vae);
+        return 0;
+    }
     int tile_pixels = configured_tile_pixels(
         latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
     if (latent_time == 2 &&
@@ -1220,11 +1295,14 @@ int h3_video_vae_decode(const char *weight_directory,
          latent_width > TILE_PIXELS / SPATIAL_RATIO)) {
         fail(error, error_size,
              "the two-token diagnostic VAE path supports one spatial tile");
+        cleanup(&vae);
         return 0;
     }
     if (latent_time > CHUNK_LATENT_TIME ||
         latent_height > tile_pixels / SPATIAL_RATIO ||
         latent_width > tile_pixels / SPATIAL_RATIO) {
+        h3_weight_store_free(vae.weights);
+        vae.weights = NULL;
         int ok = decode_chunked(weight_directory, shader_source_path,
                                 normalized_latent, latent_time, latent_height,
                                 latent_width, latent_mean, latent_std,
@@ -1233,8 +1311,7 @@ int h3_video_vae_decode(const char *weight_directory,
         if (!ok) h3_video_frames_free(output);
         return ok;
     }
-    vae.weights = h3_weight_store_open(weight_directory, error, error_size);
-    if (!vae.weights) return 0;
+    vae.stream_weights = checkpoint_streams_f16(vae.weights);
     vae.gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (vae.gpu)
         h3_gpu_profile_set_label(vae.gpu, "video VAE decoder");

@@ -34,6 +34,11 @@ typedef struct {
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
+/* Compile or load the process-wide Metal library. Safe to call repeatedly;
+ * later GPU contexts reuse the same device, library, and pipelines. Missing
+ * shader files return success so handshake can run without weights. */
+int h3_gpu_prepare(const char *shader_source_path,
+                   char *error, size_t error_size);
 void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
@@ -46,6 +51,8 @@ h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
                                       size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
@@ -53,18 +60,42 @@ h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
  * accounting are unchanged, so this may run on an I/O thread while another
  * tensor is in flight on the GPU. */
 int h3_gpu_tensor_read_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                  uint64_t file_offset, size_t elements,
                                  char *error, size_t error_size);
+int h3_gpu_tensor_read_file_bf16_range(
+                                 h3_gpu_tensor *tensor,
+                                 size_t destination_offset,
+                                 const char *path, uint64_t file_offset,
+                                 size_t elements,
+                                 char *error, size_t error_size);
+int h3_gpu_tensor_read_file_f32(h3_gpu_tensor *tensor, const char *path,
+                                uint64_t file_offset, size_t elements,
+                                char *error, size_t error_size);
+int h3_gpu_tensor_read_file_i8(h3_gpu_tensor *tensor, const char *path,
+                               uint64_t file_offset, size_t elements,
+                               char *error, size_t error_size);
 /* As above, but ask Darwin to avoid retaining a second copy in the file cache.
  * Intended for large sequential weight streams whose destination is the only
  * useful resident copy. */
 int h3_gpu_tensor_stream_file_bf16(h3_gpu_tensor *tensor, const char *path,
                                    uint64_t file_offset, size_t elements,
                                    char *error, size_t error_size);
+int h3_gpu_tensor_stream_file_i8(h3_gpu_tensor *tensor, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 char *error, size_t error_size);
+/* Convert an IEEE F16 payload into an existing shared F32 buffer while
+ * streaming it from disk. Conversion is chunked and the source file is marked
+ * uncached, avoiding full-size host F16/F32 staging allocations. */
+int h3_gpu_tensor_stream_file_f16_as_f32(
+                                 h3_gpu_tensor *tensor, const char *path,
+                                 uint64_t file_offset, size_t elements,
+                                 char *error, size_t error_size);
 void h3_gpu_tensor_free(h3_gpu_tensor *tensor);
 size_t h3_gpu_tensor_elements(const h3_gpu_tensor *tensor);
 h3_gpu_dtype h3_gpu_tensor_dtype(const h3_gpu_tensor *tensor);
@@ -75,6 +106,8 @@ int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
@@ -288,11 +321,25 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
 
 /* Portable BF16 storage path. Arithmetic accumulates in F32 and rounds at
  * operation boundaries, matching the released checkpoint's compute dtype. */
+/* Apply the normalized regular-Hadamard activation transform required by
+ * ConvRot checkpoints. Input and output may alias. The first implementation
+ * supports the group size 256 used by the curated H3 package. */
+int h3_gpu_convrot_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                        const h3_gpu_tensor *input, uint32_t rows,
+                        uint32_t width, uint32_t group_size);
 int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *weight,
                        const h3_gpu_tensor *bias, uint32_t rows,
                        uint32_t input_dim, uint32_t output_dim);
+/* Portable weight-only int8 path for pre-M5 Apple GPUs. Activations and
+ * outputs remain BF16; weights use one F32 scale per output channel. */
+int h3_gpu_linear_i8_weight_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *weight_scales,
+                                 const h3_gpu_tensor *bias, uint32_t rows,
+                                 uint32_t input_dim, uint32_t output_dim);
 int h3_gpu_mlp_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *input,
                     const h3_gpu_tensor *fc1_weight,

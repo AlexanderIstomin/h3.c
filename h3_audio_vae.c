@@ -194,6 +194,20 @@ static int load_normalized_conv(audio_context *audio, audio_conv *conv,
     conv->stride = stride;
     conv->transpose = transpose;
     snprintf(name, sizeof(name), "%s.weight_v", prefix);
+    if (!h3_weight_find(audio->weights, name, NULL)) {
+        /* Compact Comfy checkpoints remove PyTorch's weight-normalization
+         * parametrization and serialize the already-normalized convolution. */
+        snprintf(name, sizeof(name), "%s.weight", prefix);
+        conv->weight = f3(audio, name, outer, inner_channels, kernel,
+                          error, error_size);
+        if (!conv->weight) return 0;
+        if (has_bias) {
+            snprintf(name, sizeof(name), "%s.bias", prefix);
+            conv->bias = f1(audio, name, output_channels, error, error_size);
+            if (!conv->bias) return 0;
+        }
+        return 1;
+    }
     conv->vector = f3(audio, name, outer, inner_channels, kernel,
                       error, error_size);
     if (!conv->vector) return 0;
@@ -217,6 +231,7 @@ static int load_normalized_conv(audio_context *audio, audio_conv *conv,
 
 static int normalize_conv(audio_context *audio, audio_conv *conv,
                           char *error, size_t error_size) {
+    if (conv->weight && !conv->vector && !conv->magnitude) return 1;
     uint32_t outer = conv->transpose ? conv->input_channels :
                                       conv->output_channels;
     uint32_t inner_channels = conv->transpose ? conv->output_channels :
@@ -298,8 +313,26 @@ static int parse_float_array(const char *json, const char *key, float *values,
 }
 
 static int load_latent_normalization(const char *weight_directory,
+                                     const h3_weight_store *weights,
                                      float *mean, float *deviation,
                                      char *error, size_t error_size) {
+    if (h3_weight_find(weights, "latents_mean", NULL) ||
+        h3_weight_find(weights, "latents_std", NULL)) {
+        int ok = h3_weight_read_f32_vector(
+                     weights, "latents_mean", mean, LATENT_CHANNELS,
+                     error, error_size) &&
+                 h3_weight_read_f32_vector(
+                     weights, "latents_std", deviation, LATENT_CHANNELS,
+                     error, error_size);
+        if (ok) for (int channel = 0; channel < LATENT_CHANNELS; channel++) {
+            if (deviation[channel] <= 0.0f) {
+                fail(error, error_size,
+                     "audio VAE latent standard deviation is invalid");
+                return 0;
+            }
+        }
+        return ok;
+    }
     size_t path_size = strlen(weight_directory) + strlen("/config.json") + 1;
     char *path = malloc(path_size);
     if (!path) {
@@ -674,13 +707,20 @@ int h3_audio_vae_decode(const char *weight_directory,
     audio_context audio = {0};
     audio.length = (uint32_t)latent_length;
     float mean[LATENT_CHANNELS], deviation[LATENT_CHANNELS];
-    if (!load_latent_normalization(weight_directory, mean, deviation,
-                                   error, error_size)) return 0;
-    audio.gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (!audio.gpu) return 0;
-    h3_gpu_profile_set_label(audio.gpu, "audio VAE decoder");
     audio.weights = h3_weight_store_open(weight_directory, error, error_size);
-    int ok = audio.weights && load_filters(&audio, error, error_size) &&
+    if (!audio.weights ||
+        !load_latent_normalization(weight_directory, audio.weights,
+                                   mean, deviation, error, error_size)) {
+        cleanup(&audio);
+        return 0;
+    }
+    audio.gpu = h3_gpu_create(shader_source_path, error, error_size);
+    if (!audio.gpu) {
+        cleanup(&audio);
+        return 0;
+    }
+    h3_gpu_profile_set_label(audio.gpu, "audio VAE decoder");
+    int ok = load_filters(&audio, error, error_size) &&
              prepare_input(&audio, normalized_latent, mean, deviation,
                            error, error_size);
     for (int index = 0; ok && index < STAGES; index++) {
@@ -1288,14 +1328,20 @@ int h3_audio_vae_encode(const char *weight_directory,
     }
     audio_context audio = {0};
     float mean[LATENT_CHANNELS], deviation[LATENT_CHANNELS];
-    if (!load_latent_normalization(weight_directory, mean, deviation,
-                                   error, error_size)) return 0;
-    audio.gpu = h3_gpu_create(shader_source_path, error, error_size);
-    if (!audio.gpu) return 0;
-    h3_gpu_profile_set_label(audio.gpu, "audio VAE encoder");
     audio.weights = h3_weight_store_open(weight_directory, error, error_size);
-    int ok = audio.weights && encoder_initial(&audio, pcm, samples,
-                                               error, error_size);
+    if (!audio.weights ||
+        !load_latent_normalization(weight_directory, audio.weights,
+                                   mean, deviation, error, error_size)) {
+        cleanup(&audio);
+        return 0;
+    }
+    audio.gpu = h3_gpu_create(shader_source_path, error, error_size);
+    if (!audio.gpu) {
+        cleanup(&audio);
+        return 0;
+    }
+    h3_gpu_profile_set_label(audio.gpu, "audio VAE encoder");
+    int ok = encoder_initial(&audio, pcm, samples, error, error_size);
     uint32_t channels = ENCODER_DIM;
     for (int stage = 1; ok && stage <= ENCODER_STAGES; stage++) {
         for (int residual = 0; ok && residual < ENCODER_RESIDUALS; residual++)

@@ -1,4 +1,6 @@
 #include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 #ifdef H3_METAL_HAS_TENSOR
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -33,6 +35,12 @@ struct linear_args {
     uint input_dim;
     uint output_dim;
     uint has_bias;
+};
+
+struct convrot_args {
+    uint rows;
+    uint width;
+    uint group_size;
 };
 
 struct int8_quant_args {
@@ -785,6 +793,48 @@ kernel void h3_clip_f32(device const float *input [[buffer(0)]],
         output[index] = clamp(input[index], args.minimum, args.maximum);
 }
 
+/* ConvRot's H256 is H4 kron H4 kron H4 kron H4, normalized by 1/16.
+ * Four radix-4 stages reduce each group from O(256^2) to O(256 log 256).
+ * Separate source/destination scratch arrays need one barrier per stage and
+ * permit input/output aliasing after the initial group load. */
+kernel void h3_convrot_bf16(device const ushort *input [[buffer(0)]],
+                            device ushort *output [[buffer(1)]],
+                            constant convrot_args &args [[buffer(2)]],
+                            ushort tid [[thread_index_in_threadgroup]],
+                            uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float first[256];
+    threadgroup float second[256];
+    uint row = group.y;
+    uint feature_group = group.x;
+    if (row >= args.rows || args.group_size != 256) return;
+    uint offset = row * args.width + feature_group * 256;
+    first[tid] = h3_bf16_to_f32(input[offset + tid]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stage = 0, stride = 1; stage < 4; stage++, stride *= 4) {
+        uint digit = (uint(tid) / stride) & 3u;
+        uint base = uint(tid) - digit * stride;
+        float a, b, c, d;
+        if ((stage & 1u) == 0) {
+            a = first[base];
+            b = first[base + stride];
+            c = first[base + stride * 2];
+            d = first[base + stride * 3];
+        } else {
+            a = second[base];
+            b = second[base + stride];
+            c = second[base + stride * 2];
+            d = second[base + stride * 3];
+        }
+        float value = digit == 0 ? a + b + c - d :
+                      digit == 1 ? a + b - c + d :
+                      digit == 2 ? a - b + c + d : -a + b + c + d;
+        if ((stage & 1u) == 0) second[tid] = value;
+        else first[tid] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    output[offset + tid] = h3_f32_to_bf16(first[tid] * 0.0625f);
+}
+
 kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
                            device const ushort *weight [[buffer(1)]],
                            device const ushort *bias [[buffer(2)]],
@@ -818,6 +868,109 @@ kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
     }
     if (row < args.rows && column < args.output_dim) {
         output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
+    }
+}
+
+/* Portable weight-only int8 GEMM. Unlike the M5 TensorOps path, this keeps
+ * activations in BF16 and dequantizes each weight tile in threadgroup memory.
+ * The serialized int8 weights never need a full-size BF16 expansion. */
+kernel void h3_linear_i8_weight_bf16(
+                           device const ushort *input [[buffer(0)]],
+                           device const char *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device const ushort *bias [[buffer(3)]],
+                           device ushort *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint2 tid [[thread_position_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float input_tile[16][16];
+    threadgroup float weight_tile[16][16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ?
+            h3_bf16_to_f32(input[row * args.input_dim + input_k]) : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.input_dim ?
+            float(weight[column * args.input_dim + weight_k]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(input_tile[tid.y][k], weight_tile[k][tid.x], sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.output_dim) {
+        sum *= weight_scales[column];
+        if (args.has_bias) sum += h3_bf16_to_f32(bias[column]);
+        output[row * args.output_dim + column] = h3_f32_to_bf16(sum);
+    }
+}
+
+/* M1-M4 weight-only int8 GEMM using the original Apple-silicon simdgroup
+ * matrix primitive. The per-lane 8x8 fragment mapping follows MLX Steel's
+ * MIT-licensed BaseMMAFrag; see THIRD_PARTY_NOTICES.md. */
+kernel void h3_linear_i8_weight_bf16_simd(
+                           device const ushort *input [[buffer(0)]],
+                           device const char *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device const ushort *bias [[buffer(3)]],
+                           device ushort *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint TILE = 8;
+    uint row_start = group.y * TILE;
+    uint column_start = group.x * TILE;
+    ushort quad = lane / 4;
+    uint fragment_row = (quad & 4) + ((lane / 2) % 4);
+    uint fragment_column = (quad & 2) * 2 + (lane % 2) * 2;
+    simdgroup_matrix<float, TILE, TILE> a;
+    simdgroup_matrix<float, TILE, TILE> b;
+    simdgroup_matrix<float, TILE, TILE> accumulator;
+    accumulator.thread_elements()[0] = 0.0f;
+    accumulator.thread_elements()[1] = 0.0f;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        uint input_row = row_start + fragment_row;
+        uint input_column = k + fragment_column;
+        a.thread_elements()[0] =
+            input_row < args.rows && input_column < args.input_dim ?
+            h3_bf16_to_f32(input[input_row * args.input_dim + input_column]) :
+            0.0f;
+        a.thread_elements()[1] =
+            input_row < args.rows && input_column + 1 < args.input_dim ?
+            h3_bf16_to_f32(
+                input[input_row * args.input_dim + input_column + 1]) : 0.0f;
+
+        uint weight_row = k + fragment_row;
+        uint weight_column = column_start + fragment_column;
+        b.thread_elements()[0] =
+            weight_row < args.input_dim && weight_column < args.output_dim ?
+            float(weight[weight_column * args.input_dim + weight_row]) : 0.0f;
+        b.thread_elements()[1] =
+            weight_row < args.input_dim && weight_column + 1 < args.output_dim ?
+            float(weight[(weight_column + 1) * args.input_dim + weight_row]) :
+            0.0f;
+        simdgroup_multiply_accumulate(accumulator, a, b, accumulator);
+    }
+    uint output_row = row_start + fragment_row;
+    uint output_column = column_start + fragment_column;
+    if (output_row < args.rows && output_column < args.output_dim) {
+        float value = accumulator.thread_elements()[0] *
+            weight_scales[output_column];
+        if (args.has_bias) value += h3_bf16_to_f32(bias[output_column]);
+        output[output_row * args.output_dim + output_column] =
+            h3_f32_to_bf16(value);
+    }
+    if (output_row < args.rows && output_column + 1 < args.output_dim) {
+        float value = accumulator.thread_elements()[1] *
+            weight_scales[output_column + 1];
+        if (args.has_bias) value += h3_bf16_to_f32(bias[output_column + 1]);
+        output[output_row * args.output_dim + output_column + 1] =
+            h3_f32_to_bf16(value);
     }
 }
 

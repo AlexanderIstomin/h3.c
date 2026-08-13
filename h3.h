@@ -93,8 +93,9 @@ typedef struct {
     /* Restore the released spatial RoPE grid at 256x256. The default applies
      * a visually validated half-scale grid only at that native canvas. */
     int use_reference_rope;
-    /* Keep only two original BF16 DiT blocks in memory and overlap reading the
-     * next block from the checkpoint with execution of the current block. */
+    /* Keep only two DiT matrix slots in memory and overlap reading the next
+     * block with execution of the current one. Optimized I8 packages select
+     * this automatically and stream I8 matrices plus F32 scales. */
     int ssd_streaming;
     /* Optional lower internal model canvas. Both must be zero (exact output
      * canvas) or valid same-aspect dimensions no larger than width/height. */
@@ -152,12 +153,20 @@ typedef struct {
     size_t tensors;
 } h3_component_info;
 
+typedef enum {
+    H3_MODEL_LAYOUT_UNKNOWN = 0,
+    H3_MODEL_LAYOUT_RELEASED_DIRECTORY = 1,
+    H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE = 2
+} h3_model_layout;
+
 typedef struct {
     h3_component_info text_encoder;
     h3_component_info fl2va_transformer;
     h3_component_info ref2va_transformer;
     h3_component_info video_vae;
     h3_component_info audio_vae;
+    h3_model_layout layout;
+    int generation_supported;
 } h3_model_info;
 
 struct h3_result {
@@ -171,6 +180,9 @@ struct h3_result {
 
 /* Load model metadata and initialize the Metal device. Weights remain unmapped. */
 h3_ctx *h3_load_dir(const char *model_dir);
+/* Inspect checkpoint files without initializing Metal or reading payloads. */
+int h3_probe_model_dir(const char *model_dir, h3_model_info *model,
+                       char *error, size_t error_size);
 void h3_free(h3_ctx *ctx);
 
 const char *h3_last_error(const h3_ctx *ctx);

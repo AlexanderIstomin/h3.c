@@ -53,5 +53,7 @@ const char *h3_dtype_name(h3_dtype dtype);
 
 int h3_st_inventory_dir(const char *directory, h3_component_info *info,
                         char *error, size_t error_size);
+int h3_st_inventory_file(const char *path, h3_component_info *info,
+                         char *error, size_t error_size);
 
 #endif

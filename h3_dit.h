@@ -19,7 +19,8 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
 
 /* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
  * happen before the persistent core is loaded. SSD streaming retains only the
- * small block norms and two alternating BF16 matrix slots. */
+ * small block norms and two alternating matrix slots (BF16, or I8 plus F32
+ * scales for a pre-quantized checkpoint). */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
                          const h3_text_embedding *text,

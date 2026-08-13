@@ -4,11 +4,13 @@
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
 
+#include <fcntl.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int tests_run;
@@ -259,11 +261,14 @@ static void test_safetensors(void) {
     CHECK(descriptor >= 0);
     const char header_json[] =
         "{\"x\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]},"
-        "\"scalar\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[24,26]}}";
+        "\"scalar\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[24,26]},"
+        "\"q\":{\"dtype\":\"I8\",\"shape\":[4],\"data_offsets\":[26,30]}}";
     uint64_t length = sizeof(header_json) - 1;
     unsigned char prefix[8];
     for (unsigned index = 0; index < 8; index++) prefix[index] = (unsigned char)(length >> (8 * index));
-    unsigned char payload[26] = {0};
+    unsigned char payload[30] = {0};
+    const int8_t quantized[] = {-127, -1, 0, 127};
+    memcpy(payload + 26, quantized, sizeof(quantized));
     write_all(descriptor, prefix, sizeof(prefix));
     write_all(descriptor, header_json, (size_t)length);
     write_all(descriptor, payload, sizeof(payload));
@@ -272,7 +277,7 @@ static void test_safetensors(void) {
     h3_st_header header;
     char error[256];
     CHECK(h3_st_read_header(path, &header, error, sizeof(error)));
-    CHECK(header.tensor_count == 2);
+    CHECK(header.tensor_count == 3);
     const h3_st_tensor *x = h3_st_find(&header, "x");
     CHECK(x && x->dtype == H3_DTYPE_F32 && x->ndim == 2);
     CHECK(x->shape[0] == 2 && x->shape[1] == 3);
@@ -290,8 +295,114 @@ static void test_safetensors(void) {
     CHECK(scalar && scalar->dtype == H3_DTYPE_BF16 && scalar->ndim == 0);
     CHECK(scalar->data_end - scalar->data_begin == 2);
     CHECK(h3_st_tensor_elements(scalar) == 1);
+    const h3_st_tensor *q = h3_st_find(&header, "q");
+    CHECK(q && q->dtype == H3_DTYPE_I8 && q->ndim == 1);
+    CHECK(q->shape[0] == 4 && h3_dtype_size(q->dtype) == 1);
+    int8_t q_readback[4];
+    CHECK(h3_st_read_data(&header, q, q_readback, sizeof(q_readback), error,
+                          sizeof(error)));
+    CHECK(memcmp(q_readback, quantized, sizeof(quantized)) == 0);
     h3_st_free_header(&header);
+    h3_component_info inventory;
+    CHECK(h3_st_inventory_file(path, &inventory, error, sizeof(error)));
+    CHECK(inventory.files == 1 && inventory.tensors == 3);
+    CHECK(inventory.tensor_bytes == sizeof(payload));
+    CHECK(inventory.bytes == sizeof(prefix) + length + sizeof(payload));
     CHECK(unlink(path) == 0);
+}
+
+static void write_probe_fixture(const char *path, const char *tensor_name) {
+    int descriptor = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    CHECK(descriptor >= 0);
+    char json[512];
+    int json_length = snprintf(
+        json, sizeof(json),
+        "{\"%s\":{\"dtype\":\"F32\",\"shape\":[1],"
+        "\"data_offsets\":[0,4]}}",
+        tensor_name);
+    CHECK(json_length > 0 && (size_t)json_length < sizeof(json));
+    uint64_t length = (uint64_t)json_length;
+    unsigned char prefix[8];
+    for (unsigned index = 0; index < 8; index++)
+        prefix[index] = (unsigned char)(length >> (8 * index));
+    float payload = 1.0f;
+    write_all(descriptor, prefix, sizeof(prefix));
+    write_all(descriptor, json, (size_t)json_length);
+    write_all(descriptor, &payload, sizeof(payload));
+    CHECK(close(descriptor) == 0);
+}
+
+static void test_optimized_model_probe(void) {
+    char root[] = "/tmp/h3_optimized_probe_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char diffusion[512], text[512], vae[512];
+    char fl2va[512], released_transformer[512], released_config[768];
+    CHECK(snprintf(diffusion, sizeof(diffusion), "%s/diffusion_models", root) > 0);
+    CHECK(snprintf(text, sizeof(text), "%s/text_encoders", root) > 0);
+    CHECK(snprintf(vae, sizeof(vae), "%s/vae", root) > 0);
+    CHECK(mkdir(diffusion, 0700) == 0);
+    CHECK(mkdir(text, 0700) == 0);
+    CHECK(mkdir(vae, 0700) == 0);
+    CHECK(snprintf(fl2va, sizeof(fl2va), "%s/FL2VA", root) > 0);
+    CHECK(snprintf(released_transformer, sizeof(released_transformer),
+                   "%s/transformer", fl2va) > 0);
+    CHECK(snprintf(released_config, sizeof(released_config), "%s/config.json",
+                   released_transformer) > 0);
+    CHECK(mkdir(fl2va, 0700) == 0);
+    CHECK(mkdir(released_transformer, 0700) == 0);
+    int config = open(released_config, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    CHECK(config >= 0);
+    CHECK(close(config) == 0);
+
+    static const char *relatives[] = {
+        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+        "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        "vae/minimax_h3_video_vae_fp16.safetensors",
+        "vae/minimax_h3_audio_vae_fp32.safetensors"
+    };
+    static const char *names[] = {
+        "transformer.weight", "text.weight", "video.weight", "audio.weight"
+    };
+    char paths[4][768];
+    for (size_t index = 0; index < 4; index++) {
+        int length = snprintf(paths[index], sizeof(paths[index]), "%s/%s",
+                              root, relatives[index]);
+        CHECK(length > 0 && (size_t)length < sizeof(paths[index]));
+        write_probe_fixture(paths[index], names[index]);
+    }
+
+    h3_model_info model;
+    char error[512];
+    CHECK(h3_probe_model_dir(root, &model, error, sizeof(error)));
+    CHECK(model.layout == H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE);
+    CHECK(model.generation_supported == 1);
+    CHECK(model.text_encoder.files == 1 && model.text_encoder.tensors == 1);
+    CHECK(model.fl2va_transformer.files == 1 &&
+          model.fl2va_transformer.tensors == 1);
+    CHECK(model.video_vae.files == 1 && model.video_vae.tensor_bytes == 4);
+    CHECK(model.audio_vae.files == 1 && model.audio_vae.tensor_bytes == 4);
+    CHECK(model.ref2va_transformer.files == 0);
+
+    h3_ctx *context = h3_load_dir(root);
+    CHECK(context != NULL);
+    h3_params params = H3_PARAMS_DEFAULT;
+    params.first_frame = "/tmp/h3-unused-reference.ppm";
+    CHECK(h3_generate(context, "test prompt", &params) == NULL);
+    CHECK(strstr(h3_last_error(context),
+                 "currently supports prompt-only FL2VA generation") != NULL);
+    h3_free(context);
+
+    CHECK(unlink(paths[3]) == 0);
+    CHECK(!h3_probe_model_dir(root, &model, error, sizeof(error)));
+    CHECK(strstr(error, "missing required model file") != NULL);
+    for (size_t index = 0; index < 3; index++) CHECK(unlink(paths[index]) == 0);
+    CHECK(unlink(released_config) == 0);
+    CHECK(rmdir(released_transformer) == 0);
+    CHECK(rmdir(fl2va) == 0);
+    CHECK(rmdir(vae) == 0);
+    CHECK(rmdir(text) == 0);
+    CHECK(rmdir(diffusion) == 0);
+    CHECK(rmdir(root) == 0);
 }
 
 static void test_rng_and_solver(void) {
@@ -404,6 +515,7 @@ int main(void) {
     test_layout_fl2va();
     test_layout_ref2va();
     test_safetensors();
+    test_optimized_model_probe();
     test_rng_and_solver();
     test_rgb_resize();
     test_dit_row_conversions();

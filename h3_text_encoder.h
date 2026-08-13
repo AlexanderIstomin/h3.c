@@ -28,11 +28,23 @@ typedef struct {
     const uint16_t *deepstack[3];
 } h3_text_vision_span;
 
-/* Run the released first 50 Qwen3-VL language layers. The caller owns the
- * returned BF16 values and releases them with h3_text_embedding_free(). */
+/* Run the first 50 Qwen3-VL language layers from either the released BF16
+ * shards or the supported optimized I8/F32 single-file layout. The caller
+ * owns the returned BF16 values and releases them with
+ * h3_text_embedding_free(). */
 int h3_text_encode_bf16(const char *weight_directory,
                         const char *shader_source_path,
                         const uint32_t *token_ids, size_t token_count,
+                        h3_text_progress progress, void *progress_opaque,
+                        h3_text_embedding *output,
+                        char *error, size_t error_size);
+
+/* Prefix form used by optimized-checkpoint integration tests. It follows the
+ * same text-only presentation path while stopping after layer_count. */
+int h3_text_encode_layers_bf16(const char *weight_directory,
+                        const char *shader_source_path,
+                        const uint32_t *token_ids, size_t token_count,
+                        int layer_count,
                         h3_text_progress progress, void *progress_opaque,
                         h3_text_embedding *output,
                         char *error, size_t error_size);

@@ -17,7 +17,7 @@ LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity clean
+.PHONY: all test parity real-parity real-int8 clean
 
 all: h3 libh3.a
 
@@ -43,6 +43,24 @@ h3_text_tests: tests/test_text_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_audio_gpu_tests: tests/test_audio_gpu.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_quantized_weight_tests: tests/test_quantized_weights.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_optimized_int8_test: tests/test_real_optimized_int8.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_optimized_qwen_test: tests/test_real_optimized_qwen.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_optimized_audio_vae_test: tests/test_real_optimized_audio_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_optimized_video_vae_test: tests/test_real_optimized_video_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_real_optimized_dit_stream_test: tests/test_real_optimized_dit_stream.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_audio_vae_test: tests/test_real_audio_vae.o $(LIB_OBJ)
@@ -98,7 +116,8 @@ h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
-	h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+	h3_audio_gpu_tests h3_quantized_weight_tests \
+	h3_real_audio_vae_test h3_real_audio_encoder_test \
 	h3_av_mux_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test
@@ -122,6 +141,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		echo "skip: MLX Qwen fixture is not installed"; \
 	fi
 	./h3_audio_gpu_tests
+	./h3_quantized_weight_tests
 	@if test -f MiniMax-H3/FL2VA/audio_vae/model.safetensors && \
 	         test -f misc/fixtures/h3_real_audio_vae_37.safetensors; then \
 		./h3_real_audio_vae_test; \
@@ -187,6 +207,17 @@ real-parity: h3_real_prompt_test h3_real_dit_block_test
 	./h3_real_prompt_test MiniMax-H3 misc/fixtures/h3_real_prompt_bf16.safetensors
 	./h3_real_dit_block_test MiniMax-H3 misc/fixtures/h3_real_dit_block0_bf16.safetensors
 
+real-int8: h3_real_optimized_int8_test h3_real_optimized_qwen_test \
+	h3_real_optimized_audio_vae_test h3_real_optimized_video_vae_test \
+	h3_real_optimized_dit_stream_test
+	@test -n "$(H3_OPTIMIZED_MODEL)" || \
+		(echo "set H3_OPTIMIZED_MODEL to the installed package root" >&2; exit 2)
+	./h3_real_optimized_int8_test "$(H3_OPTIMIZED_MODEL)"
+	./h3_real_optimized_qwen_test "$(H3_OPTIMIZED_MODEL)"
+	./h3_real_optimized_audio_vae_test "$(H3_OPTIMIZED_MODEL)"
+	./h3_real_optimized_video_vae_test "$(H3_OPTIMIZED_MODEL)"
+	./h3_real_optimized_dit_stream_test "$(H3_OPTIMIZED_MODEL)"
+
 %.o: %.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
 
@@ -205,7 +236,12 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 clean:
 	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
-		h3_audio_gpu_tests h3_real_audio_vae_test h3_real_audio_encoder_test \
+		h3_real_optimized_qwen_test \
+		h3_real_optimized_audio_vae_test h3_real_optimized_video_vae_test \
+		h3_real_optimized_dit_stream_test \
+		h3_audio_gpu_tests h3_quantized_weight_tests \
+		h3_real_optimized_int8_test \
+		h3_real_audio_vae_test h3_real_audio_encoder_test \
 		h3_av_mux_test \
 		h3_real_video_encoder_test h3_real_qwen_vision_test \
 		h3_real_multimodal_text_test h3_real_ref_video_text_test \

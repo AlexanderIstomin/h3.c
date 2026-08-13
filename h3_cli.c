@@ -160,7 +160,7 @@ static void print_help(void) {
     puts("  !layers [N]              Set or show active DiT blocks");
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
-    puts("  !ssd-streaming [on|off]   Toggle original-BF16 SSD streaming");
+    puts("  !ssd-streaming [on|off]   Toggle released-BF16 SSD streaming");
     puts("  !int8-row-fc2 [on|off]    Toggle faster one-scale FC2");
     puts("  !reference-rope [on|off]  Toggle released spatial RoPE");
     puts("  !first [PATH|clear]      Set, show, or clear first frame");
@@ -182,6 +182,9 @@ static void print_help(void) {
 
 static void print_status(const h3_cli_state *state) {
     int aligned = h3_align_frame_count(state->params.frames);
+    const h3_model_info *model = h3_model(state->ctx);
+    int optimized = model && model->layout ==
+        H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE;
     printf("Size: %dx%d", state->params.width, state->params.height);
     if (state->params.render_width)
         printf(" (render %dx%d)", state->params.render_width,
@@ -193,7 +196,9 @@ static void print_status(const h3_cli_state *state) {
            state->params.steps, state->params.denoise_reuse,
            state->params.dit_layers, state->params.core_reuse,
            state->params.token_reduction ? "reduced" : "full",
+           optimized ? "SSD I8/F32 (automatic)" :
            state->params.ssd_streaming ? "SSD BF16" : "resident",
+           optimized ? "prequantized I8" :
            state->params.ssd_streaming ? "BF16" :
            state->params.use_int8_row_fc2 ? "int8 row" : "int8 grouped");
     printf("Spatial RoPE: %s\n", state->params.use_reference_rope ?
