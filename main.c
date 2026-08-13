@@ -34,6 +34,8 @@ static void usage(const char *program) {
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream DiT layers (automatic for optimized INT8)\n"
         "      --beta-schedule    Beta(0.6,0.6) sigma spacing for turbo checkpoints\n"
+        "      --lora PATH        Apply a low-rank adapter at runtime\n"
+        "      --lora-strength S  Adapter strength, default 1.0\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
         "      --use-slower-bf16-mlp  Force close-reference BF16/MPS MLP\n"
@@ -91,6 +93,17 @@ static int frames_from_seconds(const char *value) {
         exit(2);
     }
     return (int)rounded;
+}
+
+static float parse_float(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno || !end || *end || !isfinite(parsed)) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return (float)parsed;
 }
 
 static uint64_t parse_u64(const char *value, const char *label) {
@@ -239,6 +252,8 @@ int main(int argc, char **argv) {
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
            OPT_BETA_SCHEDULE,
+           OPT_LORA,
+           OPT_LORA_STRENGTH,
            OPT_USE_SLOWER_BF16_MLP,
            OPT_USE_SLOWER_BF16_QKV,
            OPT_USE_SLOWER_BF16_ATTENTION_OUTPUT,
@@ -273,6 +288,8 @@ int main(int argc, char **argv) {
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"beta-schedule", no_argument, NULL, OPT_BETA_SCHEDULE},
+        {"lora", required_argument, NULL, OPT_LORA},
+        {"lora-strength", required_argument, NULL, OPT_LORA_STRENGTH},
         {"use-slower-bf16-mlp", no_argument, NULL,
          OPT_USE_SLOWER_BF16_MLP},
         {"use-slower-bf16-qkv", no_argument, NULL,
@@ -366,6 +383,12 @@ int main(int argc, char **argv) {
                 break;
             case OPT_BETA_SCHEDULE:
                 params.use_beta_schedule = 1;
+                break;
+            case OPT_LORA:
+                params.lora_path = optarg;
+                break;
+            case OPT_LORA_STRENGTH:
+                params.lora_strength = parse_float(optarg, "lora strength");
                 break;
             case OPT_USE_SLOWER_BF16_MLP:
                 params.use_slower_bf16_mlp = 1;

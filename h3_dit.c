@@ -50,6 +50,13 @@ typedef struct {
     h3_gpu_tensor *fc2_int8;
     h3_gpu_tensor *fc2_scales;
     uint32_t fc2_convrot_group;
+    /* Optional low-rank adapters. A is pre-rotated into the ConvRot
+     * activation basis and B carries the requested strength, so the forward
+     * pass is two plain BF16 products and an add. */
+    h3_gpu_tensor *qkv_lora_a, *qkv_lora_b;
+    h3_gpu_tensor *out_lora_a, *out_lora_b;
+    h3_gpu_tensor *fc1_lora_a, *fc1_lora_b;
+    h3_gpu_tensor *fc2_lora_a, *fc2_lora_b;
 } h3_dit_block;
 
 enum {
@@ -192,6 +199,9 @@ struct h3_dit {
     h3_gpu_tensor *mlp_output;
     h3_gpu_tensor *int8_activation;
     h3_gpu_tensor *int8_activation_scales;
+    uint32_t lora_rank;
+    h3_gpu_tensor *lora_hidden;
+    h3_gpu_tensor *lora_delta;
     h3_gpu_tensor *final_audio_input;
     h3_gpu_tensor *final_video_input;
     h3_gpu_tensor *final_audio_inverse;
@@ -598,6 +608,175 @@ static void free_block(h3_dit_block *block) {
     free_tensor(&block->fc1_scales);
     free_tensor(&block->fc2_int8);
     free_tensor(&block->fc2_scales);
+    free_tensor(&block->qkv_lora_a);
+    free_tensor(&block->qkv_lora_b);
+    free_tensor(&block->out_lora_a);
+    free_tensor(&block->out_lora_b);
+    free_tensor(&block->fc1_lora_a);
+    free_tensor(&block->fc1_lora_b);
+    free_tensor(&block->fc2_lora_a);
+    free_tensor(&block->fc2_lora_b);
+}
+
+/* --- Optional low-rank adapters -------------------------------------- */
+
+static uint16_t f32_to_bf16_round(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+}
+
+static float bf16_to_f32_value(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+/* Folding the strength into B keeps the forward pass to existing kernels. */
+static int scale_bf16_tensor(h3_gpu_tensor *tensor, size_t elements,
+                             float strength) {
+    if (strength == 1.0f) return 1;
+    uint16_t *host = malloc(elements * sizeof(*host));
+    if (!host) return 0;
+    if (!h3_gpu_tensor_read_bf16(tensor, host, elements)) {
+        free(host);
+        return 0;
+    }
+    for (size_t index = 0; index < elements; index++)
+        host[index] = f32_to_bf16_round(
+            bf16_to_f32_value(host[index]) * strength);
+    int ok = h3_gpu_tensor_write_bf16(tensor, host, elements);
+    free(host);
+    return ok;
+}
+
+static int load_lora_pair(h3_dit *dit, const h3_weight_store *store,
+                          unsigned layer, const char *suffix,
+                          uint32_t input_dim, uint32_t output_dim,
+                          uint32_t convrot_group, float strength,
+                          h3_gpu_tensor **down, h3_gpu_tensor **up,
+                          char *error, size_t error_size) {
+    char name[224];
+    snprintf(name, sizeof(name),
+             "diffusion_model.blocks.%u.%s.lora_A.weight", layer, suffix);
+    const uint64_t down_shape[] = {dit->lora_rank, input_dim};
+    h3_gpu_tensor *a = h3_weight_load_bf16(store, dit->gpu, name, 2,
+                                           down_shape, error, error_size);
+    if (!a) return 0;
+    snprintf(name, sizeof(name),
+             "diffusion_model.blocks.%u.%s.lora_B.weight", layer, suffix);
+    const uint64_t up_shape[] = {output_dim, dit->lora_rank};
+    h3_gpu_tensor *b = h3_weight_load_bf16(store, dit->gpu, name, 2,
+                                           up_shape, error, error_size);
+    if (!b) {
+        h3_gpu_tensor_free(a);
+        return 0;
+    }
+    /* The projection consumes an already-rotated activation, so the adapter
+     * input is rotated once here instead of unrotating every forward. */
+    int ok = 1;
+    if (convrot_group)
+        ok = h3_gpu_begin(dit->gpu) &&
+             h3_gpu_convrot_bf16(dit->gpu, a, a, dit->lora_rank, input_dim,
+                                 convrot_group) &&
+             h3_gpu_submit(dit->gpu);
+    if (ok)
+        ok = scale_bf16_tensor(b, (size_t)output_dim * dit->lora_rank,
+                               strength);
+    if (!ok) {
+        fail(error, error_size,
+             "cannot prepare the block %u %s adapter: %s", layer, suffix,
+             h3_gpu_error(dit->gpu));
+        h3_gpu_tensor_free(a);
+        h3_gpu_tensor_free(b);
+        return 0;
+    }
+    *down = a;
+    *up = b;
+    return 1;
+}
+
+static int load_lora_adapters(h3_dit *dit, const char *path, float strength,
+                              h3_dit_progress progress, void *progress_opaque,
+                              char *error, size_t error_size) {
+    if (!dit->prequantized_int8) {
+        fail(error, error_size,
+             "runtime adapters currently require a pre-quantized INT8 "
+             "checkpoint; this build cannot apply them to BF16 weights");
+        return 0;
+    }
+    h3_weight_store *store = h3_weight_store_open(path, error, error_size);
+    if (!store) return 0;
+    const h3_st_tensor *probe = h3_weight_find(
+        store, "diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight", NULL);
+    if (!probe || probe->ndim != 2 || probe->dtype != H3_DTYPE_BF16 ||
+        probe->shape[1] != HIDDEN || !probe->shape[0] ||
+        probe->shape[0] > 512) {
+        fail(error, error_size,
+             "the adapter file must hold BF16 diffusion_model.blocks.N "
+             "lora_A/lora_B pairs for this transformer");
+        h3_weight_store_free(store);
+        return 0;
+    }
+    dit->lora_rank = (uint32_t)probe->shape[0];
+    int ok = 1;
+    for (unsigned layer = 0; layer < H3_DIT_BLOCKS && ok; layer++) {
+        report(progress, progress_opaque, "load adapters", (int)layer,
+               H3_DIT_BLOCKS);
+        if (!dit->block_active[layer]) continue;
+        h3_dit_block *block = &dit->blocks[layer];
+        ok = load_lora_pair(dit, store, layer, "attn.qkv_proj", HIDDEN,
+                            INNER * 3, block->qkv_convrot_group, strength,
+                            &block->qkv_lora_a, &block->qkv_lora_b,
+                            error, error_size) &&
+             load_lora_pair(dit, store, layer, "attn.out_proj", INNER,
+                            HIDDEN, block->out_convrot_group, strength,
+                            &block->out_lora_a, &block->out_lora_b,
+                            error, error_size) &&
+             load_lora_pair(dit, store, layer, "mlp.fc1", HIDDEN, FFN * 2,
+                            block->fc1_convrot_group, strength,
+                            &block->fc1_lora_a, &block->fc1_lora_b,
+                            error, error_size) &&
+             load_lora_pair(dit, store, layer, "mlp.fc2", FFN, HIDDEN,
+                            block->fc2_convrot_group, strength,
+                            &block->fc2_lora_a, &block->fc2_lora_b,
+                            error, error_size);
+    }
+    h3_weight_store_free(store);
+    if (!ok) return 0;
+    dit->lora_hidden = h3_gpu_tensor_new_bf16(
+        dit->gpu, (size_t)dit->sequence * dit->lora_rank);
+    dit->lora_delta = h3_gpu_tensor_new_bf16(
+        dit->gpu, (size_t)dit->sequence * FFN * 2);
+    if (!dit->lora_hidden || !dit->lora_delta) {
+        fail(error, error_size, "cannot allocate adapter activations: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    report(progress, progress_opaque, "load adapters", H3_DIT_BLOCKS,
+           H3_DIT_BLOCKS);
+    return 1;
+}
+
+static int apply_lora(h3_dit *dit, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *down, const h3_gpu_tensor *up,
+                      uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                      char *error, size_t error_size) {
+    if (!down || !up) return 1;
+    return gpu_op(dit, h3_gpu_linear_bf16(
+                      dit->gpu, dit->lora_hidden, input, down, NULL, rows,
+                      input_dim, dit->lora_rank),
+                  error, error_size, "DiT adapter down projection") &&
+           gpu_op(dit, h3_gpu_linear_bf16(
+                      dit->gpu, dit->lora_delta, dit->lora_hidden, up, NULL,
+                      rows, dit->lora_rank, output_dim),
+                  error, error_size, "DiT adapter up projection") &&
+           gpu_op(dit, h3_gpu_add_bf16(
+                      dit->gpu, output, output, dit->lora_delta,
+                      rows * output_dim),
+                  error, error_size, "DiT adapter residual");
 }
 
 static double stream_now(void) {
@@ -1747,6 +1926,8 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_dynamic_fc1_k,
                         int use_slower_grouped_quantizer,
                         int use_int8_row_fc2,
+                        const char *lora_path,
+                        float lora_strength,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -1864,6 +2045,9 @@ static h3_dit *load_dit(const char *weight_directory,
         !prepare_token_reduction_maps(dit, error, error_size) ||
         !load_core(dit, progress, progress_opaque, error, error_size) ||
         !allocate_activations(dit, error, error_size)) goto failed;
+    if (lora_path && *lora_path && lora_strength != 0.0f &&
+        !load_lora_adapters(dit, lora_path, lora_strength, progress,
+                            progress_opaque, error, error_size)) goto failed;
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
              wanted_video_condition)) ||
@@ -1901,6 +2085,8 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const char *lora_path,
+                         float lora_strength,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -1917,6 +2103,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
+                    lora_path, lora_strength,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -1943,6 +2130,8 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         const char *lora_path,
+                         float lora_strength,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -1963,6 +2152,7 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
+                    lora_path, lora_strength,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -2090,6 +2280,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->qkv, dit->mod_attention,
             weight->qkv_int8, weight->qkv_scales, NULL,
             rows, HIDDEN, INNER * 3), "DiT pre-quantized QKV projection");
+        if (!apply_lora(dit, dit->qkv, dit->mod_attention,
+                        weight->qkv_lora_a, weight->qkv_lora_b,
+                        rows, HIDDEN, INNER * 3, error, error_size)) return 0;
         /* Comfy's compact checkpoint preserves the projection's ordinary
          * [Q-all-heads | K-all-heads | V-all-heads] row order.  The released
          * MiniMax tree uses the per-head interleaved order handled by the
@@ -2146,6 +2339,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->out_int8, weight->out_scales, NULL,
             rows, INNER, HIDDEN),
            "DiT pre-quantized attention output");
+        if (!apply_lora(dit, dit->attention_output, dit->attention_heads,
+                        weight->out_lora_a, weight->out_lora_b,
+                        rows, INNER, HIDDEN, error, error_size)) return 0;
     } else if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -2205,6 +2401,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->fc1, dit->mod_mlp,
             weight->fc1_int8, weight->fc1_scales, NULL,
             rows, HIDDEN, FFN * 2), "DiT pre-quantized MLP input");
+        if (!apply_lora(dit, dit->fc1, dit->mod_mlp,
+                        weight->fc1_lora_a, weight->fc1_lora_b,
+                        rows, HIDDEN, FFN * 2, error, error_size)) return 0;
         OP(h3_gpu_swiglu_bf16(
             dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT pre-quantized SwiGLU");
@@ -2217,6 +2416,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, mlp_output, dit->activated,
             weight->fc2_int8, weight->fc2_scales, NULL,
             rows, FFN, HIDDEN), "DiT pre-quantized MLP output");
+        if (!apply_lora(dit, mlp_output, dit->activated,
+                        weight->fc2_lora_a, weight->fc2_lora_b,
+                        rows, FFN, HIDDEN, error, error_size)) return 0;
     } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
@@ -3308,7 +3510,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
     FREE(activated); FREE(mlp_output); FREE(int8_activation);
-    FREE(int8_activation_scales); FREE(final_audio_input);
+    FREE(int8_activation_scales); FREE(lora_hidden); FREE(lora_delta); FREE(final_audio_input);
     FREE(final_video_input); FREE(final_audio_inverse);
     FREE(final_video_inverse); FREE(final_audio_norm); FREE(final_video_norm);
     FREE(final_audio_f32); FREE(final_video_f32); FREE(audio_output);

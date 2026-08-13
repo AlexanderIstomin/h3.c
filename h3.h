@@ -122,6 +122,10 @@ typedef struct {
     int use_slower_dynamic_fc1_k;
     /* Force the original 256-thread FC2 grouped activation quantizer. */
     int use_slower_grouped_quantizer;
+    /* Optional low-rank adapter applied to the transformer projections at
+     * runtime. Strength scales the adapter contribution; 0 disables it. */
+    const char *lora_path;
+    float lora_strength;
     /* Decode and deliver one representative frame after every Euler step. */
     int preview_denoise;
     /* Space the sigma schedule at Beta(0.6, 0.6) quantiles instead of the
@@ -136,7 +140,8 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
+    NULL, 1.0f, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {
