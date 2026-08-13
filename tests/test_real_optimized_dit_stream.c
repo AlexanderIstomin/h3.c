@@ -76,6 +76,7 @@ int main(int argc, char **argv) {
         path, "h3_shaders.metal", &text, &layout, &sigmas,
         DIT_LAYERS, 1, 0, 1, 1.0f,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        NULL, 1.0f,
         progress, NULL, error, sizeof(error));
     if (!dit) {
         fprintf(stderr, "FAIL: optimized DiT load failed: %s\n", error);
