@@ -700,6 +700,12 @@ static int load_lora_pair(h3_dit *dit, const h3_weight_store *store,
 static int load_lora_adapters(h3_dit *dit, const char *path, float strength,
                               h3_dit_progress progress, void *progress_opaque,
                               char *error, size_t error_size) {
+    if (!dit->prequantized_int8) {
+        fail(error, error_size,
+             "runtime adapters currently require a pre-quantized INT8 "
+             "checkpoint; this build cannot apply them to BF16 weights");
+        return 0;
+    }
     h3_weight_store *store = h3_weight_store_open(path, error, error_size);
     if (!store) return 0;
     const h3_st_tensor *probe = h3_weight_find(
