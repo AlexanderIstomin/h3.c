@@ -39,9 +39,13 @@ int h3_metal_probe(h3_device_info *info, char *error, size_t error_size) {
                 break;
             }
         }
+/* MTLGPUFamilyMetal4 needs the macOS 26 SDK at compile time; older
+ * toolchains build a binary that simply reports no Metal 4 support. */
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
         if (@available(macOS 26.0, *)) {
             info->metal4 = [device supportsFamily:MTLGPUFamilyMetal4] ? 1 : 0;
         }
+#endif
     }
     return 1;
 }
