@@ -133,9 +133,19 @@ static void cleanup(encoder_context *encoder) {
     memset(encoder, 0, sizeof(*encoder));
 }
 
+/* The released tree stores the encoder in F32; the packages built around a
+ * single-file VAE store it in F16. The decoder accepts both the same way. */
 static h3_gpu_tensor *load_f32(encoder_context *encoder, const char *name,
                                int ndim, const uint64_t *shape, char *error,
                                size_t error_size) {
+    const h3_st_tensor *tensor = h3_weight_find(encoder->store, name, NULL);
+    if (!tensor) {
+        fail(error, error_size, "required weight is absent: %s", name);
+        return NULL;
+    }
+    if (tensor->dtype == H3_DTYPE_F16)
+        return h3_weight_load_f16_as_f32(encoder->store, encoder->gpu, name,
+                                         ndim, shape, error, error_size);
     return h3_weight_load_f32(encoder->store, encoder->gpu, name, ndim, shape,
                               error, error_size);
 }
@@ -237,6 +247,26 @@ static int parse_float_array(const char *json, const char *key, float *values,
 static int load_normalization(encoder_context *encoder,
                               const char *weight_directory,
                               char *error, size_t error_size) {
+    /* Single-file VAEs carry the normalization as tensors; only the released
+     * directory layout keeps it in a sibling config.json. The decoder resolves
+     * it the same way. */
+    if (h3_weight_find(encoder->store, "latents_mean", NULL) ||
+        h3_weight_find(encoder->store, "latents_std", NULL)) {
+        int ok = h3_weight_read_f32_vector(
+                     encoder->store, "latents_mean", encoder->latent_mean,
+                     LATENT_CHANNELS, error, error_size) &&
+                 h3_weight_read_f32_vector(
+                     encoder->store, "latents_std", encoder->latent_std,
+                     LATENT_CHANNELS, error, error_size);
+        if (ok) for (int channel = 0; channel < LATENT_CHANNELS; channel++) {
+            if (encoder->latent_std[channel] <= 0.0f) {
+                fail(error, error_size,
+                     "video VAE latent standard deviation is invalid");
+                return 0;
+            }
+        }
+        return ok;
+    }
     size_t path_size = strlen(weight_directory) + strlen("/../config.json") + 1;
     char *path = malloc(path_size);
     if (!path) {

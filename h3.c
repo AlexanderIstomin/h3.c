@@ -477,6 +477,17 @@ static int h3_probe_optimized_int8(const char *root, h3_model_info *model,
                            &model->video_vae, error, error_size) ||
         !h3_inventory_root(root, audio_vae, 1,
                            &model->audio_vae, error, error_size)) return 0;
+    /* Ordered references need the companion Ref2VA checkpoint. A package
+     * without it is still complete for every other mode, so its absence rules
+     * out that one mode rather than the package. */
+    static const char ref_transformer[] =
+        "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors";
+    char *ref_path = h3_path(root, ref_transformer);
+    int has_ref2va = ref_path && h3_is_file(ref_path);
+    free(ref_path);
+    if (has_ref2va && !h3_inventory_root(root, ref_transformer, 1,
+                                         &model->ref2va_transformer,
+                                         error, error_size)) return 0;
     model->layout = H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE;
     model->generation_supported = 1;
     return 1;
@@ -962,13 +973,6 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!h3_valid_params(ctx, params)) return NULL;
     int optimized = ctx->model.layout ==
         H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE;
-    if (optimized && (params->reference_count || params->first_frame ||
-                      params->last_frame)) {
-        h3_set_error(ctx,
-            "the optimized INT8 package currently supports prompt-only FL2VA "
-            "generation; visual references are not supported yet");
-        return NULL;
-    }
     int dit_ssd_streaming = optimized ? 1 : params->ssd_streaming;
     int render_width = params->render_width ? params->render_width :
                                                params->width;
@@ -1034,16 +1038,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     int conditioned = 0;
     int dit_is_cached = 0;
     int decoder_is_cached = 0;
-    char *tokenizer_path = h3_path(ctx->model_dir, ref2va ?
+    /* Both transformers share one tokenizer and, in the optimized layout, one
+     * text encoder; only the released tree keeps a second copy under Ref2VA. */
+    char *tokenizer_path = h3_path(ctx->model_dir, (ref2va && !optimized) ?
         "Ref2VA/tokenizer/tokenizer.json" : "FL2VA/tokenizer/tokenizer.json");
     char *text_path = h3_path(ctx->model_dir, optimized ?
         "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors" :
         (ref2va ? "Ref2VA/text_encoder" : "FL2VA/text_encoder"));
     char *dit_path = h3_path(ctx->model_dir, optimized ?
-        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors" :
+        (ref2va
+            ? "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+            : "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors") :
         (ref2va ? "Ref2VA/transformer" : "FL2VA/transformer"));
-    /* The int8 ConvRot decoder is a drop-in replacement that decodes about
-     * 1.6x faster; prefer it whenever the package carries one. */
+    /* The int8 ConvRot decoder is a drop-in replacement, used when a package
+     * ships one. An early 256-square measurement showed it decoding faster;
+     * timing load and decode separately at 512 with a 22-frame clip reversed
+     * that, so packages here ship the fp16 decoder and this path exists for
+     * packages that carry only the int8 one. */
     char *vae_path = NULL;
     if (optimized) {
         vae_path = h3_path(
