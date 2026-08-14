@@ -193,6 +193,32 @@ kernel void h3_silu_f32(device const float *input [[buffer(0)]],
     output[gid] = value / (1.0f + exp(-value));
 }
 
+kernel void h3_relu_f32(device const float *input [[buffer(0)]],
+                        device float *output [[buffer(1)]],
+                        constant uint &count [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    output[gid] = max(input[gid], 0.0f);
+}
+
+/* Nearest-neighbour 2x spatial upsample over an NHWC image: each output pixel
+ * copies the channel vector of the input pixel at half its coordinates. */
+kernel void h3_nearest2x_nhwc_f32(device const float *input [[buffer(0)]],
+                                  device float *output [[buffer(1)]],
+                                  constant uint &height [[buffer(2)]],
+                                  constant uint &width [[buffer(3)]],
+                                  constant uint &channels [[buffer(4)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    uint output_width = width * 2;
+    uint count = height * 2 * output_width * channels;
+    if (gid >= count) return;
+    uint channel = gid % channels;
+    uint pixel = gid / channels;
+    uint x = pixel % output_width;
+    uint y = pixel / output_width;
+    output[gid] = input[((y / 2) * width + x / 2) * channels + channel];
+}
+
 kernel void h3_cast_f32_to_bf16(device const float *input [[buffer(0)]],
                                 device ushort *output [[buffer(1)]],
                                 constant uint &count [[buffer(2)]],

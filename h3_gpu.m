@@ -241,6 +241,7 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
     NSMutableArray<NSString *> *names = [@[
         @"h3_linear_f32", @"h3_linear_f32_tiled",
         @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
+        @"h3_relu_f32", @"h3_nearest2x_nhwc_f32",
         @"h3_linear_f32_tiled_bf16_map",
         @"h3_cast_f32_to_bf16",
         @"h3_cast_bf16_to_f32",
@@ -1493,6 +1494,43 @@ int h3_gpu_silu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
+int h3_gpu_relu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                    const h3_gpu_tensor *input, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, input, elements, @"ReLU input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, elements, @"ReLU output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_relu_f32", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
+        });
+}
+
+int h3_gpu_nearest2x_nhwc_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *input, uint32_t height,
+                              uint32_t width, uint32_t channels) {
+    H3GPU *gpu = GPU(opaque);
+    uint32_t input_elements = height * width * channels;
+    uint32_t output_elements = input_elements * 4;
+    if (!h3_gpu_require_elements(gpu, input, input_elements,
+                                 @"nearest upsample input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_elements,
+                                 @"nearest upsample output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_nearest2x_nhwc_f32", output_elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&height length:sizeof(height) atIndex:2];
+            [encoder setBytes:&width length:sizeof(width) atIndex:3];
+            [encoder setBytes:&channels length:sizeof(channels) atIndex:4];
+        });
+}
+
 int h3_gpu_cast_f32_to_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                             const h3_gpu_tensor *input, uint32_t elements) {
     H3GPU *gpu = GPU(opaque);
@@ -2077,14 +2115,15 @@ static H3Conv *h3_gpu_conv3d_graph(
         uint32_t width, uint32_t input_channels, uint32_t output_channels,
         uint32_t kernel_depth, uint32_t kernel_height, uint32_t kernel_width,
         uint32_t stride_depth, uint32_t stride_height, uint32_t stride_width,
+        uint32_t pad_height, uint32_t pad_width,
         uint32_t output_depth, uint32_t output_height, uint32_t output_width,
         int has_bias) {
     @autoreleasepool {
         NSString *key = [NSString stringWithFormat:
-            @"3:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d", batch, depth,
+            @"3:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%u:%d", batch, depth,
             height, width, input_channels, output_channels, kernel_depth,
             kernel_height, kernel_width, stride_depth, stride_height,
-            stride_width, has_bias];
+            stride_width, pad_height, pad_width, has_bias];
         H3Conv *cached = gpu.convCache[key];
         if (cached) return cached;
         H3Conv *conv = [[H3Conv alloc] init];
@@ -2107,7 +2146,8 @@ static H3Conv *h3_gpu_conv3d_graph(
                 descriptorWithStrideInX:stride_width
                 strideInY:stride_height strideInZ:stride_depth
                 dilationRateInX:1 dilationRateInY:1 dilationRateInZ:1 groups:1
-                paddingLeft:0 paddingRight:0 paddingTop:0 paddingBottom:0
+                paddingLeft:pad_width paddingRight:pad_width
+                paddingTop:pad_height paddingBottom:pad_height
                 paddingFront:0 paddingBack:0
                 paddingStyle:MPSGraphPaddingStyleExplicit
                 dataLayout:MPSGraphTensorNamedDataLayoutNDHWC
@@ -2128,7 +2168,7 @@ static H3Conv *h3_gpu_conv3d_graph(
     }
 }
 
-int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+static int h3_gpu_conv3d_run(h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t batch,
@@ -2136,16 +2176,21 @@ int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                       uint32_t input_channels, uint32_t output_channels,
                       uint32_t kernel_depth, uint32_t kernel_height,
                       uint32_t kernel_width, uint32_t stride_depth,
-                      uint32_t stride_height, uint32_t stride_width) {
+                      uint32_t stride_height, uint32_t stride_width,
+                      uint32_t pad_height, uint32_t pad_width) {
     H3GPU *gpu = GPU(opaque);
     if (!batch || !depth || !height || !width || !input_channels ||
         !output_channels || !kernel_depth || !kernel_height || !kernel_width ||
         !stride_depth || !stride_height || !stride_width ||
-        depth < kernel_depth || height < kernel_height || width < kernel_width)
+        depth < kernel_depth ||
+        height + 2 * pad_height < kernel_height ||
+        width + 2 * pad_width < kernel_width)
         return 0;
     uint32_t output_depth = (depth - kernel_depth) / stride_depth + 1;
-    uint32_t output_height = (height - kernel_height) / stride_height + 1;
-    uint32_t output_width = (width - kernel_width) / stride_width + 1;
+    uint32_t output_height =
+        (height + 2 * pad_height - kernel_height) / stride_height + 1;
+    uint32_t output_width =
+        (width + 2 * pad_width - kernel_width) / stride_width + 1;
     size_t input_count = (size_t)batch * depth * height * width * input_channels;
     size_t weight_count = (size_t)output_channels * input_channels *
                           kernel_depth * kernel_height * kernel_width;
@@ -2164,7 +2209,8 @@ int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     H3Conv *conv = h3_gpu_conv3d_graph(
         gpu, batch, depth, height, width, input_channels, output_channels,
         kernel_depth, kernel_height, kernel_width, stride_depth, stride_height,
-        stride_width, output_depth, output_height, output_width, bias != NULL);
+        stride_width, pad_height, pad_width,
+        output_depth, output_height, output_width, bias != NULL);
     if (!conv) return 0;
     @autoreleasepool {
         MPSCommandBuffer *command = h3_gpu_mps_command(gpu);
@@ -2201,6 +2247,41 @@ int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     stats.mps_conv_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+int h3_gpu_conv3d_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t input_channels, uint32_t output_channels,
+                      uint32_t kernel_depth, uint32_t kernel_height,
+                      uint32_t kernel_width, uint32_t stride_depth,
+                      uint32_t stride_height, uint32_t stride_width) {
+    return h3_gpu_conv3d_run(opaque, output, input, weight, bias, batch,
+                             depth, height, width, input_channels,
+                             output_channels, kernel_depth, kernel_height,
+                             kernel_width, stride_depth, stride_height,
+                             stride_width, 0, 0);
+}
+
+/* Same-padded spatial convolution: zero padding of kernel/2 on each side of
+ * height and width, so stride-1 convolutions preserve the canvas. Depth stays
+ * unpadded — the 2D users pass depth 1. */
+int h3_gpu_conv3d_same_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t input_channels, uint32_t output_channels,
+                      uint32_t kernel_depth, uint32_t kernel_height,
+                      uint32_t kernel_width, uint32_t stride_depth,
+                      uint32_t stride_height, uint32_t stride_width) {
+    return h3_gpu_conv3d_run(opaque, output, input, weight, bias, batch,
+                             depth, height, width, input_channels,
+                             output_channels, kernel_depth, kernel_height,
+                             kernel_width, stride_depth, stride_height,
+                             stride_width, kernel_height / 2, kernel_width / 2);
 }
 
 int h3_gpu_conv1d_stride_f32(h3_gpu *opaque, h3_gpu_tensor *output,
