@@ -135,6 +135,12 @@ typedef struct {
      * a mux, so no FFmpeg process is involved. For audio output, where
      * decoding pictures nobody keeps is a large share of the render. */
     int audio_only;
+    /* Cache the tail of the transformer on schedule-gated denoising steps:
+     * a warm prefix of the blocks runs and the cached residual of the rest
+     * is replayed. Roughly halves denoising on 20-step schedules; distilled
+     * few-step schedules gate almost nothing. Cannot combine with core
+     * reuse, denoiser reuse, or token reduction. */
+    int block_cache;
     /* Decode and deliver one representative frame after every Euler step. */
     int preview_denoise;
     /* Space the sigma schedule at Beta(0.6, 0.6) quantiles instead of the
@@ -150,7 +156,7 @@ typedef struct {
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    NULL, 1.0f, 0, 0, 0, 0, NULL, NULL, NULL \
+    NULL, 1.0f, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

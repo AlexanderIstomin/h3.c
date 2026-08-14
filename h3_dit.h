@@ -50,6 +50,12 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
 /* Load FL2VA/Ref2VA packing. Condition inputs are already patchified F32 row
  * sources: visual rows have width 96 and audio rows width 32. Their element
  * counts must exactly match layout.img_cond_rows/audio_cond_rows. */
+/* Enables TE-Speed style block caching: gated denoising steps run only a
+ * warm prefix of the transformer blocks and replay the cached tail residual.
+ * Call after load; refuses core reuse and token reduction combinations. */
+int h3_dit_set_block_cache(h3_dit *dit, int enabled,
+                           char *error, size_t error_size);
+
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
                          const char *shader_source_path,

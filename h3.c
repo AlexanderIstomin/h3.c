@@ -707,6 +707,18 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "core reuse and denoiser reuse cannot be combined");
         return 0;
     }
+    if (params->block_cache != 0 && params->block_cache != 1) {
+        h3_set_error(ctx, "block cache must be zero or one");
+        return 0;
+    }
+    if (params->block_cache &&
+        (params->core_reuse > 1 || params->denoise_reuse > 1 ||
+         params->token_reduction)) {
+        h3_set_error(ctx,
+            "the block cache cannot combine with core reuse, denoiser "
+            "reuse, or token reduction");
+        return 0;
+    }
     if (params->reference_count && !params->references) {
         h3_set_error(ctx, "reference_count is nonzero but references is NULL");
         return 0;
@@ -1764,6 +1776,11 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
+    if (!h3_dit_set_block_cache(dit, params->block_cache,
+                                detail, sizeof(detail))) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }

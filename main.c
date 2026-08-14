@@ -34,6 +34,8 @@ static void usage(const char *program) {
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream DiT layers (automatic for optimized INT8)\n"
         "      --beta-schedule    Beta(0.6,0.6) sigma spacing for turbo checkpoints\n"
+        "      --block-cache      Replay cached tail-block residuals on\n"
+        "                         schedule-gated denoising steps\n"
         "      --audio-only       Skip the video decoder; write a 32 kHz WAV\n"
         "      --lora PATH        Apply a low-rank adapter at runtime\n"
         "      --lora-strength S  Adapter strength, default 1.0\n"
@@ -258,7 +260,7 @@ int main(int argc, char **argv) {
            OPT_SSD_STREAMING,
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
-           OPT_BETA_SCHEDULE,
+           OPT_BETA_SCHEDULE, OPT_BLOCK_CACHE,
            OPT_AUDIO_ONLY,
            OPT_LORA,
            OPT_LORA_STRENGTH,
@@ -296,6 +298,7 @@ int main(int argc, char **argv) {
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"beta-schedule", no_argument, NULL, OPT_BETA_SCHEDULE},
+        {"block-cache", no_argument, NULL, OPT_BLOCK_CACHE},
         {"audio-only", no_argument, NULL, OPT_AUDIO_ONLY},
         {"lora", required_argument, NULL, OPT_LORA},
         {"lora-strength", required_argument, NULL, OPT_LORA_STRENGTH},
@@ -495,6 +498,7 @@ int main(int argc, char **argv) {
                 break;
             }
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
+            case OPT_BLOCK_CACHE: params.block_cache = 1; break;
             case OPT_SHOW: show = 1; break;
             case OPT_PREVIEW: preview_flag = 1; break;
             case OPT_ZOOM:

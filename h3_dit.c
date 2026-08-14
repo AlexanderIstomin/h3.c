@@ -121,6 +121,15 @@ struct h3_dit {
     unsigned core_reuse_interval;
     unsigned core_forward_count;
     int core_residual_ready;
+    /* Block cache: gated steps run only a warm prefix of the blocks and
+     * replay the cached tail residual from the last full step. */
+    int block_cache;
+    int cache_plan_ready;
+    uint8_t cache_full_step[H3_MAX_STEPS];
+    unsigned cache_warm_last;
+    int cache_residual_ready;
+    int cache_forward_is_cached;
+    int cache_forward_captures;
     unsigned active_block_count;
     uint8_t block_active[H3_DIT_BLOCKS];
     h3_layout layout;
@@ -179,6 +188,8 @@ struct h3_dit {
     h3_gpu_tensor *hidden;
     h3_gpu_tensor *core_input;
     h3_gpu_tensor *core_residual;
+    h3_gpu_tensor *cache_snapshot;
+    h3_gpu_tensor *cache_residual;
     h3_gpu_tensor *mod_attention;
     h3_gpu_tensor *qkv;
     h3_gpu_tensor *query;
@@ -1606,6 +1617,96 @@ static unsigned next_active_block(const h3_dit *dit, unsigned current) {
     return H3_DIT_BLOCKS;
 }
 
+/* TE-Speed style block cache. On a full step the tail residual — the change
+ * the blocks after the warm prefix contribute — is captured; on a gated step
+ * only the warm prefix runs and the residual is replayed. The gate is pure
+ * schedule arithmetic (sigma deltas), so the full/cached pattern is decided
+ * up front and the streaming prefetch chain can follow it exactly. */
+#define H3_CACHE_THRESHOLD 0.12f
+#define H3_CACHE_WINDOW_START 0.10f
+#define H3_CACHE_WINDOW_END 0.90f
+#define H3_CACHE_MAX_CONSECUTIVE 2
+#define H3_CACHE_WARM_FRACTION 0.25f
+
+int h3_dit_set_block_cache(h3_dit *dit, int enabled,
+                           char *error, size_t error_size) {
+    if (!dit) return 0;
+    dit->block_cache = 0;
+    dit->cache_plan_ready = 0;
+    dit->cache_residual_ready = 0;
+    if (!enabled) return 1;
+    if (dit->core_reuse_interval > 1 || dit->token_reduction) {
+        fail(error, error_size,
+             "the block cache cannot combine with core reuse or token "
+             "reduction");
+        return 0;
+    }
+    unsigned active = 0, warm_last = H3_DIT_BLOCKS;
+    unsigned warm_target = 0;
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        if (dit->block_active[block]) active++;
+    if (active < 4) {
+        fail(error, error_size, "the block cache needs at least four blocks");
+        return 0;
+    }
+    warm_target = (unsigned)((float)active * H3_CACHE_WARM_FRACTION + 0.5f);
+    if (warm_target < 1) warm_target = 1;
+    for (unsigned block = 0, seen = 0; block < H3_DIT_BLOCKS; block++) {
+        if (!dit->block_active[block]) continue;
+        if (++seen == warm_target) { warm_last = block; break; }
+    }
+    if (!dit->cache_snapshot)
+        dit->cache_snapshot = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)dit->sequence * HIDDEN);
+    if (!dit->cache_residual)
+        dit->cache_residual = h3_gpu_tensor_new_bf16(
+            dit->gpu, (size_t)dit->sequence * HIDDEN);
+    if (!dit->cache_snapshot || !dit->cache_residual) {
+        fail(error, error_size, "cannot allocate the block cache: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    dit->cache_warm_last = warm_last;
+    dit->block_cache = 1;
+    return 1;
+}
+
+/* Decides full versus cached per step from the sigma schedule. Cached steps
+ * need small sigma deltas, sit inside the middle of the schedule, and never
+ * run more than H3_CACHE_MAX_CONSECUTIVE in a row; the first and last steps
+ * always run full. */
+static void h3_dit_block_cache_plan(h3_dit *dit) {
+    dit->cache_plan_ready = 0;
+    dit->cache_residual_ready = 0;
+    if (!dit->block_cache) return;
+    int steps = dit->sigmas.steps;
+    int consecutive = 0, cached = 0;
+    for (int step = 0; step < steps; step++) {
+        int full = 1;
+        if (step > 0 && step < steps - 1 && steps > 3) {
+            float pos = (float)step / (float)(steps - 1);
+            float video_delta = fabsf(dit->sigmas.video[step] -
+                                      dit->sigmas.video[step - 1]);
+            float audio_delta = fabsf(dit->sigmas.audio[step] -
+                                      dit->sigmas.audio[step - 1]);
+            float delta = video_delta > audio_delta ? video_delta : audio_delta;
+            if (pos >= H3_CACHE_WINDOW_START && pos <= H3_CACHE_WINDOW_END &&
+                delta < H3_CACHE_THRESHOLD &&
+                consecutive < H3_CACHE_MAX_CONSECUTIVE)
+                full = 0;
+        }
+        dit->cache_full_step[step] = (uint8_t)full;
+        consecutive = full ? 0 : consecutive + 1;
+        cached += !full;
+    }
+    dit->cache_plan_ready = 1;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr,
+                "h3: block cache plan: %d of %d steps cached, warm prefix "
+                "ends at block %u\n",
+                cached, steps, dit->cache_warm_last);
+}
+
 static void configure_gate_ranked_blocks(h3_dit *dit) {
     const char *policy = getenv("H3_DIT_LAYER_POLICY");
     if ((policy && !strcmp(policy, "uniform")) ||
@@ -2670,6 +2771,11 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
         !dit->core_residual_ready ||
         dit->core_forward_count % dit->core_reuse_interval == 0 ||
         step == h3_dit_schedule_steps(dit->schedule) - 1;
+    dit->cache_forward_is_cached = dit->block_cache && dit->cache_plan_ready &&
+        step < H3_MAX_STEPS && !dit->cache_full_step[step] &&
+        dit->cache_residual_ready;
+    dit->cache_forward_captures = dit->block_cache && dit->cache_plan_ready &&
+        !dit->cache_forward_is_cached;
     int use_token_reduction = evaluate_core && dit->token_reduction &&
         !getenv("H3_DISABLE_TOKEN_REDUCTION");
     unsigned token_reduction_end =
@@ -2763,7 +2869,9 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 weight = &streamed_weight;
 
                 unsigned future = next_active_block(dit, block);
-                if (future == H3_DIT_BLOCKS)
+                if (future == H3_DIT_BLOCKS ||
+                    (dit->cache_forward_is_cached &&
+                     block == dit->cache_warm_last))
                     future = first_active_block(dit);
                 stream_job = (h3_dit_stream_job){
                     .dit = dit,
@@ -2826,6 +2934,24 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
             }
             report(progress, progress_opaque, block_phase,
                    (int)completed_blocks, (int)dit->active_block_count);
+            if (block == dit->cache_warm_last && dit->block_cache &&
+                dit->cache_plan_ready) {
+                if (dit->cache_forward_is_cached) {
+                    OP(h3_gpu_add_bf16(dit->gpu, dit->hidden, dit->hidden,
+                                       dit->cache_residual, hidden_elements),
+                       "replay DiT block cache residual");
+                    break;
+                }
+                OP(h3_gpu_copy_bf16(dit->gpu, dit->cache_snapshot, 0,
+                                    dit->hidden, 0, hidden_elements),
+                   "snapshot DiT warm prefix");
+            }
+        }
+        if (dit->cache_forward_captures) {
+            OP(h3_gpu_sub_bf16(dit->gpu, dit->cache_residual, dit->hidden,
+                               dit->cache_snapshot, hidden_elements),
+               "capture DiT block cache residual");
+            dit->cache_residual_ready = 1;
         }
         if (use_token_reduction &&
             token_reduction_end == H3_DIT_BLOCKS &&
@@ -3418,6 +3544,7 @@ int h3_dit_denoise_euler_preview(
                                  reuse_interval, progress, progress_opaque,
                                  preview, preview_opaque,
                                  error, error_size);
+    h3_dit_block_cache_plan(dit);
     uint8_t selected[H3_MAX_STEPS] = {0};
     int selected_count = h3_dit_reuse_schedule(
         dit->sigmas.steps, reuse_interval, selected, sizeof(selected));
