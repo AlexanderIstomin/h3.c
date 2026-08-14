@@ -1034,7 +1034,21 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *dit_path = h3_path(ctx->model_dir, optimized ?
         "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors" :
         (ref2va ? "Ref2VA/transformer" : "FL2VA/transformer"));
-    char *vae_path = h3_path(ctx->model_dir, optimized ?
+    /* The int8 ConvRot decoder is a drop-in replacement that decodes about
+     * 1.6x faster; prefer it whenever the package carries one. */
+    char *vae_path = NULL;
+    if (optimized) {
+        vae_path = h3_path(
+            ctx->model_dir, "vae/minimax_h3_video_vae_int8_convrot.safetensors");
+        if (vae_path) {
+            struct stat status;
+            if (stat(vae_path, &status) != 0) {
+                free(vae_path);
+                vae_path = NULL;
+            }
+        }
+    }
+    if (!vae_path) vae_path = h3_path(ctx->model_dir, optimized ?
         "vae/minimax_h3_video_vae_fp16.safetensors" :
         (ref2va ? "Ref2VA/video_vae/source" : "FL2VA/video_vae/source"));
     char *audio_vae_path = h3_path(ctx->model_dir, optimized ?

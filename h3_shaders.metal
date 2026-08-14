@@ -910,6 +910,83 @@ kernel void h3_linear_i8_weight_bf16(
     }
 }
 
+/* F32 counterparts of the ConvRot rotation and weight-only int8 product,
+ * for the video VAE decoder, whose transformer stack runs in F32 rather
+ * than the DiT's BF16. The arithmetic mirrors the BF16 kernels exactly. */
+kernel void h3_convrot_f32(device const float *input [[buffer(0)]],
+                           device float *output [[buffer(1)]],
+                           constant convrot_args &args [[buffer(2)]],
+                           ushort tid [[thread_index_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float first[256];
+    threadgroup float second[256];
+    uint row = group.y;
+    uint feature_group = group.x;
+    if (row >= args.rows || args.group_size != 256) return;
+    uint offset = row * args.width + feature_group * 256;
+    first[tid] = input[offset + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stage = 0, stride = 1; stage < 4; stage++, stride *= 4) {
+        uint digit = (uint(tid) / stride) & 3u;
+        uint base = uint(tid) - digit * stride;
+        float a, b, c, d;
+        if ((stage & 1u) == 0) {
+            a = first[base];
+            b = first[base + stride];
+            c = first[base + stride * 2];
+            d = first[base + stride * 3];
+        } else {
+            a = second[base];
+            b = second[base + stride];
+            c = second[base + stride * 2];
+            d = second[base + stride * 3];
+        }
+        float value = digit == 0 ? a + b + c - d :
+                      digit == 1 ? a + b - c + d :
+                      digit == 2 ? a - b + c + d : -a + b + c + d;
+        if ((stage & 1u) == 0) second[tid] = value;
+        else first[tid] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    output[offset + tid] = first[tid] * 0.0625f;
+}
+
+kernel void h3_linear_i8_weight_f32(
+                           device const float *input [[buffer(0)]],
+                           device const char *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device const float *bias [[buffer(3)]],
+                           device float *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint2 tid [[thread_position_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float input_tile[16][16];
+    threadgroup float weight_tile[16][16];
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    float sum = 0.0f;
+    uint tile_count = (args.input_dim + 15) / 16;
+    for (uint tile = 0; tile < tile_count; tile++) {
+        uint input_k = tile * 16 + tid.x;
+        input_tile[tid.y][tid.x] =
+            row < args.rows && input_k < args.input_dim ?
+            input[row * args.input_dim + input_k] : 0.0f;
+        uint weight_k = tile * 16 + tid.y;
+        weight_tile[tid.y][tid.x] =
+            column < args.output_dim && weight_k < args.input_dim ?
+            float(weight[column * args.input_dim + weight_k]) : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 16; k++)
+            sum = fma(input_tile[tid.y][k], weight_tile[k][tid.x], sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < args.rows && column < args.output_dim) {
+        sum *= weight_scales[column];
+        if (args.has_bias) sum += bias[column];
+        output[row * args.output_dim + column] = sum;
+    }
+}
+
 /* M1-M4 weight-only int8 GEMM using the original Apple-silicon simdgroup
  * matrix primitive. The per-lane 8x8 fragment mapping follows MLX Steel's
  * MIT-licensed BaseMMAFrag; see THIRD_PARTY_NOTICES.md. */

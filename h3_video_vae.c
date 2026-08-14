@@ -50,6 +50,13 @@ typedef struct {
     h3_gpu_tensor *w2;
     h3_gpu_tensor *w2_b;
     h3_gpu_tensor *scale2;
+    /* Optional pre-quantized projections. When present the F32 twin above
+     * stays NULL and the forward rotates the activation before the product. */
+    h3_gpu_tensor *qkv_i8, *qkv_scales;
+    h3_gpu_tensor *out_i8, *out_scales;
+    h3_gpu_tensor *w1_i8, *w1_scales;
+    h3_gpu_tensor *w2_i8, *w2_scales;
+    uint32_t qkv_group, out_group, w1_group, w2_group;
 } vae_block;
 
 typedef struct {
@@ -163,6 +170,10 @@ static void free_block(vae_block *block) {
     free_tensor(&block->out_b); free_tensor(&block->scale1);
     free_tensor(&block->norm2); free_tensor(&block->w1);
     free_tensor(&block->w1_b); free_tensor(&block->w2);
+    free_tensor(&block->qkv_i8); free_tensor(&block->qkv_scales);
+    free_tensor(&block->out_i8); free_tensor(&block->out_scales);
+    free_tensor(&block->w1_i8); free_tensor(&block->w1_scales);
+    free_tensor(&block->w2_i8); free_tensor(&block->w2_scales);
     free_tensor(&block->w2_b); free_tensor(&block->scale2);
 }
 
@@ -185,6 +196,26 @@ static void cleanup(vae_context *vae) {
     memset(vae, 0, sizeof(*vae));
 }
 
+/* The int8 ConvRot decoder stores the same projections as I8 weights with
+ * per-row F32 scales, exactly like the transformer checkpoints. */
+static int load_quantized_projection(vae_context *vae, const char *name,
+                                     uint64_t rows, uint64_t columns,
+                                     h3_gpu_tensor **weight,
+                                     h3_gpu_tensor **scales,
+                                     uint32_t *group,
+                                     char *error, size_t error_size) {
+    return h3_weight_load_i8_linear(vae->weights, vae->gpu, name, rows,
+                                    columns, weight, scales,
+                                    error, error_size) &&
+           h3_weight_i8_linear_convrot_group(vae->weights, name, group,
+                                             error, error_size);
+}
+
+static int projection_is_quantized(const vae_context *vae, const char *name) {
+    const h3_st_tensor *tensor = h3_weight_find(vae->weights, name, NULL);
+    return tensor && tensor->dtype == H3_DTYPE_I8;
+}
+
 static int load_block(vae_context *vae, int index, char *error,
                       size_t error_size) {
     vae_block *block = &vae->blocks[index];
@@ -200,18 +231,36 @@ static int load_block(vae_context *vae, int index, char *error,
     block->field = f2(vae, name, rows, columns, error, error_size);             \
     if (!block->field) return 0;                                                \
 } while (0)
+#define Q2(weight_field, scale_field, group_field, suffix, rows, columns) do {  \
+    snprintf(name, sizeof(name), "%s%s", prefix, suffix);                       \
+    if (!load_quantized_projection(vae, name, rows, columns,                    \
+                                   &block->weight_field, &block->scale_field,   \
+                                   &block->group_field, error, error_size))     \
+        return 0;                                                               \
+} while (0)
     F1(norm1, "norm1.weight", HIDDEN);
-    F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN);
+    snprintf(name, sizeof(name), "%sattn.to_qkv.weight", prefix);
+    int quantized = projection_is_quantized(vae, name);
+    if (quantized) {
+        Q2(qkv_i8, qkv_scales, qkv_group, "attn.to_qkv.weight",
+           INNER * 3, HIDDEN);
+        Q2(out_i8, out_scales, out_group, "attn.to_out.weight", HIDDEN, INNER);
+        Q2(w1_i8, w1_scales, w1_group, "ff.w1.weight", FFN * 2, HIDDEN);
+        Q2(w2_i8, w2_scales, w2_group, "ff.w2.weight", HIDDEN, FFN);
+    } else {
+        F2(qkv_w, "attn.to_qkv.weight", INNER * 3, HIDDEN);
+        F2(out_w, "attn.to_out.weight", HIDDEN, INNER);
+        F2(w1, "ff.w1.weight", FFN * 2, HIDDEN);
+        F2(w2, "ff.w2.weight", HIDDEN, FFN);
+    }
     F1(qkv_b, "attn.to_qkv.bias", INNER * 3);
-    F2(out_w, "attn.to_out.weight", HIDDEN, INNER);
     F1(out_b, "attn.to_out.bias", HIDDEN);
     F1(scale1, "scale1", HIDDEN);
     F1(norm2, "norm2.weight", HIDDEN);
-    F2(w1, "ff.w1.weight", FFN * 2, HIDDEN);
     F1(w1_b, "ff.w1.bias", FFN * 2);
-    F2(w2, "ff.w2.weight", HIDDEN, FFN);
     F1(w2_b, "ff.w2.bias", HIDDEN);
     F1(scale2, "scale2", HIDDEN);
+#undef Q2
 #undef F1
 #undef F2
     return 1;
@@ -466,26 +515,62 @@ static int run_block(vae_context *vae, int index, char *error,
 } while (0)
     OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm1,
         rows, HIDDEN, 1e-5f), "video VAE attention norm");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
-        weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
+    if (weight->qkv_i8) {
+        if (weight->qkv_group)
+            OP(h3_gpu_convrot_f32(vae->gpu, vae->norm, vae->norm, rows,
+                HIDDEN, weight->qkv_group), "video VAE QKV ConvRot");
+        OP(h3_gpu_linear_i8_weight_f32(vae->gpu, vae->qkv, vae->norm,
+            weight->qkv_i8, weight->qkv_scales, weight->qkv_b, rows, HIDDEN,
+            INNER * 3), "video VAE pre-quantized QKV");
+    } else {
+        OP(h3_gpu_linear_f32(vae->gpu, vae->qkv, vae->norm, weight->qkv_w,
+            weight->qkv_b, rows, HIDDEN, INNER * 3), "video VAE QKV");
+    }
     OP(h3_gpu_video_qkv_rope_f32(vae->gpu, vae->query, vae->key, vae->value,
         vae->qkv, vae->rope_cos, vae->rope_sin, rows, HEADS, HEAD_DIM,
         ROPE_HALF, 1e-5f), "video VAE QK norm/RoPE");
     OP(h3_gpu_sdpa_f32(vae->gpu, vae->heads, vae->query, vae->key, vae->value,
         rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
        "video VAE attention");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->heads, weight->out_w,
-        weight->out_b, rows, INNER, HIDDEN), "video VAE attention output");
+    if (weight->out_i8) {
+        if (weight->out_group)
+            OP(h3_gpu_convrot_f32(vae->gpu, vae->heads, vae->heads, rows,
+                INNER, weight->out_group), "video VAE output ConvRot");
+        OP(h3_gpu_linear_i8_weight_f32(vae->gpu, vae->branch, vae->heads,
+            weight->out_i8, weight->out_scales, weight->out_b, rows, INNER,
+            HIDDEN), "video VAE pre-quantized attention output");
+    } else {
+        OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->heads, weight->out_w,
+            weight->out_b, rows, INNER, HIDDEN), "video VAE attention output");
+    }
     OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
         weight->scale1, rows, HIDDEN), "video VAE attention residual");
     OP(h3_gpu_rms_norm_f32(vae->gpu, vae->norm, vae->hidden, weight->norm2,
         rows, HIDDEN, 1e-5f), "video VAE MLP norm");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->ff1, vae->norm, weight->w1,
-        weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
+    if (weight->w1_i8) {
+        if (weight->w1_group)
+            OP(h3_gpu_convrot_f32(vae->gpu, vae->norm, vae->norm, rows,
+                HIDDEN, weight->w1_group), "video VAE MLP input ConvRot");
+        OP(h3_gpu_linear_i8_weight_f32(vae->gpu, vae->ff1, vae->norm,
+            weight->w1_i8, weight->w1_scales, weight->w1_b, rows, HIDDEN,
+            FFN * 2), "video VAE pre-quantized MLP input");
+    } else {
+        OP(h3_gpu_linear_f32(vae->gpu, vae->ff1, vae->norm, weight->w1,
+            weight->w1_b, rows, HIDDEN, FFN * 2), "video VAE MLP input");
+    }
     OP(h3_gpu_swiglu_f32(vae->gpu, vae->activated, vae->ff1, rows, FFN),
        "video VAE SwiGLU");
-    OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->activated, weight->w2,
-        weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
+    if (weight->w2_i8) {
+        if (weight->w2_group)
+            OP(h3_gpu_convrot_f32(vae->gpu, vae->activated, vae->activated,
+                rows, FFN, weight->w2_group), "video VAE MLP output ConvRot");
+        OP(h3_gpu_linear_i8_weight_f32(vae->gpu, vae->branch, vae->activated,
+            weight->w2_i8, weight->w2_scales, weight->w2_b, rows, FFN,
+            HIDDEN), "video VAE pre-quantized MLP output");
+    } else {
+        OP(h3_gpu_linear_f32(vae->gpu, vae->branch, vae->activated, weight->w2,
+            weight->w2_b, rows, FFN, HIDDEN), "video VAE MLP output");
+    }
     OP(h3_gpu_scale_add_f32(vae->gpu, vae->hidden, vae->hidden, vae->branch,
         weight->scale2, rows, HIDDEN), "video VAE MLP residual");
 #undef OP
