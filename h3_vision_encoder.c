@@ -247,12 +247,20 @@ static void free_block_weights(vision_block_weights *weights) {
 #undef FREE
 }
 
+/* The released tree nests the tower under the language model; the optimized
+ * single-file package stores it at the top level. */
+static const char *vision_prefix(const h3_weight_store *store) {
+    return h3_weight_find(store, "visual.patch_embed.proj.weight", NULL)
+        ? "visual." : "model.visual.";
+}
+
 static int load_block_weights(const h3_weight_store *store, h3_gpu *gpu,
                               int layer, vision_block_weights *weights,
                               char *error, size_t error_size) {
     memset(weights, 0, sizeof(*weights));
     char prefix[96], name[160];
-    snprintf(prefix, sizeof(prefix), "model.visual.blocks.%d.", layer);
+    snprintf(prefix, sizeof(prefix), "%sblocks.%d.",
+             vision_prefix(store), layer);
 #define LOAD1(field, suffix, width) do {                                      \
     snprintf(name, sizeof(name), "%s%s", prefix, suffix);                    \
     weights->field = bf1(store, gpu, name, width, error, error_size);          \
@@ -357,10 +365,10 @@ static h3_gpu_tensor *run_merger(const h3_weight_store *weights, h3_gpu *gpu,
     uint32_t norm_rows = deepstack ? rows : patch_rows;
     char prefix[128], name[192];
     if (deepstack)
-        snprintf(prefix, sizeof(prefix),
-                 "model.visual.deepstack_merger_list.%d.", merger_index);
+        snprintf(prefix, sizeof(prefix), "%sdeepstack_merger_list.%d.",
+                 vision_prefix(weights), merger_index);
     else
-        snprintf(prefix, sizeof(prefix), "model.visual.merger.");
+        snprintf(prefix, sizeof(prefix), "%smerger.", vision_prefix(weights));
 #define NAME(suffix) (snprintf(name, sizeof(name), "%s%s", prefix, suffix), name)
     h3_gpu_tensor *norm_w = bf1(weights, gpu, NAME("norm.weight"), norm_width,
                                  error, error_size);
@@ -469,8 +477,11 @@ int h3_vision_encode_bf16(const char *weight_directory,
         (size_t)rows * VISION_ROPE_HALF * sizeof(*rope_cos_data));
     uint16_t *rope_sin_data = malloc(
         (size_t)rows * VISION_ROPE_HALF * sizeof(*rope_sin_data));
+    char vision_name[128];
+    const char *tower = vision_prefix(weights);
+    snprintf(vision_name, sizeof(vision_name), "%spos_embed.weight", tower);
     h3_gpu_tensor *position_weight = bf2(weights, gpu,
-        "model.visual.pos_embed.weight", POSITION_COUNT, VISION_HIDDEN,
+        vision_name, POSITION_COUNT, VISION_HIDDEN,
         error, error_size);
     if (!patch_data || !position_table || !position_data || !rope_cos_data ||
         !rope_sin_data || !position_weight ||
@@ -500,11 +511,13 @@ int h3_vision_encode_bf16(const char *weight_directory,
     free(rope_cos_data); rope_cos_data = NULL;
     free(rope_sin_data); rope_sin_data = NULL;
     uint64_t patch_shape[] = {VISION_HIDDEN, 3, TEMPORAL_PATCH, PATCH, PATCH};
-    h3_gpu_tensor *patch_w = bf5(weights, gpu,
-        "model.visual.patch_embed.proj.weight", patch_shape,
+    snprintf(vision_name, sizeof(vision_name),
+             "%spatch_embed.proj.weight", tower);
+    h3_gpu_tensor *patch_w = bf5(weights, gpu, vision_name, patch_shape,
         error, error_size);
-    h3_gpu_tensor *patch_b = bf1(weights, gpu,
-        "model.visual.patch_embed.proj.bias", VISION_HIDDEN,
+    snprintf(vision_name, sizeof(vision_name),
+             "%spatch_embed.proj.bias", tower);
+    h3_gpu_tensor *patch_b = bf1(weights, gpu, vision_name, VISION_HIDDEN,
         error, error_size);
     h3_gpu_tensor *hidden = h3_gpu_tensor_new_bf16(gpu, hidden_elements);
     if (!patches || !position || !rope_cos || !rope_sin || !patch_w ||
