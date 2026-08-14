@@ -453,8 +453,16 @@ static int h3_probe_optimized_int8(const char *root, h3_model_info *model,
         "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
     static const char text_encoder[] =
         "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
-    static const char video_vae[] =
+    /* Either video decoder satisfies the package: the int8 ConvRot file is a
+     * drop-in replacement for the released fp16 one. */
+    static const char video_vae_fp16[] =
         "vae/minimax_h3_video_vae_fp16.safetensors";
+    static const char video_vae_int8[] =
+        "vae/minimax_h3_video_vae_int8_convrot.safetensors";
+    char *int8_path = h3_path(root, video_vae_int8);
+    int has_int8 = int8_path && h3_is_file(int8_path);
+    free(int8_path);
+    const char *video_vae = has_int8 ? video_vae_int8 : video_vae_fp16;
     static const char audio_vae[] =
         "vae/minimax_h3_audio_vae_fp32.safetensors";
     if (!h3_require_root_file(root, transformer, error, error_size) ||
