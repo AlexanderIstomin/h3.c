@@ -199,6 +199,8 @@ struct h3_dit {
     h3_gpu_tensor *mlp_output;
     h3_gpu_tensor *int8_activation;
     h3_gpu_tensor *int8_activation_scales;
+    const char *lora_path;
+    float lora_strength;
     uint32_t lora_rank;
     h3_gpu_tensor *lora_hidden;
     h3_gpu_tensor *lora_delta;
@@ -652,20 +654,18 @@ static int scale_bf16_tensor(h3_gpu_tensor *tensor, size_t elements,
 }
 
 static int load_lora_pair(h3_dit *dit, const h3_weight_store *store,
-                          unsigned layer, const char *suffix,
-                          uint32_t input_dim, uint32_t output_dim,
-                          uint32_t convrot_group, float strength,
+                          const char *base, uint32_t input_dim,
+                          uint32_t output_dim, uint32_t convrot_group,
+                          float strength,
                           h3_gpu_tensor **down, h3_gpu_tensor **up,
                           char *error, size_t error_size) {
     char name[224];
-    snprintf(name, sizeof(name),
-             "diffusion_model.blocks.%u.%s.lora_A.weight", layer, suffix);
+    snprintf(name, sizeof(name), "%s.lora_A.weight", base);
     const uint64_t down_shape[] = {dit->lora_rank, input_dim};
     h3_gpu_tensor *a = h3_weight_load_bf16(store, dit->gpu, name, 2,
                                            down_shape, error, error_size);
     if (!a) return 0;
-    snprintf(name, sizeof(name),
-             "diffusion_model.blocks.%u.%s.lora_B.weight", layer, suffix);
+    snprintf(name, sizeof(name), "%s.lora_B.weight", base);
     const uint64_t up_shape[] = {output_dim, dit->lora_rank};
     h3_gpu_tensor *b = h3_weight_load_bf16(store, dit->gpu, name, 2,
                                            up_shape, error, error_size);
@@ -685,8 +685,7 @@ static int load_lora_pair(h3_dit *dit, const h3_weight_store *store,
         ok = scale_bf16_tensor(b, (size_t)output_dim * dit->lora_rank,
                                strength);
     if (!ok) {
-        fail(error, error_size,
-             "cannot prepare the block %u %s adapter: %s", layer, suffix,
+        fail(error, error_size, "cannot prepare the %s adapter: %s", base,
              h3_gpu_error(dit->gpu));
         h3_gpu_tensor_free(a);
         h3_gpu_tensor_free(b);
@@ -697,9 +696,58 @@ static int load_lora_pair(h3_dit *dit, const h3_weight_store *store,
     return 1;
 }
 
-static int load_lora_adapters(h3_dit *dit, const char *path, float strength,
-                              h3_dit_progress progress, void *progress_opaque,
-                              char *error, size_t error_size) {
+/* The four projections of one block, whether it is a core block reading
+ * ConvRot-rotated activations or a plain BF16 refiner block. */
+static int load_lora_block(h3_dit *dit, const h3_weight_store *store,
+                           const char *base, h3_dit_block *block,
+                           uint32_t qkv_group, uint32_t out_group,
+                           uint32_t fc1_group, uint32_t fc2_group,
+                           float strength, char *error, size_t error_size) {
+    char name[192];
+#define PAIR(suffix, in_dim, out_dim, group, down, up) do {                     \
+    snprintf(name, sizeof(name), "%s." suffix, base);                           \
+    if (!load_lora_pair(dit, store, name, in_dim, out_dim, group, strength,     \
+                        &block->down, &block->up, error, error_size))           \
+        return 0;                                                               \
+} while (0)
+    PAIR("attn.qkv_proj", HIDDEN, INNER * 3, qkv_group, qkv_lora_a, qkv_lora_b);
+    PAIR("attn.out_proj", INNER, HIDDEN, out_group, out_lora_a, out_lora_b);
+    PAIR("mlp.fc1", HIDDEN, FFN * 2, fc1_group, fc1_lora_a, fc1_lora_b);
+    PAIR("mlp.fc2", FFN, HIDDEN, fc2_group, fc2_lora_a, fc2_lora_b);
+#undef PAIR
+    return 1;
+}
+
+/* The refiner runs in plain BF16 with no ConvRot, so its adapters need no
+ * rotation. Loaded separately because the refiner weights are transient. */
+static int load_refiner_lora(h3_dit *dit, h3_dit_block *blocks,
+                             char *error, size_t error_size) {
+    if (!dit->lora_path || !*dit->lora_path || dit->lora_strength == 0.0f)
+        return 1;
+    h3_weight_store *store = h3_weight_store_open(
+        dit->lora_path, error, error_size);
+    if (!store) return 0;
+    int ok = 1;
+    for (unsigned index = 0; index < 2 && ok; index++) {
+        char base[192];
+        snprintf(base, sizeof(base),
+                 "diffusion_model.token_refiner.blocks.%u", index);
+        char probe[224];
+        snprintf(probe, sizeof(probe), "%s.attn.qkv_proj.lora_A.weight", base);
+        /* Absent refiner adapters are not an error: some conversions ship
+         * only the core stack. */
+        if (!h3_weight_find(store, probe, NULL)) continue;
+        ok = load_lora_block(dit, store, base, &blocks[index], 0, 0, 0, 0,
+                             dit->lora_strength, error, error_size);
+    }
+    h3_weight_store_free(store);
+    return ok;
+}
+
+/* Validates the adapter file and sizes shared scratch. Runs before the
+ * token refiner so both stacks can use the same buffers. */
+static int prepare_lora(h3_dit *dit, const char *path, float strength,
+                        char *error, size_t error_size) {
     if (!dit->prequantized_int8) {
         fail(error, error_size,
              "runtime adapters currently require a pre-quantized INT8 "
@@ -720,31 +768,9 @@ static int load_lora_adapters(h3_dit *dit, const char *path, float strength,
         return 0;
     }
     dit->lora_rank = (uint32_t)probe->shape[0];
-    int ok = 1;
-    for (unsigned layer = 0; layer < H3_DIT_BLOCKS && ok; layer++) {
-        report(progress, progress_opaque, "load adapters", (int)layer,
-               H3_DIT_BLOCKS);
-        if (!dit->block_active[layer]) continue;
-        h3_dit_block *block = &dit->blocks[layer];
-        ok = load_lora_pair(dit, store, layer, "attn.qkv_proj", HIDDEN,
-                            INNER * 3, block->qkv_convrot_group, strength,
-                            &block->qkv_lora_a, &block->qkv_lora_b,
-                            error, error_size) &&
-             load_lora_pair(dit, store, layer, "attn.out_proj", INNER,
-                            HIDDEN, block->out_convrot_group, strength,
-                            &block->out_lora_a, &block->out_lora_b,
-                            error, error_size) &&
-             load_lora_pair(dit, store, layer, "mlp.fc1", HIDDEN, FFN * 2,
-                            block->fc1_convrot_group, strength,
-                            &block->fc1_lora_a, &block->fc1_lora_b,
-                            error, error_size) &&
-             load_lora_pair(dit, store, layer, "mlp.fc2", FFN, HIDDEN,
-                            block->fc2_convrot_group, strength,
-                            &block->fc2_lora_a, &block->fc2_lora_b,
-                            error, error_size);
-    }
     h3_weight_store_free(store);
-    if (!ok) return 0;
+    dit->lora_path = path;
+    dit->lora_strength = strength;
     dit->lora_hidden = h3_gpu_tensor_new_bf16(
         dit->gpu, (size_t)dit->sequence * dit->lora_rank);
     dit->lora_delta = h3_gpu_tensor_new_bf16(
@@ -754,6 +780,29 @@ static int load_lora_adapters(h3_dit *dit, const char *path, float strength,
              h3_gpu_error(dit->gpu));
         return 0;
     }
+    return 1;
+}
+
+static int load_lora_adapters(h3_dit *dit, const char *path, float strength,
+                              h3_dit_progress progress, void *progress_opaque,
+                              char *error, size_t error_size) {
+    h3_weight_store *store = h3_weight_store_open(path, error, error_size);
+    if (!store) return 0;
+    int ok = 1;
+    for (unsigned layer = 0; layer < H3_DIT_BLOCKS && ok; layer++) {
+        report(progress, progress_opaque, "load adapters", (int)layer,
+               H3_DIT_BLOCKS);
+        if (!dit->block_active[layer]) continue;
+        h3_dit_block *block = &dit->blocks[layer];
+        char base[192];
+        snprintf(base, sizeof(base), "diffusion_model.blocks.%u", layer);
+        ok = load_lora_block(dit, store, base, block,
+                             block->qkv_convrot_group, block->out_convrot_group,
+                             block->fc1_convrot_group, block->fc2_convrot_group,
+                             strength, error, error_size);
+    }
+    h3_weight_store_free(store);
+    if (!ok) return 0;
     report(progress, progress_opaque, "load adapters", H3_DIT_BLOCKS,
            H3_DIT_BLOCKS);
     return 1;
@@ -1112,6 +1161,8 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
                              HIDDEN, 1e-5f), "refiner attention norm");
     OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
                            HIDDEN, INNER * 3), "refiner QKV");
+    if (!apply_lora(dit, qkv, norm, weight->qkv_lora_a, weight->qkv_lora_b,
+                    rows, HIDDEN, INNER * 3, error, error_size)) return 0;
     OP(h3_gpu_grouped_qkv_rope_bf16(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
@@ -1122,16 +1173,23 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
        "refiner attention");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
                            INNER, HIDDEN), "refiner attention output");
+    if (!apply_lora(dit, branch, heads, weight->out_lora_a, weight->out_lora_b,
+                    rows, INNER, HIDDEN, error, error_size)) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner attention residual");
     OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
                              HIDDEN, 1e-5f), "refiner MLP norm");
     OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
                            HIDDEN, FFN * 2), "refiner MLP input");
+    if (!apply_lora(dit, fc1, norm, weight->fc1_lora_a, weight->fc1_lora_b,
+                    rows, HIDDEN, FFN * 2, error, error_size)) return 0;
     OP(h3_gpu_swiglu_bf16(dit->gpu, activated, fc1, rows, FFN),
        "refiner SwiGLU");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, activated, weight->fc2, NULL,
                            rows, FFN, HIDDEN), "refiner MLP output");
+    if (!apply_lora(dit, branch, activated, weight->fc2_lora_a,
+                    weight->fc2_lora_b, rows, FFN, HIDDEN,
+                    error, error_size)) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner MLP residual");
 #undef OP
@@ -1157,6 +1215,7 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
                    error, error_size) &&
         load_block(dit, &refiner[1], "token_refiner.blocks.1.",
                    error, error_size);
+    if (ok) ok = load_refiner_lora(dit, refiner, error, error_size);
     if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
     size_t rows = dit->text_rows;
@@ -2026,6 +2085,9 @@ static h3_dit *load_dit(const char *weight_directory,
          getenv("H3_BENCH_INT8_MLP_AB") ||
          getenv("H3_INT8_MLP_STAGE"));
     h3_gpu_profile_set_label(dit->gpu, "H3 DiT");
+    if (lora_path && *lora_path && lora_strength != 0.0f &&
+        !prepare_lora(dit, lora_path, lora_strength, error, error_size))
+        goto failed;
     report(progress, progress_opaque, "refine text", 0, 1);
     if (!refine_text(dit, text, error, error_size)) goto failed;
     report(progress, progress_opaque, "refine text", 1, 1);

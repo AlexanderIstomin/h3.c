@@ -182,6 +182,20 @@ when a fast mode changes the subject, anatomy, motion, or composition.
 Numerical pixel identity with MLX is not expected because the random-number and
 execution engines differ; the depicted content and motion should agree.
 
+### Runtime low-rank adapters
+
+`--lora PATH --lora-strength S` applies a rank-N adapter to the four
+pre-quantized projections without merging or requantizing weights. It exists
+for evaluating adapters cheaply; merging an adapter into the checkpoint
+produces measurably different output, so the two paths are not
+interchangeable for final renders.
+
+Current limits: pre-quantized INT8 checkpoints only (BF16 weights are
+refused rather than silently ignored), a single uniform rank across all
+pairs, BF16 tensors, `alpha` ignored (the file's own scale is applied as
+written), and every active block must supply all four projection pairs.
+Adapters for the token refiner are applied when present.
+
 ### 4. Choose a speed/quality preset
 
 These controls are independent unless noted otherwise:
