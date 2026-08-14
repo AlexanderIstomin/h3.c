@@ -11,6 +11,7 @@
 #include "h3_video_encoder.h"
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
+#include "h3_tae.h"
 
 #include <errno.h>
 #include <math.h>
@@ -938,6 +939,7 @@ static int h3_write_wav_s16(const char *path, const float *pcm, int samples,
 typedef struct {
     h3_generation_progress *progress;
     h3_video_vae_decoder *decoder;
+    h3_tae *tae;
     int latent_t;
     int latent_h;
     int latent_w;
@@ -951,7 +953,8 @@ static int h3_deliver_denoise_preview(int completed_steps, int total_steps,
                                       const float *video_latent,
                                       size_t video_elements, void *opaque) {
     h3_live_preview *preview = opaque;
-    if (!preview || !preview->progress || !preview->decoder || !video_latent) {
+    if (!preview || !preview->progress ||
+        (!preview->decoder && !preview->tae) || !video_latent) {
         if (preview && preview->progress)
             h3_set_error(preview->progress->ctx,
                          "invalid denoising preview latent");
@@ -970,9 +973,13 @@ static int h3_deliver_denoise_preview(int completed_steps, int total_steps,
     h3_video_frames decoded;
     memset(&decoded, 0, sizeof(decoded));
     int frame_index = 0;
-    if (!h3_video_vae_decoder_preview(
-            preview->decoder, video_latent, preview->latent_t,
-            &decoded, &frame_index, detail, sizeof(detail))) {
+    int decoded_ok = preview->tae
+        ? h3_tae_decode_preview(preview->tae, video_latent, preview->latent_t,
+                                &decoded, &frame_index, detail, sizeof(detail))
+        : h3_video_vae_decoder_preview(
+              preview->decoder, video_latent, preview->latent_t,
+              &decoded, &frame_index, detail, sizeof(detail));
+    if (!decoded_ok) {
         h3_set_error(preview->progress->ctx,
                      "cannot decode denoising preview: %s", detail);
         preview->failed = 1;
@@ -1112,6 +1119,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     memset(&layout, 0, sizeof(layout));
     h3_dit *dit = NULL;
     h3_video_vae_decoder *preview_decoder = NULL;
+    h3_tae *preview_tae = NULL;
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
@@ -1777,19 +1785,41 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     condition_audio_rows = NULL;
     if (progress.cancelled) goto cleanup;
     if (params->preview_denoise) {
-        h3_progress_emit(&progress, "preview VAE load", 0, 36);
-        preview_decoder = h3_acquire_video_decoder(
-            ctx, decoder_key, vae_path, latent_h, latent_w,
-            h3_preview_vae_progress_bridge, &progress,
-            &decoder_is_cached, detail, sizeof(detail));
-        if (preview_decoder && ctx->video_decoder == preview_decoder)
-            h3_progress_emit(&progress, "preview VAE load", 36, 36);
-        if (!preview_decoder) {
-            h3_set_error(ctx, "%s", detail);
-            goto cleanup;
+        /* A packaged tiny autoencoder decodes previews in milliseconds with
+         * megabytes of residency; the full decoder is the fallback, costing a
+         * long load and about ten gigabytes held for the whole run. */
+        char *tae_path = h3_path(ctx->model_dir,
+                                 "vae_approx/taeh3.safetensors");
+        if (tae_path && h3_is_file(tae_path)) {
+            preview_tae = h3_tae_load(tae_path, "h3_shaders.metal",
+                                      detail, sizeof(detail));
+            if (preview_tae &&
+                !h3_tae_prepare(preview_tae, latent_h, latent_w,
+                                detail, sizeof(detail))) {
+                h3_tae_free(preview_tae);
+                preview_tae = NULL;
+            }
+            if (!preview_tae)
+                fprintf(stderr, "h3: tiny preview decoder unavailable (%s); "
+                        "using the full decoder\n", detail);
+        }
+        free(tae_path);
+        if (!preview_tae) {
+            h3_progress_emit(&progress, "preview VAE load", 0, 36);
+            preview_decoder = h3_acquire_video_decoder(
+                ctx, decoder_key, vae_path, latent_h, latent_w,
+                h3_preview_vae_progress_bridge, &progress,
+                &decoder_is_cached, detail, sizeof(detail));
+            if (preview_decoder && ctx->video_decoder == preview_decoder)
+                h3_progress_emit(&progress, "preview VAE load", 36, 36);
+            if (!preview_decoder) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
         }
         live_preview.progress = &progress;
         live_preview.decoder = preview_decoder;
+        live_preview.tae = preview_tae;
         live_preview.latent_t = temporal.video_t;
         live_preview.latent_h = latent_h;
         live_preview.latent_w = latent_w;
@@ -1816,8 +1846,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
             h3_dit_progress_bridge, &progress,
-            preview_decoder ? h3_deliver_denoise_preview : NULL,
-            preview_decoder ? &live_preview : NULL,
+            preview_decoder || preview_tae ? h3_deliver_denoise_preview : NULL,
+            preview_decoder || preview_tae ? &live_preview : NULL,
             detail, sizeof(detail))) {
         if (!live_preview.failed) h3_set_error(ctx, "%s", detail);
         if (dit_is_cached) {
@@ -1992,6 +2022,7 @@ cleanup:
     h3_layout_free(&layout);
     if (!dit_is_cached) h3_dit_free(dit);
     if (!decoder_is_cached) h3_video_vae_decoder_free(preview_decoder);
+    h3_tae_free(preview_tae);
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);

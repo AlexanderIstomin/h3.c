@@ -60,6 +60,8 @@ static void usage(const char *program) {
         "      --ref-audio PATH    Append an ordered standalone audio clip\n"
         "      --frames-dir PATH  Write generated frames as PPM files\n"
         "      --show             Display a frame after every denoising step (M5)\n"
+        "      --preview          Decode denoising previews headlessly; pair\n"
+        "                         with --frames-dir to keep them as PPMs\n"
         "      --zoom N           Terminal image zoom (default: 2 for Retina)\n"
         "      --profile          Print per-phase Metal timing and allocation data\n"
         "      --info             Inspect model/device without mapping weights\n"
@@ -189,10 +191,14 @@ static int cli_progress(const char *phase, int completed, int total,
 static int cli_frame(const h3_frame *frame, void *opaque) {
     cli_state *state = opaque;
     int preview = frame->denoise_step >= 0;
-    if (!preview && state->frames_dir && !state->frame_write_failed) {
+    if (state->frames_dir && !state->frame_write_failed) {
         char path[1024];
-        int length = snprintf(path, sizeof(path), "%s/frame-%04d.ppm",
-                              state->frames_dir, frame->frame_index);
+        /* Previews land beside final frames, named by denoising step. */
+        int length = preview ?
+            snprintf(path, sizeof(path), "%s/preview-%02d.ppm",
+                     state->frames_dir, frame->denoise_step) :
+            snprintf(path, sizeof(path), "%s/frame-%04d.ppm",
+                     state->frames_dir, frame->frame_index);
         FILE *output = length > 0 && (size_t)length < sizeof(path) ?
             fopen(path, "wb") : NULL;
         if (!output ||
@@ -269,7 +275,7 @@ int main(int argc, char **argv) {
            OPT_SEED,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
-           OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
+           OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_PREVIEW, OPT_ZOOM,
            OPT_PROFILE, OPT_INFO };
     static const struct option options[] = {
         {"model-dir", required_argument, NULL, 'd'},
@@ -324,6 +330,7 @@ int main(int argc, char **argv) {
         {"ref-audio", required_argument, NULL, OPT_REF_AUDIO},
         {"frames-dir", required_argument, NULL, OPT_FRAMES_DIR},
         {"show", no_argument, NULL, OPT_SHOW},
+        {"preview", no_argument, NULL, OPT_PREVIEW},
         {"zoom", required_argument, NULL, OPT_ZOOM},
         {"profile", no_argument, NULL, OPT_PROFILE},
         {"info", no_argument, NULL, OPT_INFO},
@@ -338,6 +345,7 @@ int main(int argc, char **argv) {
     size_t reference_count = 0;
     cli_state cli = {{0}, 0, -1, -1, H3_TERM_NONE, 0, NULL, 0};
     int show = 0;
+    int preview_flag = 0;
     int profile = 0;
     int info = 0;
     int frames_given = 0;
@@ -488,6 +496,7 @@ int main(int argc, char **argv) {
             }
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_SHOW: show = 1; break;
+            case OPT_PREVIEW: preview_flag = 1; break;
             case OPT_ZOOM:
                 if (!h3_terminal_set_zoom(parse_int(optarg, "zoom"))) {
                     fprintf(stderr, "h3: --zoom must be at least 1\n");
@@ -533,6 +542,12 @@ int main(int argc, char **argv) {
         params.on_progress = cli_progress;
         params.callback_opaque = &cli;
         if (cli.frames_dir) params.on_frame = cli_frame;
+        if (preview_flag) {
+            /* Previews on request, graphical terminal or not; they land in
+             * --frames-dir when one is set. */
+            params.on_frame = cli_frame;
+            params.preview_denoise = 1;
+        }
         if (show) {
             cli.terminal = h3_terminal_detect();
             if (cli.terminal == H3_TERM_NONE) {
