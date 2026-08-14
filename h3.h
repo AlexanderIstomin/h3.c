@@ -126,6 +126,15 @@ typedef struct {
      * runtime. Strength scales the adapter contribution; 0 disables it. */
     const char *lora_path;
     float lora_strength;
+    /* Decode a single representative frame instead of the whole clip and
+     * skip the audio pipeline. For still output, where decoding every frame
+     * to keep one is most of the render. */
+    int still_frame_only;
+    /* Mirror of still_frame_only: keep the soundtrack and skip the video
+     * decoder entirely. output_path receives a 32 kHz stereo WAV instead of
+     * a mux, so no FFmpeg process is involved. For audio output, where
+     * decoding pictures nobody keeps is a large share of the render. */
+    int audio_only;
     /* Decode and deliver one representative frame after every Euler step. */
     int preview_denoise;
     /* Space the sigma schedule at Beta(0.6, 0.6) quantiles instead of the
@@ -141,7 +150,7 @@ typedef struct {
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
     1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    NULL, 1.0f, 0, 0, NULL, NULL, NULL \
+    NULL, 1.0f, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

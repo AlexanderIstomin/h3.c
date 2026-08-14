@@ -674,6 +674,26 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "adapter strength must be in [-2, 2]");
         return 0;
     }
+    if (params->still_frame_only != 0 && params->still_frame_only != 1) {
+        h3_set_error(ctx, "still frame mode must be zero or one");
+        return 0;
+    }
+    if (params->still_frame_only && !params->on_frame) {
+        h3_set_error(ctx, "still frame mode requires a frame callback");
+        return 0;
+    }
+    if (params->audio_only != 0 && params->audio_only != 1) {
+        h3_set_error(ctx, "audio only mode must be zero or one");
+        return 0;
+    }
+    if (params->audio_only && params->still_frame_only) {
+        h3_set_error(ctx, "audio only and still frame modes are exclusive");
+        return 0;
+    }
+    if (params->audio_only && params->preview_denoise) {
+        h3_set_error(ctx, "audio only mode has no denoising previews");
+        return 0;
+    }
     if (params->use_beta_schedule != 0 && params->use_beta_schedule != 1) {
         h3_set_error(ctx, "beta schedule must be zero or one");
         return 0;
@@ -843,6 +863,76 @@ static uint8_t *h3_rgb_f32_to_u8(const float *rgb, size_t count) {
         output[index] = (uint8_t)lrintf(scaled);
     }
     return output;
+}
+
+static void h3_wav_u32(uint8_t *header, size_t offset, uint32_t value) {
+    header[offset] = (uint8_t)(value & 0xFFu);
+    header[offset + 1] = (uint8_t)((value >> 8) & 0xFFu);
+    header[offset + 2] = (uint8_t)((value >> 16) & 0xFFu);
+    header[offset + 3] = (uint8_t)((value >> 24) & 0xFFu);
+}
+
+static void h3_wav_u16(uint8_t *header, size_t offset, uint16_t value) {
+    header[offset] = (uint8_t)(value & 0xFFu);
+    header[offset + 1] = (uint8_t)((value >> 8) & 0xFFu);
+}
+
+/* Write channel-major F32 PCM as an interleaved 16-bit RIFF/WAVE file. The
+ * audio lane keeps the decoder's own samples instead of paying a lossy AAC
+ * generation, and audio-only renders stay free of any FFmpeg process. */
+static int h3_write_wav_s16(const char *path, const float *pcm, int samples,
+                            int channels, int sample_rate,
+                            char *error, size_t error_size) {
+    if (!pcm || samples <= 0 || channels <= 0 || sample_rate <= 0) {
+        snprintf(error, error_size, "no decoded audio to write");
+        return 0;
+    }
+    size_t frame_bytes = (size_t)channels * 2;
+    size_t payload = (size_t)samples * frame_bytes;
+    if (payload > 0xFFFFFFFFu - 36u) {
+        snprintf(error, error_size, "decoded audio exceeds the WAV size limit");
+        return 0;
+    }
+    uint8_t header[44];
+    memcpy(header, "RIFF", 4);
+    h3_wav_u32(header, 4, (uint32_t)(36 + payload));
+    memcpy(header + 8, "WAVEfmt ", 8);
+    h3_wav_u32(header, 16, 16);
+    h3_wav_u16(header, 20, 1);
+    h3_wav_u16(header, 22, (uint16_t)channels);
+    h3_wav_u32(header, 24, (uint32_t)sample_rate);
+    h3_wav_u32(header, 28, (uint32_t)sample_rate * (uint32_t)frame_bytes);
+    h3_wav_u16(header, 32, (uint16_t)frame_bytes);
+    h3_wav_u16(header, 34, 16);
+    memcpy(header + 36, "data", 4);
+    h3_wav_u32(header, 40, (uint32_t)payload);
+    int16_t *interleaved = malloc(payload);
+    if (!interleaved) {
+        snprintf(error, error_size, "out of memory interleaving decoded audio");
+        return 0;
+    }
+    for (int channel = 0; channel < channels; channel++) {
+        const float *source = pcm + (size_t)channel * (size_t)samples;
+        for (int sample = 0; sample < samples; sample++) {
+            float value = source[sample];
+            if (value < -1.0f) value = -1.0f;
+            if (value > 1.0f) value = 1.0f;
+            interleaved[(size_t)sample * (size_t)channels + (size_t)channel] =
+                (int16_t)lrintf(value * 32767.0f);
+        }
+    }
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        snprintf(error, error_size, "cannot open %s: %s", path, strerror(errno));
+        free(interleaved);
+        return 0;
+    }
+    int ok = fwrite(header, 1, sizeof(header), file) == sizeof(header) &&
+             fwrite(interleaved, 1, payload, file) == payload;
+    if (fclose(file) != 0) ok = 0;
+    free(interleaved);
+    if (!ok) snprintf(error, error_size, "cannot write %s", path);
+    return ok;
 }
 
 typedef struct {
@@ -1741,6 +1831,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
+    if (params->still_frame_only) {
+        free(audio);
+        audio = NULL;
+    } else {
     h3_progress_emit(&progress, "audio VAE", 0, 7);
     if (!h3_audio_vae_decode(audio_vae_path, "h3_shaders.metal", audio,
                              temporal.audio_t, h3_audio_vae_progress_bridge,
@@ -1750,8 +1844,29 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     free(audio);
     audio = NULL;
+    }
     if (progress.cancelled) goto cleanup;
-    if (!preview_decoder && ctx->cache_enabled) {
+    int output_width = params->width;
+    int output_height = params->height;
+    int output_frames = temporal.frame_count;
+    if (params->audio_only) {
+    /* Nobody keeps the pictures of a 32x32 joint render, and loading plus
+     * running the video decoder is a large share of an audio job. Write the
+     * decoded soundtrack straight out instead of muxing a throwaway clip. */
+    free(video);
+    video = NULL;
+    if (params->output_path && *params->output_path) {
+        h3_progress_emit(&progress, "audio file", 0, 1);
+        if (!h3_write_wav_s16(params->output_path, waveform.pcm,
+                              waveform.samples, waveform.channels,
+                              waveform.sample_rate, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        h3_progress_emit(&progress, "audio file", 1, 1);
+    }
+    } else {
+    if (!preview_decoder && (ctx->cache_enabled || params->still_frame_only)) {
         h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(
             ctx, decoder_key, vae_path, latent_h, latent_w,
@@ -1764,7 +1879,12 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
-    int video_ok = preview_decoder ?
+    int still_frame_index = 0;
+    int video_ok = params->still_frame_only && preview_decoder ?
+        h3_video_vae_decoder_preview(
+            preview_decoder, video, temporal.video_t, &frames,
+            &still_frame_index, detail, sizeof(detail)) :
+        preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
             detail, sizeof(detail)) :
@@ -1787,8 +1907,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "out of memory converting generated RGB frames");
         goto cleanup;
     }
-    int output_width = frames.width;
-    int output_height = frames.height;
+    output_width = frames.width;
+    output_height = frames.height;
+    output_frames = frames.frames;
     if (output_width != params->width || output_height != params->height) {
         uint8_t *resized = NULL;
         if (!h3_resize_rgb24_high_quality(
@@ -1827,6 +1948,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
     }
+    }
     result = calloc(1, sizeof(*result));
     if (!result) {
         h3_set_error(ctx, "out of memory creating generation result");
@@ -1834,7 +1956,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     result->width = output_width;
     result->height = output_height;
-    result->frames = frames.frames;
+    result->frames = output_frames;
     result->fps = H3_FPS;
     result->sample_rate = waveform.sample_rate;
     result->seed = params->seed;

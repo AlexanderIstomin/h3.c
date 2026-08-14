@@ -34,6 +34,7 @@ static void usage(const char *program) {
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --ssd-streaming    Stream DiT layers (automatic for optimized INT8)\n"
         "      --beta-schedule    Beta(0.6,0.6) sigma spacing for turbo checkpoints\n"
+        "      --audio-only       Skip the video decoder; write a 32 kHz WAV\n"
         "      --lora PATH        Apply a low-rank adapter at runtime\n"
         "      --lora-strength S  Adapter strength, default 1.0\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
@@ -252,6 +253,7 @@ int main(int argc, char **argv) {
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
            OPT_BETA_SCHEDULE,
+           OPT_AUDIO_ONLY,
            OPT_LORA,
            OPT_LORA_STRENGTH,
            OPT_USE_SLOWER_BF16_MLP,
@@ -288,6 +290,7 @@ int main(int argc, char **argv) {
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
         {"beta-schedule", no_argument, NULL, OPT_BETA_SCHEDULE},
+        {"audio-only", no_argument, NULL, OPT_AUDIO_ONLY},
         {"lora", required_argument, NULL, OPT_LORA},
         {"lora-strength", required_argument, NULL, OPT_LORA_STRENGTH},
         {"use-slower-bf16-mlp", no_argument, NULL,
@@ -383,6 +386,9 @@ int main(int argc, char **argv) {
                 break;
             case OPT_BETA_SCHEDULE:
                 params.use_beta_schedule = 1;
+                break;
+            case OPT_AUDIO_ONLY:
+                params.audio_only = 1;
                 break;
             case OPT_LORA:
                 params.lora_path = optarg;

@@ -358,8 +358,17 @@ prompt, seed, resolution, frame count, and step count.
   `--show` previews are not written there.
 - `-o ''` disables MP4 encoding; combine it with `--frames-dir` when FFmpeg is
   unavailable.
+- `--audio-only` keeps the joint clip's soundtrack and skips the video decoder
+  entirely. `-o` receives a 32 kHz stereo WAV written directly, so no FFmpeg
+  process is involved. Pair it with the mechanical minimum `--width 32
+  --height 32` when only the audio is wanted. Prompts asking for ambience
+  rather than speech currently return speech whatever the canvas: 32, 64, 128,
+  and 256 were compared at a fixed prompt, seed, and pass count and none
+  produced the requested rain, so the larger canvases only cost time.
 - `--profile` reports phase wall time, Metal encoding/wait time, peak live
-  tensor storage, cumulative allocation, and dispatch counts.
+  tensor storage, cumulative allocation, and dispatch counts. With
+  `H3_PROFILE` set it also prints the DiT row geometry, which is what the
+  denoiser cost scales with.
 
 For example:
 

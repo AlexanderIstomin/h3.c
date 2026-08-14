@@ -395,6 +395,14 @@ static int validate_layout(h3_dit *dit, const h3_text_embedding *text,
     dit->video_total_rows = (uint32_t)(video_condition + video_target);
     dit->audio_total_rows = (uint32_t)(audio_condition + audio_target);
     dit->sequence = (uint32_t)layout->seq_len;
+    if (getenv("H3_PROFILE")) {
+        fprintf(stderr,
+                "h3: DiT rows text=%u video=%u audio=%u sequence=%u "
+                "(latent %dx%dx%d, audio_t=%d)\n",
+                dit->text_rows, dit->video_total_rows, dit->audio_total_rows,
+                dit->sequence, dit->latent_t, dit->latent_h, dit->latent_w,
+                dit->audio_t);
+    }
     return 1;
 }
 
