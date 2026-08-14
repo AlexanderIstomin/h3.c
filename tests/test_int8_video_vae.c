@@ -10,9 +10,9 @@
 #include <time.h>
 
 enum {
-    LATENT_TIME = 2,
-    LATENT_HEIGHT = 16,
-    LATENT_WIDTH = 16,
+    LATENT_TIME = 7,   /* the 22-frame clip the app renders */
+    LATENT_HEIGHT = 32,
+    LATENT_WIDTH = 32,
     LATENT_CHANNELS = 24,
     LATENT_ELEMENTS = LATENT_CHANNELS * LATENT_TIME * LATENT_HEIGHT * LATENT_WIDTH
 };
@@ -28,17 +28,32 @@ static double now_seconds(void) {
     return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
 }
 
+/* The decoder object handles any canvas; the one-shot helper is limited to a
+ * single spatial tile. Load is excluded from the timing so the number
+ * reflects decode work. */
+static double last_load_seconds = 0.0;
+
 static double decode(const char *path, const float *latent,
                      h3_video_frames *frames) {
     char error[512];
+    double load_started = now_seconds();
+    h3_video_vae_decoder *decoder = h3_video_vae_decoder_load(
+        path, "h3_shaders.metal", LATENT_HEIGHT, LATENT_WIDTH, NULL, NULL,
+        error, sizeof(error));
+    last_load_seconds = now_seconds() - load_started;
+    if (!decoder) {
+        fprintf(stderr, "load failed for %s: %s\n", path, error);
+        exit(1);
+    }
     double started = now_seconds();
-    if (!h3_video_vae_decode(path, "h3_shaders.metal", latent, LATENT_TIME,
-                             LATENT_HEIGHT, LATENT_WIDTH, NULL, NULL, frames,
-                             error, sizeof(error))) {
+    if (!h3_video_vae_decoder_decode(decoder, latent, LATENT_TIME, frames,
+                                     error, sizeof(error))) {
         fprintf(stderr, "decode failed for %s: %s\n", path, error);
         exit(1);
     }
-    return now_seconds() - started;
+    double elapsed = now_seconds() - started;
+    h3_video_vae_decoder_free(decoder);
+    return elapsed;
 }
 
 int main(int argc, char **argv) {
@@ -48,14 +63,25 @@ int main(int argc, char **argv) {
     }
     float *latent = malloc(LATENT_ELEMENTS * sizeof(*latent));
     if (!latent) fail("out of memory");
-    for (size_t index = 0; index < LATENT_ELEMENTS; index++)
-        latent[index] = (float)((int)(index % 13u) - 6) / 16.0f;
+    /* A denoised latent is roughly unit-normal, not a small ramp; quantization
+     * error depends on that dynamic range, so match it. */
+    unsigned state = 12345u;
+    for (size_t index = 0; index < LATENT_ELEMENTS; index++) {
+        double sum = 0.0;
+        for (int draw = 0; draw < 6; draw++) {
+            state = state * 1103515245u + 12345u;
+            sum += (double)((state >> 16) & 0x7fffu) / 32767.0;
+        }
+        latent[index] = (float)((sum - 3.0) * 1.4142);
+    }
 
     h3_video_frames reference, quantized;
     memset(&reference, 0, sizeof(reference));
     memset(&quantized, 0, sizeof(quantized));
     double reference_seconds = decode(argv[1], latent, &reference);
+    double reference_load = last_load_seconds;
     double quantized_seconds = decode(argv[2], latent, &quantized);
+    double quantized_load = last_load_seconds;
 
     if (reference.frames != quantized.frames ||
         reference.height != quantized.height ||
@@ -81,8 +107,15 @@ int main(int argc, char **argv) {
 
     printf("shape %dx%dx%d\n", reference.frames, reference.height,
            reference.width);
-    printf("fp16 decode  %.2f s\nint8 decode  %.2f s  (%.2fx)\n",
-           reference_seconds, quantized_seconds,
+    printf("fp16  load %.2f s + decode %.2f s = %.2f s\n",
+           reference_load, reference_seconds, reference_load + reference_seconds);
+    printf("int8  load %.2f s + decode %.2f s = %.2f s\n",
+           quantized_load, quantized_seconds, quantized_load + quantized_seconds);
+    printf("decode speed %.2fx | first render %.2fx | cached render %.2fx\n",
+           quantized_seconds > 0.0 ? reference_seconds / quantized_seconds : 0.0,
+           (quantized_load + quantized_seconds) > 0.0
+             ? (reference_load + reference_seconds) /
+               (quantized_load + quantized_seconds) : 0.0,
            quantized_seconds > 0.0 ? reference_seconds / quantized_seconds : 0.0);
     printf("mean |Δ| %.5f | worst |Δ| %.5f | PSNR %.1f dB\n",
            mean, (double)worst, psnr);
