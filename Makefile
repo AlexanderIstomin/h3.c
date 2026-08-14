@@ -78,6 +78,9 @@ h3_real_video_encoder_test: tests/test_real_video_encoder.o $(LIB_OBJ)
 h3_optimized_vision_test: tests/test_optimized_vision.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_prompt_discrimination_test: tests/test_prompt_discrimination.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
