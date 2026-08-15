@@ -37,6 +37,7 @@ static void usage(const char *program) {
         "      --block-cache      Replay cached tail-block residuals on\n"
         "                         schedule-gated denoising steps\n"
         "      --audio-only       Skip the video decoder; write a 32 kHz WAV\n"
+        "      --still            Decode one representative frame; write a PNG\n"
         "      --lora PATH        Apply a low-rank adapter at runtime\n"
         "      --lora-strength S  Adapter strength, default 1.0\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
@@ -261,7 +262,7 @@ int main(int argc, char **argv) {
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
            OPT_BETA_SCHEDULE, OPT_BLOCK_CACHE,
-           OPT_AUDIO_ONLY,
+           OPT_AUDIO_ONLY, OPT_STILL,
            OPT_LORA,
            OPT_LORA_STRENGTH,
            OPT_USE_SLOWER_BF16_MLP,
@@ -300,6 +301,7 @@ int main(int argc, char **argv) {
         {"beta-schedule", no_argument, NULL, OPT_BETA_SCHEDULE},
         {"block-cache", no_argument, NULL, OPT_BLOCK_CACHE},
         {"audio-only", no_argument, NULL, OPT_AUDIO_ONLY},
+        {"still", no_argument, NULL, OPT_STILL},
         {"lora", required_argument, NULL, OPT_LORA},
         {"lora-strength", required_argument, NULL, OPT_LORA_STRENGTH},
         {"use-slower-bf16-mlp", no_argument, NULL,
@@ -499,6 +501,7 @@ int main(int argc, char **argv) {
             }
             case OPT_FRAMES_DIR: cli.frames_dir = optarg; break;
             case OPT_BLOCK_CACHE: params.block_cache = 1; break;
+            case OPT_STILL: params.still_frame_only = 1; break;
             case OPT_SHOW: show = 1; break;
             case OPT_PREVIEW: preview_flag = 1; break;
             case OPT_ZOOM:

@@ -979,19 +979,27 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
                                 h3_video_frames *output,
                                 char *error, size_t error_size) {
     if (output) memset(output, 0, sizeof(*output));
-    if (!decoder || !normalized_latent || !output || latent_time < 7 ||
-        chunk < 0 || chunk > (latent_time - CHUNK_LATENT_TIME) / 5 ||
+    /* latent_time 2 is the trained 5-frame first chunk on its own — the
+     * shortest legal clip, used by still generation. */
+    if (!decoder || !normalized_latent || !output || chunk < 0 ||
+        (latent_time != 2 &&
+         (latent_time < 7 ||
+          chunk > (latent_time - CHUNK_LATENT_TIME) / 5)) ||
+        (latent_time == 2 && chunk != 0) ||
         selected_frame < -1 || selected_frame >= FIRST_CHUNK_FRAMES) {
         fail(error, error_size, "invalid resident video VAE chunk arguments");
         return 0;
     }
+    int window = latent_time == 2 ? 2 : CHUNK_LATENT_TIME;
+    decoder->vae.latent_t = window;
+    decoder->vae.output_frames = latent_time == 2 ? 5 : FIRST_CHUNK_FRAMES;
     int tile_count = decoder->y_axis.count * decoder->x_axis.count;
     float **tiles = calloc((size_t)tile_count, sizeof(*tiles));
     if (!tiles) {
         fail(error, error_size, "out of memory retaining video VAE tiles");
         return 0;
     }
-    int frame_count = selected_frame >= 0 ? 1 : FIRST_CHUNK_FRAMES;
+    int frame_count = selected_frame >= 0 ? 1 : decoder->vae.output_frames;
     int ok = 1;
     for (int tile_y = 0; tile_y < decoder->y_axis.count && ok; tile_y++)
         for (int tile_x = 0; tile_x < decoder->x_axis.count && ok; tile_x++) {
@@ -1000,7 +1008,7 @@ static int decoder_decode_chunk(h3_video_vae_decoder *decoder,
                 decoder->latent_w, chunk * 5,
                 decoder->y_axis.starts[tile_y] / SPATIAL_RATIO,
                 decoder->x_axis.starts[tile_x] / SPATIAL_RATIO,
-                CHUNK_LATENT_TIME, decoder->vae.latent_h,
+                window, decoder->vae.latent_h,
                 decoder->vae.latent_w, error, error_size);
             if (!input) {
                 ok = 0;
@@ -1101,13 +1109,15 @@ int h3_video_vae_decoder_preview(h3_video_vae_decoder *decoder,
     if (output) memset(output, 0, sizeof(*output));
     if (error && error_size) error[0] = '\0';
     if (!decoder || !normalized_latent || !output || !output_frame_index ||
-        latent_time < CHUNK_LATENT_TIME || (latent_time - 2) % 5) {
+        latent_time < 2 ||
+        (latent_time != 2 && (latent_time < CHUNK_LATENT_TIME ||
+                              (latent_time - 2) % 5))) {
         fail(error, error_size, "invalid video VAE preview arguments");
         return 0;
     }
     int chunks = (latent_time - 2) / 5;
     int chunk = chunks / 2;
-    int local_frame = FIRST_CHUNK_FRAMES / 2;
+    int local_frame = latent_time == 2 ? 2 : FIRST_CHUNK_FRAMES / 2;
     int output_frames = chunks * 17 + 5;
     int global_frame = chunk * 17 + local_frame;
     if (global_frame >= output_frames) global_frame = output_frames - 1;

@@ -1087,9 +1087,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                                params->width;
     int render_height = params->render_height ? params->render_height :
                                                  params->height;
-    if (h3_align_frame_count(params->frames) < 22) {
+    /* Stills ride the trained 5-frame first chunk, the shortest legal clip
+     * — about a third of the 22-frame sequence cost. Video and audio jobs
+     * keep the full-chunk floor. */
+    int minimum_frames = params->still_frame_only ? 5 : 22;
+    if (h3_align_frame_count(params->frames) < minimum_frames) {
         h3_set_error(ctx,
-            "generation requires at least one trained 22-frame decoder chunk");
+            "generation requires at least one trained %d-frame decoder chunk",
+            minimum_frames);
         return NULL;
     }
     int ref2va = params->reference_count != 0;
