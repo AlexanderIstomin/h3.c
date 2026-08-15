@@ -4,6 +4,8 @@ CFLAGS := -std=c11 -O3 -MMD -MP -Wall -Wextra -Wpedantic -Wshadow \
 	-Wconversion -Wno-sign-conversion -D_DARWIN_C_SOURCE
 OBJCFLAGS := $(CFLAGS) -fobjc-arc
 FRAMEWORKS := -framework Foundation -framework Metal \
+	-framework AVFoundation -framework CoreMedia -framework CoreVideo \
+	-framework VideoToolbox -framework AudioToolbox \
 	-framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph \
 	-framework Accelerate
 LDLIBS := $(FRAMEWORKS) -licucore -lm
@@ -13,7 +15,7 @@ LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c h3_tae.c
-LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
+LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m h3_avwriter.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
@@ -85,6 +87,9 @@ h3_tae_test: tests/test_tae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_gqa_test: tests/test_gqa.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_avwriter_test: tests/test_avwriter.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)

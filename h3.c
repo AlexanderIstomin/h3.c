@@ -3,6 +3,7 @@
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
+#include "h3_avwriter.h"
 #include "h3_metal.h"
 #include "h3_multimodal.h"
 #include "h3_safetensors.h"
@@ -2014,16 +2015,30 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
     if (params->output_path && *params->output_path) {
-        h3_progress_emit(&progress, "FFmpeg", 0, frames.frames);
-        if (!h3_ffmpeg_write_av_rgb24_f32(
+        /* The system muxer needs nothing installed and encodes on hardware,
+         * so it leads; FFmpeg stays as the fallback for the cases it does
+         * not cover, and reports its own failure if it is absent too. */
+        h3_progress_emit(&progress, "mux", 0, frames.frames);
+        char av_detail[512];
+        int muxed = h3_avwriter_write_av_rgb24_f32(
+            params->output_path, rgb8, frames.frames, output_width,
+            output_height, H3_FPS, waveform.pcm, waveform.samples,
+            waveform.channels, waveform.sample_rate,
+            av_detail, sizeof(av_detail));
+        if (!muxed) {
+            fprintf(stderr, "h3: system muxer unavailable (%s); trying "
+                    "FFmpeg\n", av_detail);
+            muxed = h3_ffmpeg_write_av_rgb24_f32(
                 params->output_path, rgb8, frames.frames, output_width,
                 output_height, H3_FPS, waveform.pcm, waveform.samples,
                 waveform.channels, waveform.sample_rate,
-                detail, sizeof(detail))) {
+                detail, sizeof(detail));
+        }
+        if (!muxed) {
             h3_set_error(ctx, "%s", detail);
             goto cleanup;
         }
-        h3_progress_emit(&progress, "FFmpeg", frames.frames, frames.frames);
+        h3_progress_emit(&progress, "mux", frames.frames, frames.frames);
     }
     }
     result = calloc(1, sizeof(*result));
