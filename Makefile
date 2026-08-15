@@ -84,6 +84,9 @@ h3_prompt_discrimination_test: tests/test_prompt_discrimination.o $(LIB_OBJ)
 h3_tae_test: tests/test_tae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_gqa_test: tests/test_gqa.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_qwen_vision_test: tests/test_real_qwen_vision.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

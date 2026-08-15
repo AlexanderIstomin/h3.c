@@ -6,6 +6,7 @@
 #include "h3_gpu.h"
 
 #include <errno.h>
+#include <mach-o/dyld.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
@@ -151,10 +152,38 @@ static NSString *h3_gpu_library_key(NSString *path, BOOL wantsTensorOps) {
     return [NSString stringWithFormat:@"%@|tensor=%d", path, wantsTensorOps ? 1 : 0];
 }
 
+static NSString *h3_gpu_metallib_path(NSString *source_path);
+
+/* Resolves the shader source, falling back to the executable's own directory
+ * when a relative path is not present in the working directory. Without this
+ * the binary only runs from the directory it was built in, which breaks PATH
+ * installs, daemons, and callers that set their own working directory.
+ * Upstream applies the same fallback inline; this fork resolves paths here,
+ * so it lands in one place and covers the precompiled metallib too. */
 static NSString *h3_gpu_shader_path(const char *shader_source_path) {
-    if (shader_source_path && *shader_source_path)
-        return [NSString stringWithUTF8String:shader_source_path];
-    return @"h3_shaders.metal";
+    NSString *path = shader_source_path && *shader_source_path
+        ? [NSString stringWithUTF8String:shader_source_path]
+        : @"h3_shaders.metal";
+    if ([path isAbsolutePath]) return path;
+    NSFileManager *files = [NSFileManager defaultManager];
+    if ([files isReadableFileAtPath:path] ||
+        [files isReadableFileAtPath:h3_gpu_metallib_path(path)])
+        return path;
+    uint32_t size = 0;
+    _NSGetExecutablePath(NULL, &size);
+    char *buffer = malloc(size);
+    if (!buffer) return path;
+    NSString *resolved = path;
+    if (_NSGetExecutablePath(buffer, &size) == 0) {
+        NSString *executable = [NSString stringWithUTF8String:buffer];
+        NSString *beside = [[executable stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:path];
+        if ([files isReadableFileAtPath:beside] ||
+            [files isReadableFileAtPath:h3_gpu_metallib_path(beside)])
+            resolved = beside;
+    }
+    free(buffer);
+    return resolved;
 }
 
 static NSString *h3_gpu_metallib_path(NSString *source_path) {
