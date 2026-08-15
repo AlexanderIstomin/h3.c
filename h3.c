@@ -4,6 +4,7 @@
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
 #include "h3_avwriter.h"
+#include "h3_avreader.h"
 #include "h3_metal.h"
 #include "h3_multimodal.h"
 #include "h3_safetensors.h"
@@ -807,6 +808,40 @@ static void h3_dit_progress_bridge(const char *phase, int completed, int total,
     h3_progress_emit(opaque, phase, completed, total);
 }
 
+/* Reference media goes through the system frameworks first, so no external
+ * tool is needed for the formats a macOS user is likely to supply, and falls
+ * back to FFmpeg for the containers they decline, such as Matroska. The
+ * fallback's message is the one reported, since it is the broader reader. */
+static int h3_read_image_f32(const char *path, int width, int height,
+                             h3_image_fit fit, float **pixels,
+                             char *error, size_t error_size) {
+    char detail[512];
+    if (h3_avreader_read_image_f32(path, width, height, fit, pixels,
+                                   detail, sizeof(detail))) return 1;
+    return h3_ffmpeg_read_image_f32(path, width, height, fit, pixels,
+                                    error, error_size);
+}
+
+static int h3_read_video_f32(const char *path, int width, int height,
+                             int max_frames, float **pixels, int *frames,
+                             char *error, size_t error_size) {
+    char detail[512];
+    if (h3_avreader_read_video_f32(path, width, height, max_frames, pixels,
+                                   frames, detail, sizeof(detail))) return 1;
+    return h3_ffmpeg_read_video_f32(path, width, height, max_frames, pixels,
+                                    frames, error, error_size);
+}
+
+static int h3_read_audio_f32(const char *path, int max_samples,
+                             int truncate_at_limit, float **pcm, int *samples,
+                             char *error, size_t error_size) {
+    char detail[512];
+    if (h3_avreader_read_audio_f32(path, max_samples, truncate_at_limit, pcm,
+                                   samples, detail, sizeof(detail))) return 1;
+    return h3_ffmpeg_read_audio_f32(path, max_samples, truncate_at_limit, pcm,
+                                    samples, error, error_size);
+}
+
 static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "video VAE load", completed, total);
 }
@@ -1322,7 +1357,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                         "cannot resolve reference image %zu canvas", index + 1);
                     goto cleanup;
                 }
-                if (!h3_ffmpeg_read_image_f32(
+                if (!h3_read_image_f32(
                         reference->path, media_width, media_height,
                         H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
                         detail, sizeof(detail))) {
@@ -1341,7 +1376,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                         "cannot resolve reference video %zu canvas", index + 1);
                     goto cleanup;
                 }
-                if (!h3_ffmpeg_read_video_f32(
+                if (!h3_read_video_f32(
                         reference->path, media_width, media_height,
                         temporal.frame_count, &condition_pixels[visual_count],
                         &condition_frames[visual_count],
@@ -1423,7 +1458,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             }
             float *pcm = NULL;
             int samples = 0;
-            if (!h3_ffmpeg_read_audio_f32(
+            if (!h3_read_audio_f32(
                     audio_path, max_samples, truncate, &pcm, &samples,
                     detail, sizeof(detail))) {
                 free(pcm);
@@ -1496,7 +1531,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     } else {
         if (params->first_frame) {
             keyframes[keyframe_count++] = 0;
-            if (!h3_ffmpeg_read_image_f32(
+            if (!h3_read_image_f32(
                     params->first_frame, render_width, render_height,
                     H3_IMAGE_FIT_STRETCH, &condition_pixels[visual_count],
                     detail, sizeof(detail))) {
@@ -1510,7 +1545,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         if (params->last_frame) {
             keyframes[keyframe_count++] = temporal.frame_count - 1;
-            if (!h3_ffmpeg_read_image_f32(
+            if (!h3_read_image_f32(
                     params->last_frame, render_width, render_height,
                     H3_IMAGE_FIT_COVER, &condition_pixels[visual_count],
                     detail, sizeof(detail))) {
