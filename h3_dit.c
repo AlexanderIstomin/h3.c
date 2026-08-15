@@ -3604,6 +3604,7 @@ int h3_dit_denoise_euler_preview(
         fail(error, error_size, "out of memory allocating Euler velocities");
         free(video_velocity);
         free(audio_velocity);
+        free(preview_video);
         free(last_video);
         free(previous_video);
         free(last_audio);
@@ -3675,6 +3676,7 @@ int h3_dit_denoise_euler_preview(
     }
     free(video_velocity);
     free(audio_velocity);
+    free(preview_video);
     free(last_video);
     free(previous_video);
     free(last_audio);
