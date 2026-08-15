@@ -809,6 +809,11 @@ static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "video VAE load", completed, total);
 }
 
+static void h3_vae_decode_progress_bridge(int completed, int total,
+                                          void *opaque) {
+    h3_progress_emit(opaque, "video VAE decode", completed, total);
+}
+
 static void h3_preview_vae_progress_bridge(int completed, int total,
                                            void *opaque) {
     h3_progress_emit(opaque, "preview VAE load", completed, total);
@@ -1165,18 +1170,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             ? "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
             : "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors") :
         (ref2va ? "Ref2VA/transformer" : "FL2VA/transformer"));
-    /* The int8 ConvRot decoder is a drop-in replacement, used when a package
-     * ships one. An early 256-square measurement showed it decoding faster;
-     * timing load and decode separately at 512 with a 22-frame clip reversed
-     * that, so packages here ship the fp16 decoder and this path exists for
-     * packages that carry only the int8 one. */
+    /* Decoder choice when a package carries both. The int8 ConvRot file is a
+     * drop-in replacement and an early 256-square measurement suggested it was
+     * faster, but timing load and decode separately at 512 square over a
+     * 22-frame clip reversed that: 115s of decode against 60s for fp16, about
+     * twice as slow. So fp16 wins whenever it is present, and the int8 path
+     * serves packages that ship only that one. */
     char *vae_path = NULL;
     if (optimized) {
-        vae_path = h3_path(
-            ctx->model_dir, "vae/minimax_h3_video_vae_int8_convrot.safetensors");
-        if (vae_path) {
-            struct stat status;
-            if (stat(vae_path, &status) != 0) {
+        char *fp16_path = h3_path(
+            ctx->model_dir, "vae/minimax_h3_video_vae_fp16.safetensors");
+        int has_fp16 = fp16_path && h3_is_file(fp16_path);
+        free(fp16_path);
+        if (!has_fp16) {
+            vae_path = h3_path(
+                ctx->model_dir,
+                "vae/minimax_h3_video_vae_int8_convrot.safetensors");
+            if (vae_path && !h3_is_file(vae_path)) {
                 free(vae_path);
                 vae_path = NULL;
             }
@@ -1824,6 +1834,17 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             if (!preview_tae)
                 fprintf(stderr, "h3: tiny preview decoder unavailable (%s); "
                         "using the full decoder\n", detail);
+        } else {
+            /* Silence here reads as a hang: the full decoder costs a long
+             * load, gigabytes of residency, and a complete VAE pass per step.
+             * Say so on the progress channel, not just stderr — hosts show
+             * phases to the user but keep stderr for crash diagnosis. */
+            fprintf(stderr,
+                    "h3: this package has no vae_approx/taeh3.safetensors, so "
+                    "denoising previews run the full video VAE\n");
+            h3_progress_emit(&progress,
+                             "previews use the full video VAE (slow): this "
+                             "package has no tiny preview decoder", 0, 1);
         }
         free(tae_path);
         if (!preview_tae) {
@@ -1931,6 +1952,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    if (preview_decoder)
+        h3_video_vae_decoder_set_progress(
+            preview_decoder, h3_vae_decode_progress_bridge, &progress);
     int still_frame_index = 0;
     int video_ok = params->still_frame_only && preview_decoder ?
         h3_video_vae_decoder_preview(

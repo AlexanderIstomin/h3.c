@@ -6,6 +6,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>
 
 enum { LATENT_T = 7, LATENT_H = 28, LATENT_W = 28, CHANNELS = 24 };
@@ -61,6 +62,27 @@ int main(int argc, char **argv) {
     }
     printf("mean %.4f, range [%.4f, %.4f]\n", sum / (double)pixels,
            (double)low, (double)high);
+
+    /* Steady-state cost: what each denoising step actually pays once the
+     * Metal library and graphs are built. */
+    struct timespec started, ended;
+    enum { REPEATS = 10 };
+    clock_gettime(CLOCK_MONOTONIC, &started);
+    for (int index = 0; index < REPEATS; index++) {
+        h3_video_frames again;
+        int frame_again = 0;
+        if (!h3_tae_decode_preview(tae, latent, LATENT_T, &again, &frame_again,
+                                   error, sizeof(error))) {
+            fprintf(stderr, "FAIL repeat decode: %s\n", error);
+            return 1;
+        }
+        h3_video_frames_free(&again);
+    }
+    clock_gettime(CLOCK_MONOTONIC, &ended);
+    double seconds = (double)(ended.tv_sec - started.tv_sec) +
+                     (double)(ended.tv_nsec - started.tv_nsec) * 1e-9;
+    printf("steady-state decode %.0f ms per preview\n",
+           seconds / REPEATS * 1000.0);
     if (high - low < 1e-6) {
         fprintf(stderr, "FAIL: constant output\n");
         return 1;
