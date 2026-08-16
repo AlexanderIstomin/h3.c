@@ -861,6 +861,52 @@ kernel void h3_convrot_bf16(device const ushort *input [[buffer(0)]],
     output[offset + tid] = h3_f32_to_bf16(first[tid] * 0.0625f);
 }
 
+/* The same product for the matrix-vector shapes autoregressive decode produces,
+ * where the 16x16 tile below is the wrong arrangement twice over: at one row,
+ * fifteen of its sixteen thread rows compute sums that are discarded, and its
+ * weight read has adjacent lanes 2 KB apart, so each fetched cache line is
+ * mostly waste.
+ *
+ * Here one SIMD group owns one output column and its lanes walk that column's
+ * weight row in order, four values at a time. Adjacent lanes then touch adjacent
+ * addresses, which is what the memory system wants, and the partials reduce
+ * across the group at the end. Decode is entirely weight-bandwidth bound — the
+ * weights are read once per token and reused for a single multiply — so the
+ * access pattern is the whole performance story.
+ *
+ * Requires input_dim to be a multiple of 4; the caller checks. */
+kernel void h3_linear_bf16_matvec(
+        device const ushort *input [[buffer(0)]],
+        device const ushort *weight [[buffer(1)]],
+        device const ushort *bias [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant linear_args &args [[buffer(4)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint COLUMNS_PER_GROUP = 8;   /* one per SIMD group */
+    const uint column = group.x * COLUMNS_PER_GROUP + simdgroup;
+    const uint row = group.y;
+    if (column >= args.output_dim || row >= args.rows) return;
+
+    device const ushort4 *weight4 = reinterpret_cast<device const ushort4 *>(
+        weight + (size_t)column * args.input_dim);
+    device const ushort4 *input4 = reinterpret_cast<device const ushort4 *>(
+        input + (size_t)row * args.input_dim);
+    const uint vectors = args.input_dim / 4;
+
+    float sum = 0.0f;
+    for (uint index = lane; index < vectors; index += 32) {
+        sum += dot(h3_bf16x4_to_f32(weight4[index]),
+                   h3_bf16x4_to_f32(input4[index]));
+    }
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        if (args.has_bias) sum += h3_bf16_to_f32(bias[column]);
+        output[(size_t)row * args.output_dim + column] = h3_f32_to_bf16(sum);
+    }
+}
+
 kernel void h3_linear_bf16(device const ushort *input [[buffer(0)]],
                            device const ushort *weight [[buffer(1)]],
                            device const ushort *bias [[buffer(2)]],
@@ -4136,6 +4182,66 @@ struct gqa_args {
     float scale;
 };
 
+struct argmax_args {
+    uint rows;
+    uint width;
+    uint offset;
+};
+
+/* Index of the largest value in each row, written at indices[offset + row].
+ *
+ * Ties go to the lower index, matching a serial scan that keeps its running
+ * best only on a strictly greater value — the host samplers do exactly that, so
+ * anything else would disagree with them on the rows where it matters most.
+ *
+ * Exists so a decode chain can pick a token without the host: the result feeds
+ * h3_embedding_bf16, which reads its ids from device memory, and a fifteen-step
+ * chain then costs one round trip instead of fifteen. */
+kernel void h3_argmax_bf16(
+        device const ushort *values [[buffer(0)]],
+        device uint *indices [[buffer(1)]],
+        constant argmax_args &args [[buffer(2)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint threads [[threads_per_threadgroup]]) {
+    if (row >= args.rows) return;
+    threadgroup float best_value[256];
+    threadgroup uint best_index[256];
+    device const ushort *source = values + (size_t)row * args.width;
+
+    float local = -INFINITY;
+    uint local_index = 0;
+    for (uint index = tid; index < args.width; index += threads) {
+        const float value = h3_bf16_to_f32(source[index]);
+        if (value > local) { local = value; local_index = index; }
+    }
+    best_value[tid] = local;
+    best_index[tid] = local_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) {
+            const float other = best_value[tid + stride];
+            const uint other_index = best_index[tid + stride];
+            if (other > best_value[tid] ||
+                (other == best_value[tid] && other_index < best_index[tid])) {
+                best_value[tid] = other;
+                best_index[tid] = other_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) indices[args.offset + row] = best_index[0];
+}
+
+struct gqa_cache_args {
+    uint sequence;
+    uint past;
+    uint query_heads;
+    uint kv_heads;
+    uint head_dim;
+    float scale;
+};
+
 struct head_norm_args {
     uint sequence;
     uint heads;
@@ -4164,6 +4270,45 @@ kernel void h3_head_rms_norm_bf16(
         float value = h3_bf16_to_f32(tensor[base + d]);
         tensor[base + d] = h3_f32_to_bf16(
             value * inverse * h3_bf16_to_f32(weight[d]));
+    }
+}
+
+/* One SIMD group per head rather than one thread.
+ *
+ * The kernel above hands a whole head to a single thread, which is race-free
+ * and costs nothing when there are many rows — 64 heads across a few hundred
+ * tokens is threads enough. At one row it is sixteen threads for the entire
+ * device, each running 256 serial iterations, and it measured 40 us, nearly
+ * twice the largest matmul in the same layer. Here the lanes of a SIMD group
+ * share a head and reduce at the end.
+ *
+ * The sum is therefore formed in a different order, so the host routes here
+ * only when the plain kernel would not have the threads to fill the device.
+ * H3's own text encoder keeps the arithmetic it was verified with. */
+kernel void h3_head_rms_norm_bf16_coop(
+        device ushort *tensor [[buffer(0)]],
+        device const ushort *weight [[buffer(1)]],
+        constant head_norm_args &args [[buffer(2)]],
+        uint2 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]],
+        uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint HEADS_PER_GROUP = 4;
+    const uint head = group.x * HEADS_PER_GROUP + simdgroup;
+    const uint row = group.y;
+    if (head >= args.heads || row >= args.sequence) return;
+    const uint base = (row * args.heads + head) * args.head_dim;
+
+    float sum = 0.0f;
+    for (uint d = lane; d < args.head_dim; d += 32) {
+        const float value = h3_bf16_to_f32(tensor[base + d]);
+        sum = fma(value, value, sum);
+    }
+    sum = simd_sum(sum);
+    const float inverse = rsqrt(sum / float(args.head_dim) + args.epsilon);
+    for (uint d = lane; d < args.head_dim; d += 32) {
+        const float value = h3_bf16_to_f32(tensor[base + d]);
+        tensor[base + d] =
+            h3_f32_to_bf16(value * inverse * h3_bf16_to_f32(weight[d]));
     }
 }
 
@@ -4211,41 +4356,41 @@ kernel void h3_rope_text_bf16(
     }
 }
 
-kernel void h3_gqa_causal_bf16(
-        device const ushort *query [[buffer(0)]],
-        device const ushort *key [[buffer(1)]],
-        device const ushort *value [[buffer(2)]],
-        device ushort *output [[buffer(3)]],
-        constant gqa_args &args [[buffer(4)]],
-        threadgroup float *scores [[threadgroup(0)]],
-        uint3 group [[threadgroup_position_in_grid]],
-        uint3 thread_position [[thread_position_in_threadgroup]],
-        uint3 threadgroup_size [[threads_per_threadgroup]]) {
-    uint tid = thread_position.x;
-    uint threads = threadgroup_size.x;
-    uint query_row = group.x;
-    uint query_head = group.y;
-    if (query_row >= args.sequence || query_head >= args.query_heads) return;
-    uint kv_head = query_head / (args.query_heads / args.kv_heads);
-    uint q_base = (query_row * args.query_heads + query_head) * args.head_dim;
-    uint key_count = query_row + 1;
-    threadgroup float reductions[128];
-    threadgroup float shared_query[128];
+/* Causal grouped-query attention over `past` cached rows followed by the
+ * `sequence` rows being computed now. Query row r attends to past + r + 1 keys,
+ * so past == 0 is an ordinary prefill and sequence == 1 with past == n is one
+ * autoregressive step against a cache. Keys and values carry past + sequence
+ * rows; the query and the output carry sequence. */
+static void h3_gqa_causal_core(
+        device const ushort *query,
+        device const ushort *key,
+        device const ushort *value,
+        device ushort *output,
+        uint sequence, uint past, uint query_heads, uint kv_heads,
+        uint head_dim, float scale,
+        threadgroup float *scores,
+        threadgroup float *reductions,
+        threadgroup float *shared_query,
+        uint tid, uint threads, uint query_row, uint query_head) {
+    if (query_row >= sequence || query_head >= query_heads) return;
+    uint kv_head = query_head / (query_heads / kv_heads);
+    uint q_base = (query_row * query_heads + query_head) * head_dim;
+    uint key_count = past + query_row + 1;
 
-    for (uint d = tid; d < args.head_dim; d += threads) {
+    for (uint d = tid; d < head_dim; d += threads) {
         /* Keep Q scaling in F32 through the QK contraction. Rounding the
          * product back to BF16 discards precision without reducing storage,
          * since shared_query is already a threadgroup float array. */
         shared_query[d] =
-            h3_bf16_to_f32(query[q_base + d]) * args.scale;
+            h3_bf16_to_f32(query[q_base + d]) * scale;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float local_max = -INFINITY;
     for (uint key_row = tid; key_row < key_count; key_row += threads) {
-        uint k_base = (key_row * args.kv_heads + kv_head) * args.head_dim;
+        uint k_base = (key_row * kv_heads + kv_head) * head_dim;
         float dot = 0.0f;
-        for (uint d = 0; d < args.head_dim; d++) {
+        for (uint d = 0; d < head_dim; d++) {
             dot = fma(shared_query[d], h3_bf16_to_f32(key[k_base + d]), dot);
         }
         float score = dot;
@@ -4272,15 +4417,90 @@ kernel void h3_gqa_causal_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float inverse_sum = 1.0f / reductions[0];
-    for (uint d = tid; d < args.head_dim; d += threads) {
+    for (uint d = tid; d < head_dim; d += threads) {
         float sum = 0.0f;
         for (uint key_row = 0; key_row < key_count; key_row++) {
-            uint v_index = (key_row * args.kv_heads + kv_head) * args.head_dim + d;
+            uint v_index = (key_row * kv_heads + kv_head) * head_dim + d;
             sum = fma(scores[key_row] * inverse_sum,
                       h3_bf16_to_f32(value[v_index]), sum);
         }
         output[q_base + d] = h3_f32_to_bf16(sum);
     }
+}
+
+/* The rotation again, one thread per channel pair instead of per head.
+ *
+ * Every output element is computed from the same two inputs by the same
+ * expression as above — only the assignment of work to threads differs, and the
+ * pairs are disjoint, so this is bit-identical and simply wider. It matters
+ * because the per-head version leaves one row with sixteen threads, where this
+ * has sixteen times half the head dimension. */
+kernel void h3_rope_text_bf16_wide(
+        device ushort *query [[buffer(0)]],
+        device ushort *key [[buffer(1)]],
+        device const float *rope_cos [[buffer(2)]],
+        device const float *rope_sin [[buffer(3)]],
+        constant text_rope_inplace_args &args [[buffer(4)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint row = gid.x;
+    const uint head = gid.y;
+    const uint d = gid.z;
+    const uint half_dim = args.head_dim / 2;
+    if (row >= args.sequence || d >= half_dim) return;
+    const float c = rope_cos[row * half_dim + d];
+    const float s = rope_sin[row * half_dim + d];
+    if (head < args.query_heads) {
+        const uint base = (row * args.query_heads + head) * args.head_dim;
+        const float first = h3_bf16_to_f32(query[base + d]);
+        const float second = h3_bf16_to_f32(query[base + half_dim + d]);
+        query[base + d] = h3_f32_to_bf16(first * c - second * s);
+        query[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
+    }
+    if (head < args.kv_heads) {
+        const uint base = (row * args.kv_heads + head) * args.head_dim;
+        const float first = h3_bf16_to_f32(key[base + d]);
+        const float second = h3_bf16_to_f32(key[base + half_dim + d]);
+        key[base + d] = h3_f32_to_bf16(first * c - second * s);
+        key[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
+    }
+}
+
+kernel void h3_gqa_causal_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant gqa_args &args [[buffer(4)]],
+        threadgroup float *scores [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    threadgroup float reductions[128];
+    threadgroup float shared_query[128];
+    h3_gqa_causal_core(query, key, value, output, args.sequence, 0,
+                       args.query_heads, args.kv_heads, args.head_dim,
+                       args.scale, scores, reductions, shared_query,
+                       thread_position.x, threadgroup_size.x,
+                       group.x, group.y);
+}
+
+kernel void h3_gqa_causal_cache_bf16(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant gqa_cache_args &args [[buffer(4)]],
+        threadgroup float *scores [[threadgroup(0)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    threadgroup float reductions[128];
+    threadgroup float shared_query[128];
+    h3_gqa_causal_core(query, key, value, output, args.sequence, args.past,
+                       args.query_heads, args.kv_heads, args.head_dim,
+                       args.scale, scores, reductions, shared_query,
+                       thread_position.x, threadgroup_size.x,
+                       group.x, group.y);
 }
 
 kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],

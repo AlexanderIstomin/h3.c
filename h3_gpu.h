@@ -47,6 +47,7 @@ int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_new_u32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
                                       size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
@@ -108,6 +109,8 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
 int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
                           size_t elements);
+int h3_gpu_tensor_read_u32(const h3_gpu_tensor *tensor, uint32_t *values,
+                           size_t elements);
 int h3_gpu_tensor_write_f32(h3_gpu_tensor *tensor, const float *values,
                             size_t elements);
 int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
@@ -601,12 +604,30 @@ int h3_gpu_head_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *tensor,
                               const h3_gpu_tensor *weight,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, float epsilon);
+/* The same norm with each head spread across a SIMD group instead of owned by
+ * one thread. At one row the plain kernel leaves the device sixteen threads and
+ * measured 40 us, more than the largest matmul beside it; this measured 6 us.
+ * The sum is formed in a different order, so it is a separate entry point: use
+ * it for decode-shaped work, and leave callers with goldens on the kernel they
+ * were verified against. Falls back when the shape or device will not take it. */
+int h3_gpu_head_rms_norm_coop_bf16(h3_gpu *gpu, h3_gpu_tensor *tensor,
+                                   const h3_gpu_tensor *weight,
+                                   uint32_t sequence, uint32_t heads,
+                                   uint32_t head_dim, float epsilon);
 int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           h3_gpu_tensor *key,
                           const h3_gpu_tensor *rope_cos_f32,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
                           uint32_t kv_heads, uint32_t head_dim);
+/* Index of the largest value in each row, written at indices[index_offset+row].
+ * Ties go to the lower index, as a serial scan keeping its best only on a
+ * strictly greater value would. `indices` must be U32, and its result can feed
+ * h3_gpu_embedding_bf16 directly, so a decode chain need not return to the host
+ * between steps. */
+int h3_gpu_argmax_bf16(h3_gpu *gpu, h3_gpu_tensor *indices,
+                       const h3_gpu_tensor *values, uint32_t rows,
+                       uint32_t width, uint32_t index_offset);
 int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *query,
                            const h3_gpu_tensor *key,
@@ -614,6 +635,18 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                            uint32_t sequence, uint32_t query_heads,
                            uint32_t kv_heads, uint32_t head_dim,
                            float scale);
+/* Causal GQA continued over a key/value cache: `past` rows precede the
+ * `sequence` rows being computed now, so query row r attends to past + r + 1
+ * keys. Keys and values carry past + sequence rows; the query and the output
+ * carry sequence. past == 0 is exactly h3_gpu_gqa_causal_bf16, and sequence == 1
+ * is one autoregressive step. */
+int h3_gpu_gqa_causal_cache_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *query,
+                                 const h3_gpu_tensor *key,
+                                 const h3_gpu_tensor *value,
+                                 uint32_t sequence, uint32_t past,
+                                 uint32_t query_heads, uint32_t kv_heads,
+                                 uint32_t head_dim, float scale);
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);

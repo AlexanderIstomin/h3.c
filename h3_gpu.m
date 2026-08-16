@@ -294,7 +294,10 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         @"h3_vision_qkv_rope_bf16",
         @"h3_embedding_bf16", @"h3_text_qk_rope_bf16",
         @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
-        @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
+        @"h3_gqa_causal_bf16", @"h3_gqa_causal_cache_bf16",
+        @"h3_linear_bf16_matvec", @"h3_argmax_bf16",
+        @"h3_head_rms_norm_bf16_coop", @"h3_rope_text_bf16_wide",
+        @"h3_add_bf16", @"h3_sub_bf16",
         @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
         @"h3_token_expand_delta_bf16",
         @"h3_token_expand_adaln_bf16",
@@ -1110,6 +1113,18 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     return 1;
 }
 
+h3_gpu_tensor *h3_gpu_tensor_new_u32(h3_gpu *gpu, size_t elements) {
+    return h3_gpu_tensor_new(gpu, NULL, elements, sizeof(uint32_t), H3_GPU_U32);
+}
+
+int h3_gpu_tensor_read_u32(const h3_gpu_tensor *tensor, uint32_t *values,
+                           size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_U32 ||
+        elements > TENSOR(tensor).elements) return 0;
+    memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(uint32_t));
+    return 1;
+}
+
 int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
                           size_t elements) {
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
@@ -1301,6 +1316,10 @@ typedef struct {
     uint32_t sequence, query_heads, kv_heads, head_dim;
     float scale;
 } gqa_args;
+typedef struct {
+    uint32_t sequence, past, query_heads, kv_heads, head_dim;
+    float scale;
+} gqa_cache_args;
 typedef struct { uint32_t sample_offset, elements; float delta, ratio; }
     euler_args;
 
@@ -2974,6 +2993,47 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         stats.direct_dispatches += dispatches;
         gpu.stats = stats;
         return 1;
+    }
+    /* Few enough rows that the 16x16 tile would idle most of its threads and
+     * read the weight with a row-length stride. One SIMD group per output
+     * column reads it in order instead, which is the difference between a
+     * quarter of this machine's bandwidth and most of it.
+     *
+     * The cut is at twelve rows, measured rather than reasoned. This kernel
+     * gives each row its own threadgroup and so appears to re-read the weight
+     * per row, but the groups sharing a column block run together and hit the
+     * same cache lines, which carries it much further than that reading
+     * suggests. On the talker's own shapes across 28 layers it runs 30.2 ms ->
+     * 9.0 ms at one row, is still ahead at twelve (29.8 against 32.5), and
+     * loses by sixteen (38.1 against 32.8). From thirty-two rows MPS takes over
+     * anyway. */
+    if (rows && rows <= 12 && !(input_dim % 4) && input_dim >= 32 &&
+        !getenv("H3_DISABLE_MATVEC_LINEAR")) {
+        linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+        const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+        if (!h3_gpu_require_command(gpu)) return 0;
+        id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+            gpu, @"h3_linear_bf16_matvec");
+        if (pipeline && pipeline.maxTotalThreadsPerThreadgroup >= 256) {
+            @autoreleasepool {
+                id<MTLComputeCommandEncoder> encoder =
+                    [gpu.command computeCommandEncoder];
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:2];
+                [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+                [encoder setBytes:&args length:sizeof(args) atIndex:4];
+                [encoder dispatchThreadgroups:
+                    MTLSizeMake((output_dim + 7) / 8, rows, 1)
+                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [encoder endEncoding];
+            }
+            h3_gpu_stats stats = gpu.stats;
+            stats.direct_dispatches++;
+            gpu.stats = stats;
+            return 1;
+        }
     }
     if (rows >= 32 && input_dim >= 256 && output_dim >= 256 &&
         h3_gpu_linear_mps(gpu, output, input, weight, bias, rows,
@@ -4684,6 +4744,49 @@ int h3_gpu_head_rms_norm_bf16(h3_gpu *opaque, h3_gpu_tensor *tensor,
         });
 }
 
+/* Deliberately a separate entry point rather than a size heuristic inside the
+ * one above.
+ *
+ * Spreading a head across a SIMD group forms its sum in a different order, and
+ * any threshold low enough to help one-row decode would also catch H3's text
+ * encoder on short prompts — its key norm runs eight heads, so anything under
+ * about thirty tokens would qualify. That subsystem is verified against goldens
+ * and has no reason to move, so the choice belongs to the caller that wants it,
+ * not to a rule that cannot tell the two apart. */
+int h3_gpu_head_rms_norm_coop_bf16(h3_gpu *opaque, h3_gpu_tensor *tensor,
+                                   const h3_gpu_tensor *weight,
+                                   uint32_t sequence, uint32_t heads,
+                                   uint32_t head_dim, float epsilon) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!h3_gpu_require_bf16(gpu, tensor, count, @"head norm tensor") ||
+        !h3_gpu_require_bf16(gpu, weight, head_dim, @"head norm weight")) return 0;
+    if (head_dim % 32 || getenv("H3_DISABLE_COOP_HEAD_NORM"))
+        return h3_gpu_head_rms_norm_bf16(opaque, tensor, weight, sequence, heads,
+                                         head_dim, epsilon);
+    head_norm_args args = {sequence, heads, head_dim, epsilon};
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_head_rms_norm_bf16_coop");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128 ||
+        !h3_gpu_require_command(gpu))
+        return h3_gpu_head_rms_norm_bf16(opaque, tensor, weight, sequence, heads,
+                                         head_dim, epsilon);
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(tensor).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake((heads + 3) / 4, sequence, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_rope_text_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
                           h3_gpu_tensor *key,
                           const h3_gpu_tensor *rope_cos_f32,
@@ -4703,6 +4806,20 @@ int h3_gpu_rope_text_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
         TENSOR(rope_sin_f32).dtype != H3_GPU_F32) return 0;
     text_rope_inplace_args args = {sequence, query_heads, kv_heads, head_dim};
     uint32_t maximum_heads = query_heads > kv_heads ? query_heads : kv_heads;
+    /* A thread per channel pair rather than per head. Every element is computed
+     * by the same expression from the same inputs and the pairs are disjoint,
+     * so this is bit-identical to the kernel below and only wider — which is
+     * the whole point at one row, where per-head leaves sixteen threads. */
+    if (!getenv("H3_DISABLE_WIDE_TEXT_ROPE"))
+        return h3_gpu_dispatch_3d(gpu, @"h3_rope_text_bf16_wide",
+            MTLSizeMake(sequence, maximum_heads, head_dim / 2),
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(rope_cos_f32).buffer offset:0 atIndex:2];
+                [encoder setBuffer:TENSOR(rope_sin_f32).buffer offset:0 atIndex:3];
+                [encoder setBytes:&args length:sizeof(args) atIndex:4];
+            });
     return h3_gpu_dispatch_2d(gpu, @"h3_rope_text_bf16", sequence, maximum_heads,
         ^(id<MTLComputeCommandEncoder> encoder) {
             [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
@@ -4831,33 +4948,43 @@ static int h3_gpu_gqa_mps(H3GPU *gpu, h3_gpu_tensor *output,
     return 1;
 }
 
-int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
-                           const h3_gpu_tensor *query,
-                           const h3_gpu_tensor *key,
-                           const h3_gpu_tensor *value,
-                           uint32_t sequence, uint32_t query_heads,
-                           uint32_t kv_heads, uint32_t head_dim,
-                           float scale) {
-    H3GPU *gpu = GPU(opaque);
+/* Shared by the prefill and cached entry points below. `past` is the number of
+ * cached key rows preceding the query block; the keys and values carry
+ * past + sequence rows. */
+static int h3_gpu_gqa_causal_check(H3GPU *gpu, h3_gpu_tensor *output,
+                                   const h3_gpu_tensor *query,
+                                   const h3_gpu_tensor *key,
+                                   const h3_gpu_tensor *value,
+                                   uint32_t sequence, uint32_t past,
+                                   uint32_t query_heads, uint32_t kv_heads,
+                                   uint32_t head_dim) {
+    size_t keys = (size_t)past + sequence;
     size_t query_count = (size_t)sequence * query_heads * head_dim;
-    size_t kv_count = (size_t)sequence * kv_heads * head_dim;
-    if (!sequence || !query_heads || !kv_heads || !head_dim ||
-        query_heads % kv_heads || head_dim > 128 ||
-        !h3_gpu_require_bf16(gpu, query, query_count, @"GQA query") ||
-        !h3_gpu_require_bf16(gpu, key, kv_count, @"GQA key") ||
-        !h3_gpu_require_bf16(gpu, value, kv_count, @"GQA value") ||
-        !h3_gpu_require_bf16(gpu, output, query_count, @"GQA output") ||
-        !h3_gpu_require_command(gpu)) return 0;
-    if (getenv("H3_MPS_GQA") && h3_gpu_gqa_mps(
-            gpu, output, query, key, value, sequence, query_heads,
-            kv_heads, head_dim, scale)) return 1;
+    size_t kv_count = keys * kv_heads * head_dim;
+    return sequence && query_heads && kv_heads && head_dim &&
+        !(query_heads % kv_heads) && head_dim <= 128 &&
+        h3_gpu_require_bf16(gpu, query, query_count, @"GQA query") &&
+        h3_gpu_require_bf16(gpu, key, kv_count, @"GQA key") &&
+        h3_gpu_require_bf16(gpu, value, kv_count, @"GQA value") &&
+        h3_gpu_require_bf16(gpu, output, query_count, @"GQA output") &&
+        h3_gpu_require_command(gpu);
+}
+
+static int h3_gpu_gqa_causal_dispatch(H3GPU *gpu, h3_gpu_tensor *output,
+                                      const h3_gpu_tensor *query,
+                                      const h3_gpu_tensor *key,
+                                      const h3_gpu_tensor *value,
+                                      uint32_t sequence, uint32_t past,
+                                      uint32_t query_heads, uint32_t kv_heads,
+                                      uint32_t head_dim, float scale) {
+    size_t keys = (size_t)past + sequence;
     /* Metal's debug layer requires dynamic threadgroup allocations to be
-     * 16-byte aligned. The attention kernel only indexes `sequence` floats,
-     * so padding this allocation is safe and keeps debug and release launches
-     * identical. */
-    size_t score_bytes = ((size_t)sequence * sizeof(float) + 15u) & ~(size_t)15u;
-    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
-                                                           @"h3_gqa_causal_bf16");
+     * 16-byte aligned. The attention kernel only indexes `past + sequence`
+     * floats, so padding this allocation is safe and keeps debug and release
+     * launches identical. */
+    size_t score_bytes = (keys * sizeof(float) + 15u) & ~(size_t)15u;
+    NSString *name = past ? @"h3_gqa_causal_cache_bf16" : @"h3_gqa_causal_bf16";
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu, name);
     if (!pipeline) return 0;
     if (score_bytes + pipeline.staticThreadgroupMemoryLength >
         gpu.device.maxThreadgroupMemoryLength) {
@@ -4875,8 +5002,14 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
         [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
-        gqa_args args = {sequence, query_heads, kv_heads, head_dim, scale};
-        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        if (past) {
+            gqa_cache_args args = {sequence, past, query_heads, kv_heads,
+                                   head_dim, scale};
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        } else {
+            gqa_args args = {sequence, query_heads, kv_heads, head_dim, scale};
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        }
         [encoder setThreadgroupMemoryLength:score_bytes atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(sequence, query_heads, 1)
                  threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
@@ -4886,6 +5019,77 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+int h3_gpu_argmax_bf16(h3_gpu *opaque, h3_gpu_tensor *indices,
+                       const h3_gpu_tensor *values, uint32_t rows,
+                       uint32_t width, uint32_t index_offset) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !width ||
+        !h3_gpu_require_bf16(gpu, values, (size_t)rows * width,
+                             @"argmax input") ||
+        !h3_gpu_require_elements(gpu, indices, (size_t)index_offset + rows,
+                                 @"argmax indices") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    if (TENSOR(indices).dtype != H3_GPU_U32) {
+        h3_gpu_set_error(gpu, @"argmax indices tensor is not U32");
+        return 0;
+    }
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(gpu,
+                                                           @"h3_argmax_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"argmax needs a 256-thread threadgroup");
+        return 0;
+    }
+    typedef struct { uint32_t rows, width, offset; } argmax_args;
+    argmax_args args = {rows, width, index_offset};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(values).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(indices).buffer offset:0 atIndex:1];
+        [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        [encoder dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *query,
+                           const h3_gpu_tensor *key,
+                           const h3_gpu_tensor *value,
+                           uint32_t sequence, uint32_t query_heads,
+                           uint32_t kv_heads, uint32_t head_dim,
+                           float scale) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_gqa_causal_check(gpu, output, query, key, value, sequence, 0,
+                                 query_heads, kv_heads, head_dim)) return 0;
+    if (getenv("H3_MPS_GQA") && h3_gpu_gqa_mps(
+            gpu, output, query, key, value, sequence, query_heads,
+            kv_heads, head_dim, scale)) return 1;
+    return h3_gpu_gqa_causal_dispatch(gpu, output, query, key, value, sequence,
+                                      0, query_heads, kv_heads, head_dim,
+                                      scale);
+}
+
+int h3_gpu_gqa_causal_cache_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                 const h3_gpu_tensor *query,
+                                 const h3_gpu_tensor *key,
+                                 const h3_gpu_tensor *value,
+                                 uint32_t sequence, uint32_t past,
+                                 uint32_t query_heads, uint32_t kv_heads,
+                                 uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_gqa_causal_check(gpu, output, query, key, value, sequence, past,
+                                 query_heads, kv_heads, head_dim)) return 0;
+    return h3_gpu_gqa_causal_dispatch(gpu, output, query, key, value, sequence,
+                                      past, query_heads, kv_heads, head_dim,
+                                      scale);
 }
 
 int h3_gpu_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

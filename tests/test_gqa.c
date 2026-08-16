@@ -121,6 +121,50 @@ static void reference_attention(const uint16_t *query, const uint16_t *key,
     }
 }
 
+/* Replays the same causal attention in chunks against a growing cache and
+ * requires the result to match the single-shot prefill bit for bit.
+ *
+ * The two paths run identical arithmetic in an identical order — the cached
+ * kernel sees the same key_count, the same strided loop and the same reduction
+ * tree — so anything short of exact agreement means the cache offset is wrong
+ * rather than that precision drifted. A chunk of 1 is autoregressive decode,
+ * which is what the talker actually does. */
+static void require_cache_matches(h3_gpu *gpu, const uint16_t *query,
+                                  h3_gpu_tensor *k, h3_gpu_tensor *v,
+                                  const uint16_t *expected, unsigned chunk) {
+    const size_t row_width = (size_t)QUERY_HEADS * HEAD_DIM;
+    uint16_t *got = malloc(row_width * (size_t)chunk * sizeof(*got));
+    require(got != NULL, "chunk allocation failed");
+    for (unsigned past = 0; past < SEQUENCE; past += chunk) {
+        unsigned rows = SEQUENCE - past < chunk ? SEQUENCE - past : chunk;
+        h3_gpu_tensor *q = h3_gpu_tensor_from_bf16(
+            gpu, query + (size_t)past * row_width, row_width * rows);
+        h3_gpu_tensor *output = h3_gpu_tensor_new_bf16(gpu, row_width * rows);
+        require(q && output, "cached Metal tensor allocation failed");
+        require_gpu(gpu, h3_gpu_begin(gpu), "begin cached command stream");
+        require_gpu(gpu, h3_gpu_gqa_causal_cache_bf16(
+            gpu, output, q, k, v, rows, past, QUERY_HEADS, KV_HEADS, HEAD_DIM,
+            1.0f / sqrtf((float)HEAD_DIM)), "cached causal GQA");
+        require_gpu(gpu, h3_gpu_submit(gpu), "submit cached command stream");
+        require(h3_gpu_tensor_read_bf16(output, got, row_width * rows),
+                "cannot read cached GQA output");
+        for (size_t index = 0; index < row_width * rows; index++) {
+            if (got[index] == expected[(size_t)past * row_width + index])
+                continue;
+            fprintf(stderr,
+                    "FAIL tests/test_gqa.c: chunk %u, past %u, element %zu: "
+                    "cached %.9g against prefill %.9g\n", chunk, past, index,
+                    (double)bf16_to_f32(got[index]),
+                    (double)bf16_to_f32(expected[(size_t)past * row_width +
+                                                 index]));
+            exit(1);
+        }
+        h3_gpu_tensor_free(output);
+        h3_gpu_tensor_free(q);
+    }
+    free(got);
+}
+
 int main(void) {
     const size_t query_count = (size_t)SEQUENCE * QUERY_HEADS * HEAD_DIM;
     const size_t kv_count = (size_t)SEQUENCE * KV_HEADS * HEAD_DIM;
@@ -157,6 +201,10 @@ int main(void) {
         require_gpu(gpu, h3_gpu_submit(gpu), "submit command stream");
         require(h3_gpu_tensor_read_bf16(output, got, query_count),
                 "cannot read GQA output");
+        /* One row at a time is what generation does; eight at a time is a
+         * chunked prefill resuming from a cache. */
+        require_cache_matches(gpu, query, k, v, got, 1);
+        require_cache_matches(gpu, query, k, v, got, 8);
         for (size_t index = 0; index < query_count; index++) {
             double delta = (double)bf16_to_f32(got[index]) - reference[index];
             double absolute = fabs(delta);
@@ -190,5 +238,7 @@ int main(void) {
     free(key);
     free(query);
     puts("ok: production-width GQA keeps scaled queries at F32 precision");
+    puts("ok: cached GQA reproduces the prefill exactly, one row and eight at "
+         "a time");
     return 0;
 }
