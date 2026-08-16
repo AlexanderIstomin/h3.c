@@ -161,6 +161,11 @@ int main(void) {
     float conv_expected[8];
     conv_reference(conv_expected, input_values, normalized, bias_values,
                    4, 2, 2, 3, 1, 1);
+    /* Causal is the same reference with every pad moved to the left, which is
+     * what conv_reference's single padding term already means. */
+    float causal_expected[8];
+    conv_reference(causal_expected, input_values, normalized, bias_values,
+                   4, 2, 2, 3, 2, 1);
 
     const float transpose_weight[] = {0.2f, 0.3f, -0.1f, 0.4f,
                                       -0.5f, 0.1f, 0.25f, 0.2f};
@@ -176,6 +181,15 @@ int main(void) {
     float activation_expected[8];
     activation_reference(activation_expected, input_values, alpha, beta,
                          filter, filter, 4, 2);
+    /* The same activation without the resampling filters around it. */
+    float snake_expected[8];
+    for (int time = 0; time < 4; time++)
+        for (int channel = 0; channel < 2; channel++) {
+            const float value = input_values[time * 2 + channel];
+            const float sine = sinf(value * expf(alpha[channel]));
+            snake_expected[time * 2 + channel] = value +
+                sine * sine / (expf(beta[channel]) + 1e-9f);
+        }
     const float right_values[] = {2.0f, -4.0f, 0.2f, 0.4f};
     float add_expected[4], clip_expected[4];
     for (int index = 0; index < 4; index++) {
@@ -194,6 +208,7 @@ int main(void) {
     h3_gpu_tensor *bias = own(&test, h3_gpu_tensor_from_f32(
         test.gpu, bias_values, 2));
     h3_gpu_tensor *conv = own(&test, h3_gpu_tensor_new_f32(test.gpu, 8));
+    h3_gpu_tensor *causal = own(&test, h3_gpu_tensor_new_f32(test.gpu, 8));
     h3_gpu_tensor *trans_weight = own(&test, h3_gpu_tensor_from_f32(
         test.gpu, transpose_weight, 8));
     h3_gpu_tensor *trans_bias = own(&test, h3_gpu_tensor_from_f32(
@@ -206,6 +221,7 @@ int main(void) {
     h3_gpu_tensor *filter_gpu = own(&test, h3_gpu_tensor_from_f32(
         test.gpu, filter, 12));
     h3_gpu_tensor *activated = own(&test, h3_gpu_tensor_new_f32(test.gpu, 8));
+    h3_gpu_tensor *snaked = own(&test, h3_gpu_tensor_new_f32(test.gpu, 8));
     h3_gpu_tensor *right = own(&test, h3_gpu_tensor_from_f32(
         test.gpu, right_values, 4));
     h3_gpu_tensor *added = own(&test, h3_gpu_tensor_new_f32(test.gpu, 4));
@@ -216,12 +232,17 @@ int main(void) {
                                          2, 6), "weight norm");
     gpu_ok(&test, h3_gpu_conv1d_f32(test.gpu, conv, input, weight, bias,
                                     1, 4, 2, 2, 3, 1, 1), "Conv1d");
+    gpu_ok(&test, h3_gpu_conv1d_causal_f32(test.gpu, causal, input, weight,
+                                           bias, 1, 4, 2, 2, 3, 1),
+           "causal Conv1d");
     gpu_ok(&test, h3_gpu_conv_transpose1d_f32(
         test.gpu, trans, input, trans_weight, trans_bias,
         1, 3, 2, 1, 4, 2, 1), "ConvTranspose1d");
     gpu_ok(&test, h3_gpu_alias_free_snake_f32(
         test.gpu, activated, input, alpha_gpu, beta_gpu, filter_gpu,
         filter_gpu, 1, 4, 2), "alias-free SnakeBeta");
+    gpu_ok(&test, h3_gpu_snake_beta_f32(test.gpu, snaked, input, alpha_gpu,
+                                        beta_gpu, 1, 4, 2), "SnakeBeta");
     gpu_ok(&test, h3_gpu_add_scaled_f32(test.gpu, added, input, right,
                                         0.25f, 0.5f, 4), "scaled add");
     gpu_ok(&test, h3_gpu_clip_f32(test.gpu, clipped, added, 4, -0.4f, 0.4f),
@@ -230,13 +251,15 @@ int main(void) {
 
     compare(weight, normalized, 12, 2e-6f, "weight norm");
     compare(conv, conv_expected, 8, 2e-5f, "Conv1d");
+    compare(causal, causal_expected, 8, 2e-5f, "causal Conv1d");
     compare(trans, transpose_expected, 6, 2e-5f, "ConvTranspose1d");
-    compare(activated, activation_expected, 8, 2e-5f, "SnakeBeta");
+    compare(activated, activation_expected, 8, 2e-5f, "alias-free SnakeBeta");
+    compare(snaked, snake_expected, 8, 2e-5f, "SnakeBeta");
     compare(added, add_expected, 4, 1e-7f, "scaled add");
     compare(clipped, clip_expected, 4, 1e-7f, "clip");
 
     h3_gpu_stats stats;
-    if (!h3_gpu_get_stats(test.gpu, &stats) || stats.mps_conv_dispatches != 2)
+    if (!h3_gpu_get_stats(test.gpu, &stats) || stats.mps_conv_dispatches != 3)
         die("MPS Conv1d dispatch count mismatch");
     for (size_t index = 0; index < test.count; index++)
         h3_gpu_tensor_free(test.owned[index]);

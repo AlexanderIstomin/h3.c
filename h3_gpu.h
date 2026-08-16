@@ -241,6 +241,15 @@ int h3_gpu_conv1d_stride_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       uint32_t output_channels, uint32_t kernel,
                       uint32_t stride, uint32_t padding,
                       uint32_t dilation);
+/* Causal Conv1d: every pad on the left, so output t reads inputs up to t and
+ * no further, and the output keeps the input's length. */
+int h3_gpu_conv1d_causal_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t length, uint32_t input_channels,
+                      uint32_t output_channels, uint32_t kernel,
+                      uint32_t dilation);
 int h3_gpu_conv_transpose1d_f32(
                       h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
@@ -269,6 +278,14 @@ int h3_gpu_alias_free_snake_f32(
 int h3_gpu_snake1d_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                        const h3_gpu_tensor *input,
                        const h3_gpu_tensor *alpha, uint32_t batch,
+                       uint32_t length, uint32_t channels);
+/* x + sin^2(x * exp(alpha)) / exp(beta): what the alias-free kernel applies
+ * between its resampling filters, for vocoders that use it unfiltered. Note
+ * h3_gpu_snake1d_f32 is a different activation, not this one with beta fixed. */
+int h3_gpu_snake_beta_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                       const h3_gpu_tensor *input,
+                       const h3_gpu_tensor *alpha_log,
+                       const h3_gpu_tensor *beta_log, uint32_t batch,
                        uint32_t length, uint32_t channels);
 int h3_gpu_audio_qkv_split_f32(h3_gpu *gpu,
                        h3_gpu_tensor *query, h3_gpu_tensor *key,

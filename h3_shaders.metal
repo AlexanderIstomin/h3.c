@@ -738,6 +738,30 @@ kernel void h3_snake1d_f32(device const float *input [[buffer(0)]],
     output[gid] = x + wave * wave / (a + 1e-9f);
 }
 
+/* SnakeBeta on its own: x + sin^2(x * exp(alpha)) / exp(beta).
+ *
+ * This is the activation h3_alias_free_snake_f32 applies between its 2x
+ * resampling filters, and h3_snake1d_f32 is a different function again — one
+ * parameter, used raw rather than as a log. Vocoders that do not band-limit
+ * their activation want this form, so it stands alone.
+ *
+ * Both parameters are stored as logs. Reciprocating beta once and multiplying
+ * matches how a per-channel host loop hoists it. */
+kernel void h3_snake_beta_f32(device const float *input [[buffer(0)]],
+                              device const float *alpha_log [[buffer(1)]],
+                              device const float *beta_log [[buffer(2)]],
+                              device float *output [[buffer(3)]],
+                              constant audio_activation_args &args [[buffer(4)]],
+                              uint gid [[thread_position_in_grid]]) {
+    uint count = args.batch * args.length * args.channels;
+    if (gid >= count) return;
+    uint channel = gid % args.channels;
+    float inverse = 1.0f / (exp(beta_log[channel]) + 1e-9f);
+    float x = input[gid];
+    float wave = sin(x * exp(alpha_log[channel]));
+    output[gid] = x + inverse * wave * wave;
+}
+
 struct audio_qkv_args {
     uint batch;
     uint length;
