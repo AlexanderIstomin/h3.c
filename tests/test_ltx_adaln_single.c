@@ -16,10 +16,16 @@
  *     convention subtracts one, and `downscale_freq_shift` here is zero;
  *   - the argument is sigma * 1000, not sigma. Every path scales by
  *     `timestep_scale_multiplier` first; and
- *   - the cross-modal gate is the exception. Its argument is multiplied by
- *     `av_ca_factor`, which is 1 / 1000, so the 1000 divides straight back out
- *     and the gate alone is embedded at the raw sigma. Reusing the scaled
- *     argument there gives a gate from an utterly different frequency band.
+ *   - the cross-modal gate's argument is `sigma * av_ca_timestep_scale_multiplier`,
+ *     because `av_ca_factor` divides `timestep_scale_multiplier` back out
+ *     again. That multiplier is the one number here that cannot be read off
+ *     the library: its default is 1, which would put the gate at the raw sigma
+ *     while every other path sits at a thousand times it, but **the released
+ *     checkpoint's config sets it to 1000.0**, which puts the gate on the same
+ *     scale as the rest. Both are checked below, and they disagree by three
+ *     orders of magnitude in the argument. The released value is the one the
+ *     driver wants; the default is here so that reading the library alone
+ *     cannot silently give the wrong answer.
  *
  * Two structural facts follow from the reference and matter to the driver
  * rather than to this file. The prompt modulation is driven by the modality's
@@ -48,7 +54,10 @@ enum {
 };
 
 #define TIMESTEP_SCALE 1000.0f
-#define AV_CA_SCALE 1.0f
+/* From the released checkpoint's own metadata, not from the library, whose
+ * default for this is 1. */
+#define AV_CA_RELEASED 1000.0f
+#define AV_CA_LIBRARY_DEFAULT 1.0f
 #define MAX_PERIOD 10000.0
 
 static int failures = 0;
@@ -218,11 +227,13 @@ int main(int argc, char **argv) {
     float prompt_embedded[DIM];
     adaln_single("prompt", &prompt_argument, 1, 2, prompt_out, prompt_embedded);
 
-    /* The gate's factor divides the scale straight back out, so this is the
-     * raw sigma where every other path is a thousand times it. */
-    float gate_argument = cross[0] * TIMESTEP_SCALE * (AV_CA_SCALE / TIMESTEP_SCALE);
-    float gate_embedded[DIM];
+    /* sigma * av_ca_multiplier, the factor having cancelled the other one. */
+    float gate_embedded[DIM], gate_default[DIM];
+    float gate_argument = cross[0] * TIMESTEP_SCALE * (AV_CA_RELEASED / TIMESTEP_SCALE);
     adaln_single("cross_gate", &gate_argument, 1, 1, gate_out, gate_embedded);
+    float default_argument =
+        cross[0] * TIMESTEP_SCALE * (AV_CA_LIBRARY_DEFAULT / TIMESTEP_SCALE);
+    adaln_single("cross_gate", &default_argument, 1, 1, gate_default, gate_embedded);
 
     /* Recompute the intermediate for the main path, which the loop above
      * overwrote with the cross one. */
@@ -236,10 +247,11 @@ int main(int argc, char **argv) {
 
     /* 5e-05 is the F32 floor described above, not a fitted bound: the trig at
      * a thousand radians sets it, and a 256-wide dot product on top. The gate
-     * lands three orders below because its argument is the raw sigma, which
-     * is the clearest evidence that the floor is the argument's size. Every
-     * structural mistake checked in the commit message clears this by at
-     * least three orders. */
+     * at the library default lands three orders below, because there its
+     * argument is the raw sigma -- which is the clearest evidence that the
+     * floor is the argument's size rather than anything structural. At the
+     * released multiplier the gate sits with the rest. Every structural
+     * mistake checked in the commit message clears this by three orders. */
     compare("nine-slot modulation", main_out, expected_main,
             TOKENS * 9 * DIM, 5e-5f);
     compare("embedded timestep", embedded, expected_embedded,
@@ -247,7 +259,27 @@ int main(int argc, char **argv) {
     compare("prompt modulation", prompt_out, expected_prompt, 2 * DIM, 5e-5f);
     compare("cross scale and shift", cross_ss, expected_ss,
             TOKENS * 4 * DIM, 5e-5f);
-    compare("cross gate", gate_out, expected_gate, DIM, 5e-5f);
+    float *expected_default = load_f32("reference.cross_gate_default", DIM);
+    compare("cross gate, released", gate_out, expected_gate, DIM, 5e-5f);
+    compare("cross gate, library default", gate_default, expected_default,
+            DIM, 5e-5f);
+    /* If the two multipliers ever produced the same gate, checking both would
+     * be pointless and the released value would stop mattering. */
+    double spread = 0.0;
+    for (size_t index = 0; index < DIM; index++) {
+        double delta = fabs((double)expected_gate[index] -
+                            (double)expected_default[index]);
+        if (delta > spread) spread = delta;
+    }
+    if (spread < 1e-2) {
+        fprintf(stderr, "FAIL the two av_ca multipliers agree to %.2e, so "
+                "which one the model uses would not matter\n", spread);
+        failures++;
+    } else {
+        printf("  ok  %-26s the two multipliers differ by %.2e\n",
+               "the multiplier matters", spread);
+    }
+    free(expected_default);
 
     free(sigmas); free(scalar); free(cross);
     free(expected_main); free(expected_embedded); free(expected_prompt);
@@ -259,6 +291,6 @@ int main(int argc, char **argv) {
         return 1;
     }
     printf("ok: all four AdaLN-single widths reproduce LTX-2.5's own output, "
-           "including the gate's unscaled argument\n");
+           "at both cross-modal multipliers\n");
     return 0;
 }
