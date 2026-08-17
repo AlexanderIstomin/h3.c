@@ -28,3 +28,7 @@ h3_real_video_vae_test
 h3_semantic_vae_test
 libh3.a
 .DS_Store
+
+# the LTX-2.5 generation drivers
+h3_ltx_generate
+h3_ltx_decode
