@@ -87,6 +87,9 @@ h3_ltx_sampler_test: tests/test_ltx_sampler.o $(LIB_OBJ)
 h3_real_ltx_text_test: tests/test_real_ltx_text.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_ltx_connector_test: tests/test_real_ltx_connector.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_optimized_qwen_test: tests/test_real_optimized_qwen.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
