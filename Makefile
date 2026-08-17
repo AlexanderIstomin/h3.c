@@ -108,6 +108,9 @@ h3_real_ltx_dit_sample_test: tests/test_real_ltx_dit_sample.o $(LIB_OBJ)
 h3_real_ltx_video_vae_test: tests/test_real_ltx_video_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_ltx_audio_vae_test: tests/test_real_ltx_audio_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_optimized_qwen_test: tests/test_real_optimized_qwen.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
