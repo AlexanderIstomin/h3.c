@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 
 enum {
     LATENT_CHANNELS = 24,
@@ -163,10 +164,72 @@ static h3_gpu_tensor *load_f32(vae_context *vae, const char *name, int ndim,
     return NULL;
 }
 
+/* Whether to reload each block's weights per tile rather than keeping them.
+ *
+ * Streaming rereads the whole checkpoint for every spatial tile, and a real
+ * decode runs six of them. Measured on a 640x352 clip: 216 block loads for 36
+ * blocks of work, 0.81s each of which only 0.125s was arithmetic. That was
+ * 85% of the decode and 70% of the whole generation, and keeping the weights
+ * instead took the run from 230s to 105s with the frames bit-identical.
+ *
+ * The resident path below exists for exactly this and its own note sizes it
+ * at "about 9 GiB after the DiT has been retired" — which is this checkpoint,
+ * F16 widened to F32. So the question is not the dtype but whether that fits,
+ * and an F16 checkpoint was being streamed on machines with room to spare.
+ *
+ * So the choice is made per machine and per checkpoint: what residency would
+ * cost is measured from the files rather than assumed, and taken only if this
+ * machine has room for it and something left over. Anywhere it does not fit,
+ * the streaming path is what it always was.
+ *
+ * `H3_VAE_RESIDENT=1` forces residency, `=0` forces streaming.
+ */
+/* Left for activations, the rest of the engine and the system. Residency is
+ * only worth having if it does not push the machine into paging, which would
+ * cost more than the reread it saves. */
+#define RESIDENT_VAE_HEADROOM ((uint64_t)8 << 30)
+
+static uint64_t machine_memory_bytes(void) {
+    uint64_t bytes = 0;
+    size_t size = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &size, NULL, 0) != 0) return 0;
+    return bytes;
+}
+
+/* What residency has to hold, from the stack rather than from the files.
+ *
+ * Counting the directory would be wrong twice over: the weights sit in a
+ * subdirectory of the package, and the package also holds the transformer and
+ * the text encoder, which are not being made resident and are forty times the
+ * size. The decoder's shape is fixed and known, so it can simply be counted.
+ * Everything is loaded as f32 whatever the checkpoint stores. */
+static uint64_t resident_weight_bytes(void) {
+    const uint64_t per_block = (uint64_t)HIDDEN * INNER * 3 +  /* qkv */
+                               (uint64_t)INNER * HIDDEN +      /* out */
+                               (uint64_t)HIDDEN * FFN * 2 +    /* w1  */
+                               (uint64_t)FFN * HIDDEN;         /* w2  */
+    const uint64_t ends = (uint64_t)OUTPUT_PATCH * HIDDEN +
+                          (uint64_t)LATENT_CHANNELS * HIDDEN;
+    return (per_block * LAYERS + ends) * sizeof(float);
+}
+
 static int checkpoint_streams_f16(const h3_weight_store *weights) {
+    const char *forced = getenv("H3_VAE_RESIDENT");
+    if (forced && *forced) return *forced == '0';
     const h3_st_tensor *tensor = h3_weight_find(
         weights, "decoder.transformer_blocks.0.attn.to_qkv.weight", NULL);
-    return tensor && tensor->dtype == H3_DTYPE_F16;
+    if (!tensor || tensor->dtype != H3_DTYPE_F16) return 0;
+
+    const uint64_t resident = resident_weight_bytes();
+    const uint64_t memory = machine_memory_bytes();
+    const int fits = memory && resident + RESIDENT_VAE_HEADROOM <= memory;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr,
+                "h3: video VAE %s — %.1f GiB resident against %.1f GiB\n",
+                fits ? "resident" : "streaming",
+                (double)resident / (double)(1u << 30),
+                (double)memory / (double)(1u << 30));
+    return !fits;
 }
 
 static h3_gpu_tensor *f1(vae_context *vae, const char *name, uint64_t width,
