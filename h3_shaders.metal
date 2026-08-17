@@ -5436,6 +5436,44 @@ kernel void h3_gelu_mul_bf16(device const ushort *gate [[buffer(0)]],
     output[gid] = h3_f32_to_bf16(activated * other);
 }
 
+/* LTX-2.5's AdaLN modulation is per token, not per step: each token carries
+ * its own nine vectors, to which the block's static table is added. The table
+ * is one row of `slots * width` and the timestep embedding is one such row a
+ * token, so this is a row broadcast add and the result is exactly the layout
+ * h3_adaln_bf16 and h3_gate_bf16 already read.
+ *
+ * H3's own DiT gets here differently -- it interpolates one modulation per
+ * step and points every row at it through the row map -- so this does not
+ * replace that path, it sits beside it. */
+kernel void h3_add_row_bf16(device const ushort *input [[buffer(0)]],
+                           device const float *row [[buffer(1)]],
+                           device ushort *output [[buffer(2)]],
+                           constant uint2 &shape [[buffer(3)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= shape.x || gid.y >= shape.y) return;
+    uint at = gid.y * shape.x + gid.x;
+    output[at] = h3_f32_to_bf16(h3_bf16_to_f32(input[at]) + row[gid.x]);
+}
+
+/* Per-head attention gating. The logits come from the attention's *input*,
+ * one a head, and the gate is twice a sigmoid so it centres on one rather
+ * than a half -- an ungated head passes its output through unchanged.
+ *
+ * Laid out to match SDPA's row-major [token, head, dimension] output, so this
+ * runs after the heads are joined rather than before. */
+kernel void h3_head_gate_bf16(device ushort *values [[buffer(0)]],
+                           device const ushort *logits [[buffer(1)]],
+                           constant uint3 &shape [[buffer(2)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    uint heads = shape.y, head_dim = shape.z;
+    if (gid.x >= heads * head_dim || gid.y >= shape.x) return;
+    uint head = gid.x / head_dim;
+    float logit = h3_bf16_to_f32(logits[gid.y * heads + head]);
+    float gate = 2.0f / (1.0f + precise::exp(-logit));
+    uint at = gid.y * heads * head_dim + gid.x;
+    values[at] = h3_f32_to_bf16(h3_bf16_to_f32(values[at]) * gate);
+}
+
 /* Every Gemma block multiplies its output by a trained scalar before the
  * residual stream carries it on. The following RMS norm divides the scale out
  * of the normalised path, but not out of the stream itself, so it matters. */

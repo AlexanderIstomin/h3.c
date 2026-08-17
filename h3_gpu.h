@@ -812,5 +812,20 @@ int h3_gpu_gelu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_scale_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, uint32_t elements,
                       float factor);
+/* Add one F32 row of `width` to every row of a bf16 matrix. LTX-2.5 builds
+ * its per-token AdaLN modulation this way: the block's static table is the
+ * row and the timestep embedding is the matrix, and the sum is the layout
+ * h3_gpu_adaln_bf16 and h3_gpu_gate_bf16 already read. */
+int h3_gpu_add_row_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                        const h3_gpu_tensor *input,
+                        const h3_gpu_tensor *row_f32, uint32_t rows,
+                        uint32_t width);
+/* Scale each head of an attention output by twice the sigmoid of its own
+ * logit, so an ungated head passes through unchanged. `logits` carries one
+ * value per head per row, projected from the attention's input. Operates in
+ * place on SDPA's row-major [row, head, dimension] output. */
+int h3_gpu_head_gate_bf16(h3_gpu *gpu, h3_gpu_tensor *values,
+                          const h3_gpu_tensor *logits, uint32_t rows,
+                          uint32_t heads, uint32_t head_dim);
 
 #endif
