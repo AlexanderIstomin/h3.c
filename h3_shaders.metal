@@ -1351,11 +1351,11 @@ kernel void h3_linear_i8_weight_bf16_simd_square(
             }
 #pragma clang loop unroll(full)
             for (uint across = 0; across < ACROSS; across++) {
-                device const char *column =
-                    weight + (column_start + across * TILE + fragment_column) *
-                             args.input_dim + step_row;
-                b[across].thread_elements()[0] = float(column[0]);
-                b[across].thread_elements()[1] = float(column[args.input_dim]);
+                device const char *row =
+                    weight + (size_t)step_row * args.output_dim +
+                             column_start + across * TILE + fragment_column;
+                b[across].thread_elements()[0] = float(row[0]);
+                b[across].thread_elements()[1] = float(row[1]);
             }
         } else {
 #pragma clang loop unroll(full)
@@ -1375,10 +1375,10 @@ kernel void h3_linear_i8_weight_bf16_simd_square(
                 uint weight_column = column_start + across * TILE + fragment_column;
                 b[across].thread_elements()[0] =
                     step_row < args.input_dim && weight_column < args.output_dim ?
-                    float(weight[weight_column * args.input_dim + step_row]) : 0.0f;
+                    float(weight[(size_t)step_row * args.output_dim + weight_column]) : 0.0f;
                 b[across].thread_elements()[1] =
                     step_row < args.input_dim && weight_column + 1 < args.output_dim ?
-                    float(weight[(weight_column + 1) * args.input_dim + step_row]) :
+                    float(weight[(size_t)step_row * args.output_dim + weight_column + 1]) :
                     0.0f;
             }
         }

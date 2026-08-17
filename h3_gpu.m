@@ -3345,7 +3345,8 @@ int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *opaque, h3_gpu_tensor *output,
                                             input_dim, output_dim);
     if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
                              @"square int8-weight linear input") ||
-        !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
+        /* [input][output] as stored; the count is the same either way. */
+        !h3_gpu_require_i8(gpu, weight, (size_t)input_dim * output_dim,
                            @"square int8-weight linear weight") ||
         !h3_gpu_require_f32(gpu, weight_scales, output_dim,
                             @"square int8-weight linear scales") ||
