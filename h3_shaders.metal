@@ -5408,3 +5408,35 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+/* Gemma 4's feed-forward is GeGLU rather than SwiGLU, and its gate and up
+ * projections are separate matrices, so the product cannot reuse the fused
+ * SwiGLU path. Only the tanh form is implemented, because gelu_pytorch_tanh
+ * is what the checkpoint asks for and an exact-erf branch here would be a
+ * second path nothing exercises. */
+kernel void h3_gelu_mul_bf16(device const ushort *gate [[buffer(0)]],
+                              device const ushort *up [[buffer(1)]],
+                              device ushort *output [[buffer(2)]],
+                              constant uint &count [[buffer(3)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    float value = h3_bf16_to_f32(gate[gid]);
+    float other = h3_bf16_to_f32(up[gid]);
+    float cube = value * value * value;
+    float activated = 0.5f * value *
+        (1.0f + precise::tanh(0.7978845608028654f *
+                              (value + 0.044715f * cube)));
+    output[gid] = h3_f32_to_bf16(activated * other);
+}
+
+/* Every Gemma block multiplies its output by a trained scalar before the
+ * residual stream carries it on. The following RMS norm divides the scale out
+ * of the normalised path, but not out of the stream itself, so it matters. */
+kernel void h3_scale_bf16(device const ushort *input [[buffer(0)]],
+                           device ushort *output [[buffer(1)]],
+                           constant uint &count [[buffer(2)]],
+                           constant float &factor [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) return;
+    output[gid] = h3_f32_to_bf16(h3_bf16_to_f32(input[gid]) * factor);
+}

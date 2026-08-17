@@ -787,5 +787,13 @@ int h3_gpu_euler_bf16(h3_gpu *gpu, h3_gpu_tensor *sample,
 int h3_gpu_silu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          const h3_gpu_tensor *gate,
                          const h3_gpu_tensor *up, uint32_t elements);
+/* Gemma 4's GeGLU: tanh-approximate GELU on the gate times the up
+ * projection, both kept as separate matrices. */
+int h3_gpu_gelu_mul_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *gate,
+                         const h3_gpu_tensor *up, uint32_t elements);
+int h3_gpu_scale_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, uint32_t elements,
+                      float factor);
 
 #endif

@@ -307,6 +307,7 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         @"h3_token_expand_delta_bf16",
         @"h3_token_expand_adaln_bf16",
         @"h3_euler_bf16", @"h3_silu_mul_bf16",
+        @"h3_gelu_mul_bf16", @"h3_scale_bf16",
         @"h3_weight_norm_f32", @"h3_add_scaled_f32",
         @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
         @"h3_snake_beta_f32",
@@ -5779,5 +5780,36 @@ int h3_gpu_silu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(up).buffer offset:0 atIndex:1];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
             [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_gelu_mul_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                         const h3_gpu_tensor *gate,
+                         const h3_gpu_tensor *up, uint32_t elements) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, gate, elements, @"GELU gate") ||
+        !h3_gpu_require_bf16(gpu, up, elements, @"GELU up") ||
+        !h3_gpu_require_bf16(gpu, output, elements, @"GELU product")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_gelu_mul_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(gate).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(up).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:2];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:3];
+        });
+}
+
+int h3_gpu_scale_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, uint32_t elements,
+                      float factor) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_bf16(gpu, input, elements, @"scale input") ||
+        !h3_gpu_require_bf16(gpu, output, elements, @"scale output")) return 0;
+    return h3_gpu_dispatch_1d(gpu, @"h3_scale_bf16", elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&elements length:sizeof(elements) atIndex:2];
+            [encoder setBytes:&factor length:sizeof(factor) atIndex:3];
         });
 }
