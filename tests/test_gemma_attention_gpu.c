@@ -235,6 +235,115 @@ static void run_case(h3_gpu *gpu, const attention_case *item) {
     free(actual); free(expected);
 }
 
+/* Gemma's two rotary tables in the compact half-width form h3_rope_text_bf16
+ * consumes. Proportional RoPE fills only the first partial*head_dim/2 entries
+ * with real frequencies and leaves the rest zero, an identity rotation, so the
+ * table still spans the head.
+ *
+ * Note what the rotary checks below do and do not establish. The same table
+ * feeds the kernel and the host reference, so an error in the table cancels
+ * out: these confirm that the kernel applies a given table the way Gemma
+ * applies one -- the rotate-half pairing, the half-width indexing, separate
+ * query and key head counts, and head widths of 256 and 512 -- and nothing
+ * about whether the table itself is right. That is checked in
+ * tests/test_gemma_block.c against cos and sin from the reference
+ * implementation, where getting the zero padding wrong does fail. */
+static void rope_tables(float *cos_table, float *sin_table, uint32_t tokens,
+                        uint32_t head_dim, double theta, double partial) {
+    uint32_t half = head_dim / 2;
+    uint32_t rotated = (uint32_t)(partial * (double)head_dim / 2.0);
+    for (uint32_t position = 0; position < tokens; position++) {
+        for (uint32_t index = 0; index < half; index++) {
+            double inverse = index < rotated ?
+                1.0 / pow(theta, (double)(2 * index) / (double)head_dim) : 0.0;
+            double angle = (double)position * inverse;
+            cos_table[position * half + index] = (float)cos(angle);
+            sin_table[position * half + index] = (float)sin(angle);
+        }
+    }
+}
+
+static void rope_reference(uint16_t *values, const float *cos_table,
+                           const float *sin_table, uint32_t tokens,
+                           uint32_t heads, uint32_t head_dim) {
+    uint32_t half = head_dim / 2;
+    for (uint32_t token = 0; token < tokens; token++) {
+        for (uint32_t head = 0; head < heads; head++) {
+            uint16_t *x = values + ((size_t)token * heads + head) * head_dim;
+            for (uint32_t index = 0; index < half; index++) {
+                float first = bf16_f32(x[index]);
+                float second = bf16_f32(x[half + index]);
+                float c = cos_table[token * half + index];
+                float sn = sin_table[token * half + index];
+                x[index] = bf16(first * c - second * sn);
+                x[half + index] = bf16(second * c + first * sn);
+            }
+        }
+    }
+}
+
+/* Gemma applies RoPE to queries and keys together, with different head counts
+ * and, on its global layers, a head twice as wide as anything H3 uses. */
+static void run_rope(h3_gpu *gpu, const char *label, uint32_t tokens,
+                     uint32_t query_heads, uint32_t kv_heads,
+                     uint32_t head_dim, double theta, double partial) {
+    size_t qn = (size_t)tokens * query_heads * head_dim;
+    size_t kn = (size_t)tokens * kv_heads * head_dim;
+    size_t half = head_dim / 2;
+    uint16_t *q = malloc(qn * sizeof(*q)), *k = malloc(kn * sizeof(*k));
+    uint16_t *eq = malloc(qn * sizeof(*eq)), *ek = malloc(kn * sizeof(*ek));
+    float *ct = malloc(tokens * half * sizeof(*ct));
+    float *st = malloc(tokens * half * sizeof(*st));
+    uint16_t *gq = malloc(qn * sizeof(*gq)), *gk = malloc(kn * sizeof(*gk));
+    require(q && k && eq && ek && ct && st && gq && gk,
+            "cannot allocate rotary buffers");
+    fill(q, tokens, query_heads, head_dim, 11);
+    fill(k, tokens, kv_heads, head_dim, 12);
+    memcpy(eq, q, qn * sizeof(*eq));
+    memcpy(ek, k, kn * sizeof(*ek));
+    rope_tables(ct, st, tokens, head_dim, theta, partial);
+    rope_reference(eq, ct, st, tokens, query_heads, head_dim);
+    rope_reference(ek, ct, st, tokens, kv_heads, head_dim);
+
+    h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, q, qn);
+    h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, k, kn);
+    h3_gpu_tensor *tc = h3_gpu_tensor_from_f32(gpu, ct, tokens * half);
+    h3_gpu_tensor *ts = h3_gpu_tensor_from_f32(gpu, st, tokens * half);
+    require(tq && tk && tc && ts, "cannot allocate rotary tensors");
+    require(h3_gpu_begin(gpu), "cannot begin the rotary path");
+    if (!h3_gpu_rope_text_bf16(gpu, tq, tk, tc, ts, tokens, query_heads,
+                               kv_heads, head_dim)) {
+        fprintf(stderr, "FAIL %-36s unsupported: %s\n", label,
+                h3_gpu_error(gpu));
+        failures++;
+        return;
+    }
+    require(h3_gpu_submit(gpu), "rotary submit failed");
+    require(h3_gpu_tensor_read_bf16(tq, gq, qn) &&
+            h3_gpu_tensor_read_bf16(tk, gk, kn), "cannot read rotary output");
+
+    double worst = 0.0;
+    for (size_t i = 0; i < qn; i++) {
+        double d = fabs((double)bf16_f32(gq[i]) - (double)bf16_f32(eq[i]));
+        if (d > worst) worst = d;
+    }
+    for (size_t i = 0; i < kn; i++) {
+        double d = fabs((double)bf16_f32(gk[i]) - (double)bf16_f32(ek[i]));
+        if (d > worst) worst = d;
+    }
+    /* Both sides round to BF16 the same way, so this should be exact. */
+    if (worst > 0.0) {
+        fprintf(stderr, "FAIL %-36s worst |delta| %.3e\n", label, worst);
+        failures++;
+    } else {
+        printf("  ok  %-36s exact\n", label);
+    }
+    h3_gpu_tensor_free(tq); h3_gpu_tensor_free(tk);
+    h3_gpu_tensor_free(tc); h3_gpu_tensor_free(ts);
+    free(q); free(k); free(eq); free(ek); free(ct); free(st);
+    free(gq); free(gk);
+}
+
 int main(void) {
     char error[512];
     h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", error, sizeof(error));
@@ -245,13 +354,22 @@ int main(void) {
     printf("causal grouped attention at Gemma 4 head widths:\n");
     size_t count = sizeof(CASES) / sizeof(*CASES);
     for (size_t index = 0; index < count; index++) run_case(gpu, &CASES[index]);
+
+    printf("Gemma 4 rotary application through the text RoPE kernel:\n");
+    /* Sliding layers rotate the whole 256-wide head at theta 10,000. */
+    run_rope(gpu, "sliding rotation, 16:8 of 256", 256, 16, 8, 256, 10000.0, 1.0);
+    /* Global layers rotate a quarter of a 512-wide head at theta 1,000,000
+     * and leave the remaining 192 frequency slots at zero. */
+    run_rope(gpu, "global rotation, 16:1 of 512", 256, 16, 1, 512, 1000000.0, 0.25);
+    run_rope(gpu, "global rotation, short prompt", 7, 16, 1, 512, 1000000.0, 0.25);
     h3_gpu_free(gpu);
 
     if (failures) {
         fprintf(stderr, "\n%d attention cases failed\n", failures);
         return 1;
     }
-    printf("ok: %zu causal attention shapes match a host reference, including "
-           "the 256- and 512-wide heads the Gemma tower needs\n", count);
+    printf("ok: %zu causal attention shapes match a host reference and the "
+           "rotary kernel applies Gemma's rotation at 3 shapes, including the "
+           "256- and 512-wide heads the tower needs\n", count);
     return 0;
 }
