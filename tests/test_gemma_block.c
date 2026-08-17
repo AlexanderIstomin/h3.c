@@ -266,6 +266,15 @@ static void compare(const char *label, const float *actual,
     double worst = 0.0;
     size_t worst_at = 0;
     for (size_t index = 0; index < count; index++) {
+        /* A non-finite result must fail loudly. Comparing it by magnitude
+         * would not: every ordering test against NaN is false, so a NaN slips
+         * through as though it were within tolerance. */
+        if (!isfinite(actual[index])) {
+            fprintf(stderr, "FAIL %-28s produced %f at %zu\n",
+                    label, actual[index], index);
+            failures++;
+            return;
+        }
         double delta = fabs((double)actual[index] - (double)expected[index]);
         if (delta > worst) { worst = delta; worst_at = index; }
     }
