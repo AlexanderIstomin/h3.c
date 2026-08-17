@@ -102,6 +102,9 @@ h3_real_ltx_dit_top_test: tests/test_real_ltx_dit_top.o $(LIB_OBJ)
 h3_real_ltx_dit_run_test: tests/test_real_ltx_dit_run.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_ltx_dit_sample_test: tests/test_real_ltx_dit_sample.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_optimized_qwen_test: tests/test_real_optimized_qwen.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
