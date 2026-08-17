@@ -7,7 +7,7 @@
 #include <string.h>
 
 enum {
-    SEQUENCE = 32,
+    SEQUENCE = 128,
     QUERY_HEADS = 8,
     KV_HEADS = 2,
     HEAD_DIM = 128,
@@ -166,6 +166,7 @@ static void require_cache_matches(h3_gpu *gpu, const uint16_t *query,
 }
 
 int main(void) {
+
     const size_t query_count = (size_t)SEQUENCE * QUERY_HEADS * HEAD_DIM;
     const size_t kv_count = (size_t)SEQUENCE * KV_HEADS * HEAD_DIM;
     uint16_t *query = malloc(query_count * sizeof(*query));
