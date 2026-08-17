@@ -699,10 +699,120 @@ static h3_gpu_tensor *embed(const int32_t *ids, uint32_t tokens) {
     return hidden;
 }
 
+/* -------------------------------------------------------- the aggregation */
+
+/* LTX's FeatureExtractorV2. Each hidden state is normalized per token over its
+ * own 3840 channels, the 49 of them are laid out with the layer index *minor*
+ * -- normed[token][d * 49 + l], which is what reshape(B, T, D * L) produces
+ * from a [B, T, D, L] stack -- rescaled, and projected.
+ *
+ * The two streams differ only in their weights and their rescale, which is
+ * sqrt(out_dim / 3840) and so is not the same number for a 4096-wide video
+ * embedding as for a 2048-wide audio one. Reusing one for the other is wrong
+ * by sqrt(2) and produces entirely plausible conditioning. */
+static void aggregate_stream(const float *normed, uint32_t tokens,
+                             const char *name, uint32_t out_dim,
+                             float *out) {
+    const float rescale = sqrtf((float)out_dim / (float)HIDDEN);
+    const size_t count = (size_t)tokens * AGGREGATE_INPUT;
+    uint16_t *staged = malloc(count * sizeof(*staged));
+    require(staged != NULL, "cannot allocate the aggregation input");
+    for (size_t index = 0; index < count; index++) {
+        float value = round_bf16(normed[index] * rescale);
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        staged[index] = (uint16_t)(bits >> 16);
+    }
+    h3_gpu_tensor *input = h3_gpu_tensor_from_bf16(gpu, staged, count);
+    require(input != NULL, "cannot upload the aggregation input");
+    free(staged);
+
+    char weight_name[160], bias_name[160];
+    snprintf(weight_name, sizeof(weight_name),
+             "text_embedding_projection.%s.weight", name);
+    snprintf(bias_name, sizeof(bias_name),
+             "text_embedding_projection.%s.bias", name);
+    h3_gpu_tensor *weight = load_bf16(weight_name, 2, out_dim, AGGREGATE_INPUT);
+    h3_gpu_tensor *bias = load_bf16(bias_name, 1, out_dim, 0);
+    h3_gpu_tensor *result = h3_gpu_tensor_new_bf16(gpu, (size_t)tokens * out_dim);
+    require(result != NULL, "cannot allocate the aggregation output");
+    GPU_OP(h3_gpu_begin(gpu), "begin aggregation");
+    GPU_OP(h3_gpu_linear_bf16(gpu, result, input, weight, bias, tokens,
+                              AGGREGATE_INPUT, out_dim), "aggregation");
+    GPU_OP(h3_gpu_submit(gpu), "submit aggregation");
+    read_bf16_as_f32(result, out, (size_t)tokens * out_dim);
+
+    double peak = 0.0;
+    for (size_t index = 0; index < (size_t)tokens * out_dim; index++) {
+        require(isfinite(out[index]), "an aggregated feature is not finite");
+        if (fabs((double)out[index]) > peak) peak = fabs((double)out[index]);
+    }
+    printf("  ok  %-28s [%u, %u] rescale %.5f, peak %.3f\n",
+           name, tokens, out_dim, (double)rescale, peak);
+
+    h3_gpu_tensor_free(input);
+    h3_gpu_tensor_free(weight);
+    h3_gpu_tensor_free(bias);
+    h3_gpu_tensor_free(result);
+}
+
+static void aggregate(float *const *states, uint32_t tokens,
+                      float **video, float **audio) {
+    const size_t count = (size_t)tokens * AGGREGATE_INPUT;
+    float *normed = malloc(count * sizeof(*normed));
+    require(normed != NULL, "cannot allocate the normalized states");
+    for (uint32_t token = 0; token < tokens; token++) {
+        for (int layer = 0; layer < HIDDEN_STATES; layer++) {
+            const float *row = states[layer] + (size_t)token * HIDDEN;
+            double sum = 0.0;
+            for (int index = 0; index < HIDDEN; index++)
+                sum += (double)row[index] * (double)row[index];
+            const float inverse = 1.0f /
+                sqrtf((float)(sum / (double)HIDDEN) + AGGREGATE_EPSILON);
+            float *out = normed + (size_t)token * AGGREGATE_INPUT;
+            for (int index = 0; index < HIDDEN; index++)
+                out[(size_t)index * HIDDEN_STATES + layer] = row[index] * inverse;
+        }
+    }
+    *video = malloc((size_t)tokens * VIDEO_DIM * sizeof(**video));
+    *audio = malloc((size_t)tokens * AUDIO_DIM * sizeof(**audio));
+    require(*video && *audio, "cannot allocate the aggregated features");
+    aggregate_stream(normed, tokens, "video_aggregate_embed", VIDEO_DIM, *video);
+    aggregate_stream(normed, tokens, "audio_aggregate_embed", AUDIO_DIM, *audio);
+    free(normed);
+}
+
+/* Everything the aggregation check needs, in a layout a numpy reader can take
+ * in four lines: a header of six uint32 (magic, tokens, states, hidden, video,
+ * audio), then the token ids as int32, then the hidden states as F32 in order,
+ * then the two aggregated results. Not safetensors, because writing that from
+ * here would be more code than the reader saves. */
+static void write_states(const char *path, const int32_t *ids,
+                         float *const *states, const float *video,
+                         const float *audio, uint32_t tokens) {
+    FILE *file = fopen(path, "wb");
+    if (!file) fail("cannot open %s for writing", path);
+    const uint32_t header[6] = {UINT32_C(0x4C545854), tokens, HIDDEN_STATES,
+                                HIDDEN, VIDEO_DIM, AUDIO_DIM};
+    const size_t state = (size_t)tokens * HIDDEN;
+    require(fwrite(header, sizeof(header), 1, file) == 1, "cannot write a header");
+    require(fwrite(ids, sizeof(*ids), tokens, file) == tokens,
+            "cannot write the token ids");
+    for (int index = 0; index < HIDDEN_STATES; index++)
+        require(fwrite(states[index], sizeof(float), state, file) == state,
+                "cannot write a hidden state");
+    require(fwrite(video, sizeof(float), (size_t)tokens * VIDEO_DIM, file) ==
+                (size_t)tokens * VIDEO_DIM, "cannot write the video features");
+    require(fwrite(audio, sizeof(float), (size_t)tokens * AUDIO_DIM, file) ==
+                (size_t)tokens * AUDIO_DIM, "cannot write the audio features");
+    require(fclose(file) == 0, "cannot close the state dump");
+    printf("  wrote %s for the aggregation check\n", path);
+}
+
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s ENCODER.safetensors ANCHOR.safetensors\n",
-                argv[0]);
+    if (argc < 3 || argc > 4) {
+        fprintf(stderr, "usage: %s ENCODER.safetensors ANCHOR.safetensors "
+                        "[STATES.bin]\n", argv[0]);
         return 2;
     }
     char error[512];
@@ -847,8 +957,86 @@ int main(int argc, char **argv) {
         h3_gpu_tensor_free(normed);
     }
 
-    scratch_free(&space);
     h3_gpu_tensor_free(hidden);
+
+    /* --------------------------------------------- 4: the whole conditioning */
+
+    /* The deliverable: all forty-eight layers, the forty-nine hidden states,
+     * and both aggregation projections. Weights are loaded and freed a layer
+     * at a time, so this holds one layer rather than the tower's twelve
+     * gigabytes and reads the file once.
+     *
+     * There is no full-depth reference to hold this to -- the tower does not
+     * fit in torch at F32 on this machine -- so what runs here is asserted to
+     * be finite and is written out for the aggregation to be checked against
+     * LTX's own FeatureExtractorV2 separately. The wiring it repeats is the
+     * wiring phase 3 anchored; what is new is only depth. */
+    if (getenv("H3_LTX_TEXT_ANCHOR_ONLY")) {
+        printf("\nH3_LTX_TEXT_ANCHOR_ONLY set: stopping before the full tower\n");
+    } else {
+        printf("\nThe whole tower, %d layers and %d hidden states:\n",
+               LAYERS, HIDDEN_STATES);
+        const double began = now();
+        float **states = calloc(HIDDEN_STATES, sizeof(*states));
+        require(states != NULL, "cannot allocate the hidden state table");
+        for (int index = 0; index < HIDDEN_STATES; index++) {
+            states[index] = malloc(state * sizeof(**states));
+            require(states[index] != NULL, "cannot allocate a hidden state");
+        }
+
+        hidden = embed(ids, tokens);
+        read_bf16_as_f32(hidden, states[0], state);
+        for (int index = 0; index < LAYERS; index++) {
+            layer_weights weights;
+            load_layer(index, &weights);
+            GPU_OP(h3_gpu_begin(gpu), "begin layer");
+            run_layer(&weights, &space, hidden, tokens);
+            GPU_OP(h3_gpu_submit(gpu), "submit layer");
+            free_layer(&weights);
+            /* State i + 1 is layer i's output, for every layer but the last:
+             * the reference records the stream entering each layer, so layer
+             * 47's raw output is never a state and only its normed form is. */
+            if (index + 1 < LAYERS)
+                read_bf16_as_f32(hidden, states[index + 1], state);
+            if ((index + 1) % 12 == 0) {
+                printf("    %2d/%d layers, %.1f s\n", index + 1, LAYERS,
+                       now() - began);
+                fflush(stdout);
+            }
+        }
+        {
+            h3_gpu_tensor *final_norm = load_bf16("model.norm.weight", 1,
+                                                  HIDDEN, 0);
+            h3_gpu_tensor *normed = h3_gpu_tensor_new_bf16(gpu, state);
+            require(normed != NULL, "cannot allocate the final normed state");
+            GPU_OP(h3_gpu_begin(gpu), "begin final norm");
+            GPU_OP(h3_gpu_rms_norm_bf16(gpu, normed, hidden, final_norm,
+                                        tokens, HIDDEN, RMS_EPSILON),
+                   "final norm");
+            GPU_OP(h3_gpu_submit(gpu), "submit final norm");
+            read_bf16_as_f32(normed, states[LAYERS], state);
+            h3_gpu_tensor_free(final_norm);
+            h3_gpu_tensor_free(normed);
+        }
+        const double tower = now() - began;
+        for (int index = 0; index < HIDDEN_STATES; index++)
+            for (size_t at = 0; at < state; at++)
+                require(isfinite(states[index][at]),
+                        "a hidden state is not finite");
+        printf("  ok  %d states, all finite, %.1f s\n", HIDDEN_STATES, tower);
+
+        float *video = NULL, *audio = NULL;
+        aggregate(states, tokens, &video, &audio);
+
+        if (argc > 3) write_states(argv[3], ids, states, video, audio, tokens);
+        for (int index = 0; index < HIDDEN_STATES; index++) free(states[index]);
+        free(states);
+        free(video);
+        free(audio);
+        h3_gpu_tensor_free(hidden);
+    }
+
+    scratch_free(&space);
     free(actual);
     free(ids);
     h3_gpu_free(gpu);
