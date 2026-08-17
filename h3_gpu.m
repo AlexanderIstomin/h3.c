@@ -284,6 +284,7 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         @"h3_zimage_modulation_f32", @"h3_zimage_modulation_bf16",
         @"h3_linear_i8_weight_bf16_simd_wide",
         @"h3_linear_i8_weight_bf16_simd_square",
+        @"h3_linear_i8_weight_bf16_simd_square_om",
         @"h3_linear_i8_weight_bf16_simd_deep",
         @"h3_flash_attention_bf16",
         @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_convrot_bf16",
@@ -3327,6 +3328,62 @@ int h3_gpu_linear_i8_weight_bf16_tile(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder dispatchThreadgroups:
             MTLSizeMake((output_dim + across * 8 - 1) / (across * 8),
                         (rows + down * 8 - 1) / (down * 8), 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+/* The 64x40 tile on weights stored the way every package already stores them,
+ * [output][input]. Same arithmetic and same dispatch as the square variant
+ * below; it gives up about 9% by reading the two weights a whole row apart
+ * instead of adjacent, and in exchange needs no re-quantized package. */
+int h3_gpu_linear_i8_weight_bf16_square_output_major(
+        h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+        const h3_gpu_tensor *weight, const h3_gpu_tensor *weight_scales,
+        const h3_gpu_tensor *bias, uint32_t rows, uint32_t input_dim,
+        uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !input_dim || !output_dim ||
+        ![gpu.device supportsFamily:MTLGPUFamilyApple7])
+        return h3_gpu_linear_i8_weight_bf16(opaque, output, input, weight,
+                                            weight_scales, bias, rows,
+                                            input_dim, output_dim);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"output-major square int8 linear input") ||
+        !h3_gpu_require_i8(gpu, weight, (size_t)input_dim * output_dim,
+                           @"output-major square int8 linear weight") ||
+        !h3_gpu_require_f32(gpu, weight_scales, output_dim,
+                            @"output-major square int8 linear scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"output-major square int8 linear output") ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
+                                      @"output-major square int8 linear bias")) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_i8_weight_bf16_simd_square_om");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32u) {
+        h3_gpu_set_error(gpu,
+            @"device cannot dispatch the output-major square int8 linear");
+        return 0;
+    }
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 39) / 40,
+                                                  (rows + 63) / 64, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [encoder endEncoding];
     }

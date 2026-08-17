@@ -239,6 +239,39 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
     va_end(arguments);
 }
 
+/* Which int8 tile the DiT's projections use.
+ *
+ * The 8x8 tile the engine shipped with re-reads the weight matrix rows/8
+ * times; the 64x40 one re-reads it rows/64 times, which on these shapes is
+ * measured at 6.1x. Both read the weight [output][input], so this is a
+ * kernel swap and nothing else — no re-quantized package, no loader change.
+ *
+ * H3_DIT_TILE=8x8 restores the old kernel, which is how the two were compared
+ * end to end in one build.
+ */
+static int use_retuned_tile(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *value = getenv("H3_DIT_TILE");
+        cached = !(value && !strcmp(value, "8x8"));
+    }
+    return cached;
+}
+
+static int dit_int8_linear(h3_gpu *gpu, h3_gpu_tensor *output,
+                           const h3_gpu_tensor *input,
+                           const h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *scales,
+                           const h3_gpu_tensor *bias, uint32_t rows,
+                           uint32_t input_dim, uint32_t output_dim) {
+    return use_retuned_tile()
+        ? h3_gpu_linear_i8_weight_bf16_square_output_major(
+              gpu, output, input, weight, scales, bias, rows, input_dim,
+              output_dim)
+        : h3_gpu_linear_i8_weight_bf16(gpu, output, input, weight, scales,
+                                       bias, rows, input_dim, output_dim);
+}
+
 static unsigned command_block_interval(const h3_dit *dit) {
     const char *value = getenv("H3_DIT_COMMAND_BLOCKS");
     if (value && *value) {
@@ -2447,7 +2480,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->gpu, dit->mod_attention, dit->mod_attention,
                 rows, HIDDEN, weight->qkv_convrot_group),
                "DiT QKV ConvRot");
-        OP(h3_gpu_linear_i8_weight_bf16(
+        OP(dit_int8_linear(
             dit->gpu, dit->qkv, dit->mod_attention,
             weight->qkv_int8, weight->qkv_scales, NULL,
             rows, HIDDEN, INNER * 3), "DiT pre-quantized QKV projection");
@@ -2505,7 +2538,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->gpu, dit->attention_heads, dit->attention_heads,
                 rows, INNER, weight->out_convrot_group),
                "DiT attention-output ConvRot");
-        OP(h3_gpu_linear_i8_weight_bf16(
+        OP(dit_int8_linear(
             dit->gpu, dit->attention_output, dit->attention_heads,
             weight->out_int8, weight->out_scales, NULL,
             rows, INNER, HIDDEN),
@@ -2568,7 +2601,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->gpu, dit->mod_mlp, dit->mod_mlp,
                 rows, HIDDEN, weight->fc1_convrot_group),
                "DiT FC1 ConvRot");
-        OP(h3_gpu_linear_i8_weight_bf16(
+        OP(dit_int8_linear(
             dit->gpu, dit->fc1, dit->mod_mlp,
             weight->fc1_int8, weight->fc1_scales, NULL,
             rows, HIDDEN, FFN * 2), "DiT pre-quantized MLP input");
@@ -2583,7 +2616,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                 dit->gpu, dit->activated, dit->activated,
                 rows, FFN, weight->fc2_convrot_group),
                "DiT FC2 ConvRot");
-        OP(h3_gpu_linear_i8_weight_bf16(
+        OP(dit_int8_linear(
             dit->gpu, mlp_output, dit->activated,
             weight->fc2_int8, weight->fc2_scales, NULL,
             rows, FFN, HIDDEN), "DiT pre-quantized MLP output");
