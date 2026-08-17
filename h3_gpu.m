@@ -3292,6 +3292,45 @@ int h3_gpu_flash_attention_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     return 1;
 }
 
+/* Bench-only: dispatch a named tile variant so geometries can be compared on
+ * the real shapes instead of argued about. `down` and `across` are the tile in
+ * 8-row/8-column fragments and must match the kernel the name selects. */
+int h3_gpu_linear_i8_weight_bf16_tile(h3_gpu *opaque, h3_gpu_tensor *output,
+                                      const h3_gpu_tensor *input,
+                                      const h3_gpu_tensor *weight,
+                                      const h3_gpu_tensor *scales,
+                                      const h3_gpu_tensor *bias, uint32_t rows,
+                                      uint32_t input_dim, uint32_t output_dim,
+                                      const char *name, uint32_t down,
+                                      uint32_t across) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, [NSString stringWithUTF8String:name]);
+    if (!pipeline) return 0;
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((output_dim + across * 8 - 1) / (across * 8),
+                        (rows + down * 8 - 1) / (down * 8), 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *opaque, h3_gpu_tensor *output,
                                         const h3_gpu_tensor *input,
                                         const h3_gpu_tensor *weight,
@@ -3315,13 +3354,8 @@ int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *opaque, h3_gpu_tensor *output,
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
                                       @"square int8-weight linear bias")) ||
         !h3_gpu_require_command(gpu)) return 0;
-    /* 32x64 everywhere except deep-K shapes, where the narrower 32x32 tile
-     * measures about a quarter faster — the DiT's w2 is the only one, at
-     * K = 10240 against everyone else's 3840. */
-    const int deep = input_dim > 8192;
     id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
-        gpu, deep ? @"h3_linear_i8_weight_bf16_simd_deep"
-                  : @"h3_linear_i8_weight_bf16_simd_square");
+        gpu, @"h3_linear_i8_weight_bf16_simd_square");
     if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32u) {
         h3_gpu_set_error(gpu, @"device cannot dispatch the square int8 linear");
         return 0;
@@ -3338,9 +3372,8 @@ int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *opaque, h3_gpu_tensor *output,
         [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
         [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
         [encoder setBytes:&args length:sizeof(args) atIndex:5];
-        const NSUInteger span = deep ? 32u : 64u;
-        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + span - 1) / span,
-                                                  (rows + 31) / 32, 1)
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 39) / 40,
+                                                  (rows + 63) / 64, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [encoder endEncoding];
     }

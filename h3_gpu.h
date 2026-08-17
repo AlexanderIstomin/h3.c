@@ -407,6 +407,14 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
  * weight fragment, so the weight crosses the bus `rows / 64` times instead of
  * `rows / 8`. Falls back to the 8x8 path on devices without simdgroup
  * matrices. */
+int h3_gpu_linear_i8_weight_bf16_tile(h3_gpu *gpu, h3_gpu_tensor *output,
+                                      const h3_gpu_tensor *input,
+                                      const h3_gpu_tensor *weight,
+                                      const h3_gpu_tensor *scales,
+                                      const h3_gpu_tensor *bias, uint32_t rows,
+                                      uint32_t input_dim, uint32_t output_dim,
+                                      const char *name, uint32_t down,
+                                      uint32_t across);
 int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *gpu, h3_gpu_tensor *output,
                                         const h3_gpu_tensor *input,
                                         const h3_gpu_tensor *weight,

@@ -1310,8 +1310,8 @@ kernel void h3_linear_i8_weight_bf16_simd_square(
      * load: 21 against the square tile's 16. Wider still would be better again
      * and does not fit — 64x64 wants 128 floats a lane of accumulator alone,
      * which spills. */
-    constexpr uint DOWN = 4;
-    constexpr uint ACROSS = 8;
+    constexpr uint DOWN = 8;
+    constexpr uint ACROSS = 5;
     uint row_start = group.y * (TILE * DOWN);
     uint column_start = group.x * (TILE * ACROSS);
     ushort quad = lane / 4;
@@ -1716,6 +1716,7 @@ kernel void h3_flash_attention_bf16(
             h3_f32_to_bf16(total > 0.0f ? accumulator[row] / total : 0.0f);
     }
 }
+
 
 /* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
  * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
