@@ -140,6 +140,267 @@ static void project(float *out, const float *normed, const float *weight,
     }
 }
 
+/* --------------------------------------------------------------- connector */
+
+/* The second conditioning stage. Padding is replaced by learnable registers
+ * and then eight bidirectional blocks run over the whole span, so the
+ * registers are part of the model rather than scaffolding: valid tokens
+ * attend to them and their content shapes the result.
+ *
+ * Two conventions here differ from the Gemma tower deliberately. Every norm
+ * in the block is parameter-free, and the query/key norms span the full inner
+ * width rather than one head, where Gemma's span a head. */
+
+enum {
+    CONNECTOR_LAYERS = 2,
+    CONNECTOR_HEADS = 4,
+    CONNECTOR_DIM = VIDEO_DIM,
+    CONNECTOR_HEAD_DIM = CONNECTOR_DIM / CONNECTOR_HEADS,
+    CONNECTOR_FF = CONNECTOR_DIM * 4,
+    REGISTERS = 4,
+    MAX_POS = 64
+};
+
+#define CONNECTOR_EPS 1e-6f
+
+/* x * rsqrt(mean(x^2) + eps), optionally scaled. weight == NULL is the
+ * parameter-free form the connector uses between its residuals. */
+static void rms_norm_rows(float *out, const float *in, const float *weight,
+                          size_t rows, size_t width) {
+    for (size_t row = 0; row < rows; row++) {
+        const float *x = in + row * width;
+        float sum = 0.0f;
+        for (size_t index = 0; index < width; index++) sum += x[index] * x[index];
+        float inverse = 1.0f / sqrtf(sum / (float)width + CONNECTOR_EPS);
+        for (size_t index = 0; index < width; index++) {
+            float value = x[index] * inverse;
+            out[row * width + index] = weight ? value * weight[index] : value;
+        }
+    }
+}
+
+static void linear_bias(float *out, const float *in, const float *weight,
+                        const float *bias, size_t rows, size_t input_dim,
+                        size_t output_dim) {
+    for (size_t row = 0; row < rows; row++) {
+        for (size_t column = 0; column < output_dim; column++) {
+            float sum = bias ? bias[column] : 0.0f;
+            const float *w = weight + column * input_dim;
+            const float *x = in + row * input_dim;
+            for (size_t k = 0; k < input_dim; k++) sum = fmaf(x[k], w[k], sum);
+            out[row * output_dim + column] = sum;
+        }
+    }
+}
+
+static float gelu_tanh_value(float value) {
+    float cube = value * value * value;
+    return 0.5f * value *
+           (1.0f + tanhf(0.7978845608028654f * (value + 0.044715f * cube)));
+}
+
+/* LTX's own frequency construction, which is not Gemma's: the inner width's
+ * frequencies are spread geometrically from 1 to theta, scaled by pi/2, and
+ * positions are mapped onto [-1, 1] by max_pos rather than used directly.
+ * The result is split across heads, so no two heads rotate alike.
+ * Laid out as [head][token][head_dim/2] to match the kernel's head stride. */
+static void connector_rope(float *cos_table, float *sin_table, size_t tokens) {
+    size_t half = CONNECTOR_HEAD_DIM / 2;
+    size_t count = CONNECTOR_DIM / 2;
+    double theta = 10000.0;
+    for (size_t index = 0; index < count; index++) {
+        double exponent = count > 1 ? (double)index / (double)(count - 1) : 0.0;
+        double frequency = pow(theta, exponent) * M_PI / 2.0;
+        size_t head = index / half;
+        size_t slot = index % half;
+        for (size_t token = 0; token < tokens; token++) {
+            double fractional = (double)token / (double)MAX_POS;
+            double angle = frequency * (fractional * 2.0 - 1.0);
+            size_t at = head * tokens * half + token * half + slot;
+            cos_table[at] = (float)cos(angle);
+            sin_table[at] = (float)sin(angle);
+        }
+    }
+}
+
+static void apply_rope_rows(float *values, const float *cos_table,
+                            const float *sin_table, size_t tokens) {
+    size_t half = CONNECTOR_HEAD_DIM / 2;
+    float scratch[CONNECTOR_HEAD_DIM];
+    for (size_t token = 0; token < tokens; token++) {
+        for (size_t head = 0; head < CONNECTOR_HEADS; head++) {
+            float *x = values + (token * CONNECTOR_HEADS + head) * CONNECTOR_HEAD_DIM;
+            memcpy(scratch, x, sizeof(scratch));
+            const float *c = cos_table + head * tokens * half + token * half;
+            const float *s = sin_table + head * tokens * half + token * half;
+            for (size_t index = 0; index < half; index++) {
+                x[index] = scratch[index] * c[index] - scratch[half + index] * s[index];
+                x[half + index] = scratch[half + index] * c[index] +
+                                  scratch[index] * s[index];
+            }
+        }
+    }
+}
+
+/* Bidirectional attention over the whole span: the registers have already
+ * taken the padded slots, so every position is valid and there is no mask. */
+static void connector_attention(float *out, const float *query,
+                                const float *key, const float *value,
+                                size_t tokens) {
+    float weights[64];
+    float scale = 1.0f / sqrtf((float)CONNECTOR_HEAD_DIM);
+    require(tokens <= 64, "connector reference assumes a short span");
+    for (size_t head = 0; head < CONNECTOR_HEADS; head++) {
+        for (size_t token = 0; token < tokens; token++) {
+            const float *q = query + (token * CONNECTOR_HEADS + head) * CONNECTOR_HEAD_DIM;
+            float maximum = -INFINITY;
+            for (size_t other = 0; other < tokens; other++) {
+                const float *k = key + (other * CONNECTOR_HEADS + head) * CONNECTOR_HEAD_DIM;
+                float score = 0.0f;
+                for (size_t index = 0; index < CONNECTOR_HEAD_DIM; index++)
+                    score = fmaf(q[index], k[index], score);
+                weights[other] = score * scale;
+                if (weights[other] > maximum) maximum = weights[other];
+            }
+            float total = 0.0f;
+            for (size_t other = 0; other < tokens; other++) {
+                weights[other] = expf(weights[other] - maximum);
+                total += weights[other];
+            }
+            float *destination = out + (token * CONNECTOR_HEADS + head) * CONNECTOR_HEAD_DIM;
+            memset(destination, 0, CONNECTOR_HEAD_DIM * sizeof(*destination));
+            for (size_t other = 0; other < tokens; other++) {
+                float share = weights[other] / total;
+                const float *v = value + (other * CONNECTOR_HEADS + head) * CONNECTOR_HEAD_DIM;
+                for (size_t index = 0; index < CONNECTOR_HEAD_DIM; index++)
+                    destination[index] = fmaf(share, v[index], destination[index]);
+            }
+        }
+    }
+}
+
+static float *load_connector(const char *suffix, size_t expected) {
+    char name[160];
+    snprintf(name, sizeof(name), "connector.%s", suffix);
+    return load_f32(name, expected);
+}
+
+static float *load_block(int layer, const char *suffix, size_t expected) {
+    char name[160];
+    snprintf(name, sizeof(name), "transformer_1d_blocks.%d.%s", layer, suffix);
+    return load_connector(name, expected);
+}
+
+static void run_connector(float *hidden, const int32_t *mask, size_t tokens) {
+    /* Padded slots take the registers, repeated to cover the span. */
+    float *registers = load_connector("learnable_registers",
+                                      (size_t)REGISTERS * CONNECTOR_DIM);
+    for (size_t token = 0; token < tokens; token++) {
+        if (mask[token]) continue;
+        const float *source = registers + (token % REGISTERS) * CONNECTOR_DIM;
+        memcpy(hidden + token * CONNECTOR_DIM, source,
+               CONNECTOR_DIM * sizeof(*hidden));
+    }
+    free(registers);
+
+    size_t half = CONNECTOR_HEAD_DIM / 2;
+    float *cos_table = malloc(CONNECTOR_HEADS * tokens * half * sizeof(*cos_table));
+    float *sin_table = malloc(CONNECTOR_HEADS * tokens * half * sizeof(*sin_table));
+    require(cos_table && sin_table, "cannot allocate connector rotary tables");
+    connector_rope(cos_table, sin_table, tokens);
+
+    size_t span = tokens * CONNECTOR_DIM;
+    float *normed = malloc(span * sizeof(*normed));
+    float *query = malloc(span * sizeof(*query));
+    float *key = malloc(span * sizeof(*key));
+    float *value = malloc(span * sizeof(*value));
+    float *heads = malloc(span * sizeof(*heads));
+    float *projected = malloc(span * sizeof(*projected));
+    float *inner = malloc(tokens * CONNECTOR_FF * sizeof(*inner));
+    require(normed && query && key && value && heads && projected && inner,
+            "cannot allocate connector scratch");
+
+    for (int layer = 0; layer < CONNECTOR_LAYERS; layer++) {
+        float *q_weight = load_block(layer, "attn1.to_q.weight", (size_t)CONNECTOR_DIM * CONNECTOR_DIM);
+        float *q_bias = load_block(layer, "attn1.to_q.bias", CONNECTOR_DIM);
+        float *k_weight = load_block(layer, "attn1.to_k.weight", (size_t)CONNECTOR_DIM * CONNECTOR_DIM);
+        float *k_bias = load_block(layer, "attn1.to_k.bias", CONNECTOR_DIM);
+        float *v_weight = load_block(layer, "attn1.to_v.weight", (size_t)CONNECTOR_DIM * CONNECTOR_DIM);
+        float *v_bias = load_block(layer, "attn1.to_v.bias", CONNECTOR_DIM);
+        float *o_weight = load_block(layer, "attn1.to_out.0.weight", (size_t)CONNECTOR_DIM * CONNECTOR_DIM);
+        float *o_bias = load_block(layer, "attn1.to_out.0.bias", CONNECTOR_DIM);
+        float *q_norm = load_block(layer, "attn1.q_norm.weight", CONNECTOR_DIM);
+        float *k_norm = load_block(layer, "attn1.k_norm.weight", CONNECTOR_DIM);
+        float *gate_weight = load_block(layer, "attn1.to_gate_logits.weight",
+                                        (size_t)CONNECTOR_HEADS * CONNECTOR_DIM);
+        float *gate_bias = load_block(layer, "attn1.to_gate_logits.bias",
+                                      CONNECTOR_HEADS);
+        float *ff_in_w = load_block(layer, "ff.net.0.proj.weight",
+                                    (size_t)CONNECTOR_FF * CONNECTOR_DIM);
+        float *ff_in_b = load_block(layer, "ff.net.0.proj.bias", CONNECTOR_FF);
+        float *ff_out_w = load_block(layer, "ff.net.2.weight",
+                                     (size_t)CONNECTOR_DIM * CONNECTOR_FF);
+        float *ff_out_b = load_block(layer, "ff.net.2.bias", CONNECTOR_DIM);
+
+        rms_norm_rows(normed, hidden, NULL, tokens, CONNECTOR_DIM);
+        linear_bias(query, normed, q_weight, q_bias, tokens,
+                    CONNECTOR_DIM, CONNECTOR_DIM);
+        linear_bias(key, normed, k_weight, k_bias, tokens,
+                    CONNECTOR_DIM, CONNECTOR_DIM);
+        linear_bias(value, normed, v_weight, v_bias, tokens,
+                    CONNECTOR_DIM, CONNECTOR_DIM);
+        /* Full inner width, unlike Gemma's per-head query and key norms. */
+        rms_norm_rows(query, query, q_norm, tokens, CONNECTOR_DIM);
+        rms_norm_rows(key, key, k_norm, tokens, CONNECTOR_DIM);
+        apply_rope_rows(query, cos_table, sin_table, tokens);
+        apply_rope_rows(key, cos_table, sin_table, tokens);
+        connector_attention(heads, query, key, value, tokens);
+
+        /* Per-head gating, twice a sigmoid so the gates centre on one rather
+         * than a half. The logits come from the block's normalised input. */
+        for (size_t token = 0; token < tokens; token++) {
+            for (size_t head = 0; head < CONNECTOR_HEADS; head++) {
+                float logit = gate_bias[head];
+                const float *w = gate_weight + head * CONNECTOR_DIM;
+                const float *x = normed + token * CONNECTOR_DIM;
+                for (size_t k = 0; k < CONNECTOR_DIM; k++)
+                    logit = fmaf(x[k], w[k], logit);
+                float gate = 2.0f / (1.0f + expf(-logit));
+                float *slot = heads + (token * CONNECTOR_HEADS + head) *
+                                          CONNECTOR_HEAD_DIM;
+                for (size_t index = 0; index < CONNECTOR_HEAD_DIM; index++)
+                    slot[index] *= gate;
+            }
+        }
+
+        linear_bias(projected, heads, o_weight, o_bias, tokens,
+                    CONNECTOR_DIM, CONNECTOR_DIM);
+        for (size_t index = 0; index < span; index++)
+            hidden[index] += projected[index];
+
+        rms_norm_rows(normed, hidden, NULL, tokens, CONNECTOR_DIM);
+        linear_bias(inner, normed, ff_in_w, ff_in_b, tokens,
+                    CONNECTOR_DIM, CONNECTOR_FF);
+        for (size_t index = 0; index < tokens * CONNECTOR_FF; index++)
+            inner[index] = gelu_tanh_value(inner[index]);
+        linear_bias(projected, inner, ff_out_w, ff_out_b, tokens,
+                    CONNECTOR_FF, CONNECTOR_DIM);
+        for (size_t index = 0; index < span; index++)
+            hidden[index] += projected[index];
+
+        free(q_weight); free(q_bias); free(k_weight); free(k_bias);
+        free(v_weight); free(v_bias); free(o_weight); free(o_bias);
+        free(q_norm); free(k_norm); free(gate_weight); free(gate_bias);
+        free(ff_in_w); free(ff_in_b); free(ff_out_w); free(ff_out_b);
+    }
+
+    rms_norm_rows(hidden, hidden, NULL, tokens, CONNECTOR_DIM);
+
+    free(cos_table); free(sin_table);
+    free(normed); free(query); free(key); free(value);
+    free(heads); free(projected); free(inner);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s FIXTURE.safetensors\n", argv[0]);
@@ -152,7 +413,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("LTX-2.5 text aggregation against its own implementation:\n");
+    printf("LTX-2.5 text conditioning against its own implementation:\n");
 
     float *hidden[LAYERS];
     for (int layer = 0; layer < LAYERS; layer++) {
@@ -197,6 +458,20 @@ int main(int argc, char **argv) {
     compare("audio features", audio, expected_audio,
             (size_t)TOKENS * AUDIO_DIM, 2e-5f);
 
+    /* Stage two: the connector, over the video stream. */
+    float *connected = malloc((size_t)TOKENS * VIDEO_DIM * sizeof(*connected));
+    require(connected != NULL, "cannot allocate the connector state");
+    memcpy(connected, video, (size_t)TOKENS * VIDEO_DIM * sizeof(*connected));
+    run_connector(connected, mask, TOKENS);
+    float *expected_connector = load_f32("reference.connector_output",
+                                         (size_t)TOKENS * VIDEO_DIM);
+    /* Two transformer blocks of F32 accumulation put the floor near 2e-5 on
+     * values around 1, an order above the single projection above. The
+     * mutation checks in the commit message confirm the bound still bites. */
+    compare("connector output", connected, expected_connector,
+            (size_t)TOKENS * VIDEO_DIM, 1e-4f);
+    free(connected); free(expected_connector);
+
     for (int layer = 0; layer < LAYERS; layer++) free(hidden[layer]);
     free(normed); free(video); free(audio);
     free(video_weight); free(video_bias); free(audio_weight); free(audio_bias);
@@ -204,10 +479,10 @@ int main(int argc, char **argv) {
     h3_weight_store_free(store);
 
     if (failures) {
-        fprintf(stderr, "\n%d aggregation comparisons failed\n", failures);
+        fprintf(stderr, "\n%d conditioning comparisons failed\n", failures);
         return 1;
     }
-    printf("ok: the aggregation reproduces LTX-2.5's own features for both "
-           "streams, padded tokens included\n");
+    printf("ok: the aggregation and the connector reproduce LTX-2.5's own "
+           "outputs, registers and padded tokens included\n");
     return 0;
 }
