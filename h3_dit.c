@@ -12,6 +12,13 @@
 #include <string.h>
 #include <time.h>
 
+/* Casting three operands up and the result back costs time linear in the
+ * rows; attention itself is quadratic in them, so the trade turns over as the
+ * sequence grows. Measured at H3's 56 heads of 128: f32 wins by 1.87x at 1625
+ * rows, 1.76x at 5095 and 1.72x at 8192. The threshold is where Z-Image put
+ * it, below which the casts stop paying for themselves. */
+#define H3_DIT_F32_ATTENTION_ROWS 512u
+
 enum {
     TEXT_DIM = 5120,
     HIDDEN = 5376,
@@ -196,6 +203,13 @@ struct h3_dit {
     h3_gpu_tensor *key;
     h3_gpu_tensor *value;
     h3_gpu_tensor *attention_heads;
+    /* Attention runs f32 above H3_DIT_F32_ATTENTION_ROWS; these hold the cast
+     * operands. NULL below that size, where the casts cost more than they
+     * save and nothing allocates them. */
+    h3_gpu_tensor *query32;
+    h3_gpu_tensor *key32;
+    h3_gpu_tensor *value32;
+    h3_gpu_tensor *heads32;
     h3_gpu_tensor *attention_output;
     h3_gpu_tensor *token_pool_pairs;
     h3_gpu_tensor *token_baseline_indices;
@@ -1938,6 +1952,25 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
+    /* Four f32 buffers for attention, allocated only where it will use them.
+     * At 5095 rows they are 146 MB each; below the threshold the bf16 path
+     * runs and they would be dead weight. Failing to get them is not fatal —
+     * the bf16 path is still correct, just slower. */
+    if (sequence > H3_DIT_F32_ATTENTION_ROWS &&
+        !getenv("H3_DISABLE_F32_ATTENTION")) {
+        dit->query32 = h3_gpu_tensor_new_f32(dit->gpu, sequence * INNER);
+        dit->key32 = h3_gpu_tensor_new_f32(dit->gpu, sequence * INNER);
+        dit->value32 = h3_gpu_tensor_new_f32(dit->gpu, sequence * INNER);
+        dit->heads32 = h3_gpu_tensor_new_f32(dit->gpu, sequence * INNER);
+        if (!dit->query32 || !dit->key32 || !dit->value32 || !dit->heads32) {
+            h3_gpu_tensor_free(dit->query32); dit->query32 = NULL;
+            h3_gpu_tensor_free(dit->key32); dit->key32 = NULL;
+            h3_gpu_tensor_free(dit->value32); dit->value32 = NULL;
+            h3_gpu_tensor_free(dit->heads32); dit->heads32 = NULL;
+            if (getenv("H3_PROFILE"))
+                fprintf(stderr, "h3: no room for f32 attention; using bf16\n");
+        }
+    }
     if (!dit->fused_patch_pack) {
         dit->video_projected = h3_gpu_tensor_new_bf16(
             dit->gpu, video_total * HIDDEN);
@@ -2527,7 +2560,31 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT head-major full attention");
-    else
+    else if (dit->query32 && rows > H3_DIT_F32_ATTENTION_ROWS) {
+        /* Attention in f32 though everything around it is bf16. MPSGraph's
+         * bf16 SDPA is roughly 1.76x slower than its f32 path on this shape,
+         * and casting three operands up and the result back still comes out
+         * well ahead: 868 ms a block against 494 at 5095 rows, which is 18.7 s
+         * a pass across 50 blocks.
+         *
+         * Only reached when the head-major variant above is not, which for a
+         * pre-quantized package is always — int8_attention_out is false there,
+         * so nothing is given up by writing row-major here. */
+        const uint32_t span = rows * INNER;
+        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->query32, dit->query, span),
+           "DiT attention cast q");
+        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->key32, dit->key, span),
+           "DiT attention cast k");
+        OP(h3_gpu_cast_bf16_to_f32(dit->gpu, dit->value32, dit->value, span),
+           "DiT attention cast v");
+        OP(h3_gpu_sdpa_f32(
+            dit->gpu, dit->heads32, dit->query32, dit->key32, dit->value32,
+            rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+           "DiT full attention f32");
+        OP(h3_gpu_cast_f32_to_bf16(dit->gpu, dit->attention_heads,
+                                   dit->heads32, span),
+           "DiT attention cast out");
+    } else
         OP(h3_gpu_sdpa_bf16(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -3767,6 +3824,7 @@ void h3_dit_free(h3_dit *dit) {
     FREE(video_projection_map); FREE(audio_projection_map); FREE(hidden);
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
+    FREE(query32); FREE(key32); FREE(value32); FREE(heads32);
     FREE(attention_heads); FREE(attention_output);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);
