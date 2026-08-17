@@ -20,6 +20,16 @@
  * The head is also where `embedded_timestep` is finally used, which is why
  * AdaLN-single returns it alongside the modulation it is derived from.
  *
+ * One thing patchify does that is not checked here, because it needs the
+ * released weights rather than a fixture: the keyframe marker added straight
+ * after this projection. LTX's own comment calls it "zero-initialized, so this
+ * is an exact no-op until it is trained -- and a no-op forever for models built
+ * without use_keyframes_abs_pos_embedding". Neither half holds for this
+ * checkpoint. Its config sets that flag, and its keyframes_abs_pos_embedding
+ * has a largest magnitude of 3.4e-03 rather than zero, so it is trained and the
+ * driver has to apply it. It reaches only tokens the keyframe mask marks, so a
+ * plain text-to-video pass is unaffected and a keyframe-conditioned one is not.
+ *
  * The reference is called unbound in the generator rather than reimplemented
  * there, since _process_output reads nothing from self.
  *

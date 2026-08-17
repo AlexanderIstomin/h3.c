@@ -37,12 +37,14 @@
  * runs: a self-attention mask, a text context mask that is not additive zeros,
  * a perturbation mask below one, and a prompt timestep.
  *
- * The last of those is now settled, and against this file: `use_prompt_adaln_single`
- * defaults to *true*, and the prompt timestep it produces is driven by the
- * modality's scalar sigma, which changes at every denoising step. So the
- * key/value modulation below is timestep-dependent in the released model and
- * is **not** cacheable across steps, the opposite of what the fixture's
- * configuration suggests. The driver must recompute it per step.
+ * The last of those is now settled. `use_prompt_adaln_single` defaults to
+ * *true* and the released config does not override it; its weights are present
+ * and live, at a standard deviation of 1.9e-02 rather than zero; and the
+ * prompt timestep they produce is driven by the modality's scalar sigma, which
+ * changes at every denoising step. So the key/value modulation below is
+ * timestep-dependent in the released model and is **not** cacheable across
+ * steps, the opposite of what the fixture's configuration suggests. The driver
+ * must recompute it per step.
  *
  * usage: h3_ltx_dit_block_test FIXTURE.safetensors */
 
