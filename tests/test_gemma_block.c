@@ -23,6 +23,7 @@
  *
  * usage: h3_gemma_block_test FIXTURE.safetensors */
 
+#include "h3_gpu.h"
 #include "h3_safetensors.h"
 #include "h3_weights.h"
 
@@ -72,6 +73,9 @@ static void require(int condition, const char *message) {
 
 /* ---------------------------------------------------------------- loading */
 
+static uint16_t to_bf16(float value);
+static float from_bf16(uint16_t value);
+
 static h3_weight_store *store = NULL;
 
 static float *load_f32(const char *name, size_t expected) {
@@ -97,6 +101,14 @@ static float *load_f32(const char *name, size_t expected) {
     require(h3_st_read_data(header, tensor, values,
                             elements * sizeof(*values), error, sizeof(error)),
             "cannot read a fixture tensor");
+    /* Diagnostic: run the host path at the GPU's storage precision. It is how
+     * the GPU tolerance below was set -- rounding weights alone, with F32
+     * arithmetic throughout, moves the host result 4.5e-2 from the reference,
+     * which is more than the GPU path moves. */
+    if (getenv("H3_GEMMA_BF16_WEIGHTS") && strncmp(name, "reference.", 10) != 0) {
+        for (size_t i = 0; i < elements; i++)
+            values[i] = from_bf16(to_bf16(values[i]));
+    }
     return values;
 }
 
@@ -265,6 +277,251 @@ static void compare(const char *label, const float *actual,
     } else {
         printf("  ok  %-28s worst |delta| %.2e\n", label, worst);
     }
+}
+
+/* ------------------------------------------------------------- GPU tower */
+
+/* The same decoder on Metal, driven entirely by kernels that already existed
+ * plus the GeGLU and scale pair Gemma needs. Weights arrive as F32 from the
+ * fixture and are rounded to BF16 once, which is the storage the engine uses
+ * for the Qwen tower too, so the comparison against an F32 host reference
+ * carries BF16 rounding through two layers rather than being exact.
+ *
+ * This is the piece the port actually needed: not new arithmetic, but proof
+ * that the block wires together correctly out of h3.c's existing parts. */
+
+static uint16_t to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += UINT32_C(0x7fff) + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static float from_bf16(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static h3_gpu_tensor *upload_bf16(h3_gpu *gpu, const float *values,
+                                  size_t count) {
+    uint16_t *rounded = malloc(count * sizeof(*rounded));
+    require(rounded != NULL, "cannot allocate a BF16 staging buffer");
+    for (size_t index = 0; index < count; index++)
+        rounded[index] = to_bf16(values[index]);
+    h3_gpu_tensor *tensor = h3_gpu_tensor_from_bf16(gpu, rounded, count);
+    free(rounded);
+    require(tensor != NULL, "cannot upload a BF16 tensor");
+    return tensor;
+}
+
+static h3_gpu_tensor *upload_layer(h3_gpu *gpu, int layer, const char *suffix,
+                                   size_t expected) {
+    float *values = load_layer_f32(layer, suffix, expected);
+    h3_gpu_tensor *tensor = upload_bf16(gpu, values, expected);
+    free(values);
+    return tensor;
+}
+
+#define GPU_OP(call, what) \
+    do { if (!(call)) { \
+        fprintf(stderr, "FAIL: %s: %s\n", (what), h3_gpu_error(gpu)); \
+        exit(1); \
+    } } while (0)
+
+static void run_gpu_tower(h3_gpu *gpu, const int32_t *ids,
+                          const float *embed, float *out,
+                          float *after_layer0) {
+    /* Scaled embedding lookup on the host: it is already covered by the F32
+     * path above, and doing it here would only test h3_gpu_embedding_bf16,
+     * which applies no scale. */
+    float embed_scale = sqrtf((float)HIDDEN);
+    float *initial = malloc((size_t)TOKENS * HIDDEN * sizeof(*initial));
+    require(initial != NULL, "cannot allocate the GPU tower input");
+    for (size_t token = 0; token < TOKENS; token++)
+        for (size_t index = 0; index < HIDDEN; index++)
+            initial[token * HIDDEN + index] =
+                embed[(size_t)ids[token] * HIDDEN + index] * embed_scale;
+    h3_gpu_tensor *hidden = upload_bf16(gpu, initial, (size_t)TOKENS * HIDDEN);
+    free(initial);
+
+    /* The value norm carries no learnable scale, so it is driven with ones
+     * rather than a second kernel. */
+    float ones[512];
+    for (size_t index = 0; index < 512; index++) ones[index] = 1.0f;
+
+    h3_gpu_tensor *scratch = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * HIDDEN);
+    h3_gpu_tensor *residual = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * HIDDEN);
+    require(scratch && residual, "cannot allocate GPU tower scratch");
+
+    for (int layer = 0; layer < LAYERS; layer++) {
+        const gemma_layer_spec *spec = &LAYERS_SPEC[layer];
+        uint32_t head_dim = spec->head_dim;
+        uint32_t inner = QUERY_HEADS * head_dim;
+        uint32_t kv_inner = spec->kv_heads * head_dim;
+        uint32_t half = head_dim / 2;
+
+        h3_gpu_tensor *input_norm = upload_layer(gpu, layer, "input_layernorm.weight", HIDDEN);
+        h3_gpu_tensor *post_attention = upload_layer(gpu, layer, "post_attention_layernorm.weight", HIDDEN);
+        h3_gpu_tensor *pre_ffn = upload_layer(gpu, layer, "pre_feedforward_layernorm.weight", HIDDEN);
+        h3_gpu_tensor *post_ffn = upload_layer(gpu, layer, "post_feedforward_layernorm.weight", HIDDEN);
+        h3_gpu_tensor *q_weight = upload_layer(gpu, layer, "self_attn.q_proj.weight", (size_t)inner * HIDDEN);
+        h3_gpu_tensor *k_weight = upload_layer(gpu, layer, "self_attn.k_proj.weight", (size_t)kv_inner * HIDDEN);
+        h3_gpu_tensor *o_weight = upload_layer(gpu, layer, "self_attn.o_proj.weight", (size_t)HIDDEN * inner);
+        h3_gpu_tensor *q_norm = upload_layer(gpu, layer, "self_attn.q_norm.weight", head_dim);
+        h3_gpu_tensor *k_norm = upload_layer(gpu, layer, "self_attn.k_norm.weight", head_dim);
+        h3_gpu_tensor *gate_w = upload_layer(gpu, layer, "mlp.gate_proj.weight", (size_t)INTERMEDIATE * HIDDEN);
+        h3_gpu_tensor *up_w = upload_layer(gpu, layer, "mlp.up_proj.weight", (size_t)INTERMEDIATE * HIDDEN);
+        h3_gpu_tensor *down_w = upload_layer(gpu, layer, "mlp.down_proj.weight", (size_t)HIDDEN * INTERMEDIATE);
+        h3_gpu_tensor *ones_norm = upload_bf16(gpu, ones, head_dim);
+
+        char v_name[160];
+        snprintf(v_name, sizeof(v_name), "layers.%d.self_attn.v_proj.weight", layer);
+        int has_value = has_tensor(v_name);
+        h3_gpu_tensor *v_weight = has_value ?
+            upload_layer(gpu, layer, "self_attn.v_proj.weight",
+                         (size_t)kv_inner * HIDDEN) : NULL;
+
+        float *cos_table = calloc((size_t)TOKENS * half, sizeof(*cos_table));
+        float *sin_table = calloc((size_t)TOKENS * half, sizeof(*sin_table));
+        require(cos_table && sin_table, "cannot allocate GPU rotary tables");
+        /* The kernel consumes the compact half-width table, where the host
+         * path builds the doubled form, so this fills it directly. */
+        uint32_t rotated = (uint32_t)(spec->partial_rotary * (double)head_dim / 2.0);
+        for (uint32_t position = 0; position < TOKENS; position++) {
+            for (uint32_t index = 0; index < half; index++) {
+                double inverse = index < rotated ?
+                    1.0 / pow(spec->theta, (double)(2 * index) / (double)head_dim) : 0.0;
+                double angle = (double)position * inverse;
+                cos_table[position * half + index] = (float)cos(angle);
+                sin_table[position * half + index] = (float)sin(angle);
+            }
+        }
+        h3_gpu_tensor *rope_cos = h3_gpu_tensor_from_f32(gpu, cos_table, (size_t)TOKENS * half);
+        h3_gpu_tensor *rope_sin = h3_gpu_tensor_from_f32(gpu, sin_table, (size_t)TOKENS * half);
+        free(cos_table);
+        free(sin_table);
+
+        h3_gpu_tensor *normed = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * HIDDEN);
+        h3_gpu_tensor *query = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * inner);
+        h3_gpu_tensor *key = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * kv_inner);
+        h3_gpu_tensor *value = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * kv_inner);
+        h3_gpu_tensor *value_normed = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * kv_inner);
+        h3_gpu_tensor *heads = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * inner);
+        h3_gpu_tensor *gate_out = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * INTERMEDIATE);
+        h3_gpu_tensor *up_out = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * INTERMEDIATE);
+        h3_gpu_tensor *activated = h3_gpu_tensor_new_bf16(gpu, (size_t)TOKENS * INTERMEDIATE);
+        require(normed && query && key && value && value_normed && heads &&
+                gate_out && up_out && activated,
+                "cannot allocate GPU layer tensors");
+
+        GPU_OP(h3_gpu_begin(gpu), "begin layer");
+        GPU_OP(h3_gpu_rms_norm_bf16(gpu, normed, hidden, input_norm,
+                                    TOKENS, HIDDEN, NORM_EPS), "input norm");
+        GPU_OP(h3_gpu_linear_bf16(gpu, query, normed, q_weight, NULL,
+                                  TOKENS, HIDDEN, inner), "query projection");
+        GPU_OP(h3_gpu_linear_bf16(gpu, key, normed, k_weight, NULL,
+                                  TOKENS, HIDDEN, kv_inner), "key projection");
+        if (has_value) {
+            GPU_OP(h3_gpu_linear_bf16(gpu, value, normed, v_weight, NULL,
+                                      TOKENS, HIDDEN, kv_inner),
+                   "value projection");
+        } else {
+            /* attention_k_eq_v: the value is the raw key projection, taken
+             * before k_norm and before the rotation. */
+            GPU_OP(h3_gpu_copy_bf16(gpu, value, 0, key, 0,
+                                    (size_t)TOKENS * kv_inner),
+                   "value from key");
+        }
+        GPU_OP(h3_gpu_rms_norm_bf16(gpu, query, query, q_norm,
+                                    TOKENS * QUERY_HEADS, head_dim, NORM_EPS),
+               "query norm");
+        GPU_OP(h3_gpu_rms_norm_bf16(gpu, key, key, k_norm,
+                                    TOKENS * spec->kv_heads, head_dim, NORM_EPS),
+               "key norm");
+        GPU_OP(h3_gpu_rope_text_bf16(gpu, query, key, rope_cos, rope_sin,
+                                     TOKENS, QUERY_HEADS, spec->kv_heads,
+                                     head_dim), "rotary");
+        GPU_OP(h3_gpu_rms_norm_bf16(gpu, value_normed, value, ones_norm,
+                                    TOKENS * spec->kv_heads, head_dim, NORM_EPS),
+               "value norm");
+        /* Gemma applies no 1/sqrt(head_dim) factor. */
+        GPU_OP(h3_gpu_gqa_causal_bf16(gpu, heads, query, key, value_normed,
+                                      TOKENS, QUERY_HEADS, spec->kv_heads,
+                                      head_dim, 1.0f), "causal attention");
+        GPU_OP(h3_gpu_linear_bf16(gpu, scratch, heads, o_weight, NULL,
+                                  TOKENS, inner, HIDDEN), "output projection");
+        GPU_OP(h3_gpu_rms_norm_bf16(gpu, scratch, scratch, post_attention,
+                                    TOKENS, HIDDEN, NORM_EPS),
+               "post attention norm");
+        GPU_OP(h3_gpu_add_bf16(gpu, hidden, hidden, scratch,
+                               TOKENS * HIDDEN), "attention residual");
+
+        GPU_OP(h3_gpu_rms_norm_bf16(gpu, normed, hidden, pre_ffn,
+                                    TOKENS, HIDDEN, NORM_EPS), "pre ffn norm");
+        GPU_OP(h3_gpu_linear_bf16(gpu, gate_out, normed, gate_w, NULL,
+                                  TOKENS, HIDDEN, INTERMEDIATE), "gate");
+        GPU_OP(h3_gpu_linear_bf16(gpu, up_out, normed, up_w, NULL,
+                                  TOKENS, HIDDEN, INTERMEDIATE), "up");
+        GPU_OP(h3_gpu_gelu_mul_bf16(gpu, activated, gate_out, up_out,
+                                    TOKENS * INTERMEDIATE), "GeGLU");
+        GPU_OP(h3_gpu_linear_bf16(gpu, scratch, activated, down_w, NULL,
+                                  TOKENS, INTERMEDIATE, HIDDEN), "down");
+        GPU_OP(h3_gpu_rms_norm_bf16(gpu, scratch, scratch, post_ffn,
+                                    TOKENS, HIDDEN, NORM_EPS),
+               "post ffn norm");
+        GPU_OP(h3_gpu_add_bf16(gpu, hidden, hidden, scratch,
+                               TOKENS * HIDDEN), "ffn residual");
+        GPU_OP(h3_gpu_scale_bf16(gpu, hidden, hidden, TOKENS * HIDDEN,
+                                 spec->layer_scalar), "layer scalar");
+        GPU_OP(h3_gpu_submit(gpu), "submit layer");
+        if (layer == 0 && after_layer0) {
+            uint16_t *staged = malloc((size_t)TOKENS * HIDDEN * sizeof(*staged));
+            require(staged != NULL, "cannot allocate a layer probe");
+            require(h3_gpu_tensor_read_bf16(hidden, staged,
+                                            (size_t)TOKENS * HIDDEN),
+                    "cannot read the layer probe");
+            for (size_t index = 0; index < (size_t)TOKENS * HIDDEN; index++)
+                after_layer0[index] = from_bf16(staged[index]);
+            free(staged);
+        }
+
+        h3_gpu_tensor_free(input_norm); h3_gpu_tensor_free(post_attention);
+        h3_gpu_tensor_free(pre_ffn); h3_gpu_tensor_free(post_ffn);
+        h3_gpu_tensor_free(q_weight); h3_gpu_tensor_free(k_weight);
+        h3_gpu_tensor_free(o_weight); h3_gpu_tensor_free(v_weight);
+        h3_gpu_tensor_free(q_norm); h3_gpu_tensor_free(k_norm);
+        h3_gpu_tensor_free(gate_w); h3_gpu_tensor_free(up_w);
+        h3_gpu_tensor_free(down_w); h3_gpu_tensor_free(ones_norm);
+        h3_gpu_tensor_free(rope_cos); h3_gpu_tensor_free(rope_sin);
+        h3_gpu_tensor_free(normed); h3_gpu_tensor_free(query);
+        h3_gpu_tensor_free(key); h3_gpu_tensor_free(value);
+        h3_gpu_tensor_free(value_normed); h3_gpu_tensor_free(heads);
+        h3_gpu_tensor_free(gate_out); h3_gpu_tensor_free(up_out);
+        h3_gpu_tensor_free(activated);
+    }
+
+    float *final_norm = load_f32("norm.weight", HIDDEN);
+    h3_gpu_tensor *norm_weight = upload_bf16(gpu, final_norm, HIDDEN);
+    free(final_norm);
+    GPU_OP(h3_gpu_begin(gpu), "begin final norm");
+    GPU_OP(h3_gpu_rms_norm_bf16(gpu, scratch, hidden, norm_weight,
+                                TOKENS, HIDDEN, NORM_EPS), "final norm");
+    GPU_OP(h3_gpu_submit(gpu), "submit final norm");
+
+    uint16_t *result = malloc((size_t)TOKENS * HIDDEN * sizeof(*result));
+    require(result != NULL, "cannot allocate the GPU tower result");
+    require(h3_gpu_tensor_read_bf16(scratch, result, (size_t)TOKENS * HIDDEN),
+            "cannot read the GPU tower result");
+    for (size_t index = 0; index < (size_t)TOKENS * HIDDEN; index++)
+        out[index] = from_bf16(result[index]);
+    free(result);
+
+    h3_gpu_tensor_free(norm_weight);
+    h3_gpu_tensor_free(hidden);
+    h3_gpu_tensor_free(scratch);
+    h3_gpu_tensor_free(residual);
 }
 
 /* ------------------------------------------------------------------ main */
@@ -440,6 +697,34 @@ int main(int argc, char **argv) {
     float *expected_final = load_f32("reference.last_hidden_state", TOKENS * HIDDEN);
     compare("final normed output", hidden, expected_final, TOKENS * HIDDEN, 2e-5f);
 
+    /* The same decoder on Metal, held to the same reference. Weights and
+     * activations are BF16 there, so two layers of rounding put the floor
+     * near a hundredth rather than at the host path's 2e-5. */
+    printf("\nThe same tower on Metal, out of h3.c's kernels:\n");
+    char gpu_error[512];
+    h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", gpu_error, sizeof(gpu_error));
+    if (!gpu) {
+        fprintf(stderr, "FAIL: cannot create Metal context: %s\n", gpu_error);
+        return 1;
+    }
+    float *gpu_out = malloc((size_t)TOKENS * HIDDEN * sizeof(*gpu_out));
+    require(gpu_out != NULL, "cannot allocate the GPU tower output");
+    float *gpu_layer0 = malloc((size_t)TOKENS * HIDDEN * sizeof(*gpu_layer0));
+    require(gpu_layer0 != NULL, "cannot allocate the GPU layer probe");
+    run_gpu_tower(gpu, ids, embed, gpu_out, gpu_layer0);
+    float *reference_layer0 = load_f32("reference.hidden_1", TOKENS * HIDDEN);
+    /* BF16 storage, not the wiring, sets this floor: with H3_GEMMA_BF16_WEIGHTS
+     * the host path rounds its weights the same way and lands 4.5e-2 from the
+     * reference while computing in F32 throughout. The bound sits just above
+     * that, and the mutation checks in the commit message confirm it still
+     * catches a mis-wired block. */
+    compare("after layer 0 (GPU)", gpu_layer0, reference_layer0,
+            TOKENS * HIDDEN, 6e-2f);
+    compare("final normed output (GPU)", gpu_out, expected_final,
+            TOKENS * HIDDEN, 6e-2f);
+    free(gpu_layer0); free(reference_layer0); free(gpu_out);
+    h3_gpu_free(gpu);
+
     free(final_norm); free(expected_final); free(embed); free(hidden);
     h3_weight_store_free(store);
 
@@ -447,7 +732,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "\n%d Gemma tower comparisons failed\n", failures);
         return 1;
     }
-    printf("ok: the Gemma 4 tower reproduces the reference activations, "
-           "covering both sliding and value-less global attention\n");
+    printf("\nok: the Gemma 4 tower reproduces the reference activations on "
+           "the host and on this GPU, covering both sliding and value-less "
+           "global attention\n");
     return 0;
 }
