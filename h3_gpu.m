@@ -285,6 +285,7 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         @"h3_linear_i8_weight_bf16_simd_wide",
         @"h3_linear_i8_weight_bf16_simd_square",
         @"h3_linear_i8_weight_bf16_simd_deep",
+        @"h3_flash_attention_bf16",
         @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_convrot_bf16",
         @"h3_linear_i8_weight_bf16", @"h3_silu_bf16",
         @"h3_convrot_f32", @"h3_linear_i8_weight_f32",
@@ -1288,6 +1289,7 @@ typedef struct {
 } adaln_args;
 typedef struct { uint32_t rows, width, slots, gate_slot; } gate_args;
 typedef struct { uint32_t width; } zimage_modulation_args;
+typedef struct { uint32_t sequence, heads; float scale; } flash_args;
 typedef struct {
     uint32_t sequence, heads, head_dim, rope_half, grouped;
     float epsilon;
@@ -3249,6 +3251,46 @@ int h3_gpu_linear_i8_weight_f32(h3_gpu *opaque, h3_gpu_tensor *output,
 /* The square tile. Traffic for a BMxBN tile is (M/BM)*N*K weight bytes plus
  * (N/BN)*M*K*2 input bytes; the tall 64x8 tile minimises the first and pays
  * for it in the second, and squaring balances them. */
+/* Tiled attention that never materialises the scores. Head dim must be 128,
+ * which is what the DiT uses; other shapes should keep to the MPSGraph path. */
+int h3_gpu_flash_attention_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value, uint32_t sequence,
+                                uint32_t heads, uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    if (head_dim != 128 || !sequence || !heads) return 0;
+    const size_t count = (size_t)sequence * heads * head_dim;
+    if (!h3_gpu_require_bf16(gpu, query, count, @"flash query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"flash key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"flash value") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"flash output") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_flash_attention_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch flash attention");
+        return 0;
+    }
+    flash_args args = {sequence, heads, scale};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((sequence + 31) / 32, heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *opaque, h3_gpu_tensor *output,
                                         const h3_gpu_tensor *input,
                                         const h3_gpu_tensor *weight,

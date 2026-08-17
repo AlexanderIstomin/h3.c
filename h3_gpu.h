@@ -623,6 +623,14 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales);
+/* Tiled attention: a query tile is held while the keys stream past and the
+ * softmax is kept online, so nothing of size sequence² is written down. Head
+ * dim must be 128. */
+int h3_gpu_flash_attention_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value, uint32_t sequence,
+                                uint32_t heads, uint32_t head_dim, float scale);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

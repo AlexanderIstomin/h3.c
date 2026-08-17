@@ -1560,6 +1560,163 @@ kernel void h3_linear_i8_weight_bf16_simd_deep(
     }
 }
 
+/* Attention that never writes the score matrix down — CORRECT AND TOO SLOW.
+ *
+ * Measured against h3_gpu_sdpa_bf16 on a 16-core M1 Pro, 30 heads of 128:
+ *
+ *     tokens   MPSGraph      this   agreement
+ *        320      2.3 ms   13.6 ms    1.3e-04
+ *       4128    268.8 ms   2060 ms    1.4e-04
+ *       9248     1342 ms  10408 ms    1.4e-04
+ *
+ * It agrees to bf16 noise and runs at 0.13 TFLOP/s against MPSGraph's 0.97 —
+ * about 2% of the machine. Kept because the arithmetic is right and it is a
+ * reference the next attempt can check against, but nothing uses it.
+ *
+ * Why it loses, so the next attempt starts somewhere better: every product
+ * here reads one or two threadgroup values and widens a bf16 on the way, so
+ * threadgroup bandwidth and the shift dominate the FMA; the running softmax
+ * uses 32 of the 128 threads while the rest wait; and three barriers a key
+ * tile serialise what should overlap. Beating MPSGraph needs the two products
+ * on simdgroup_matrix with operands held in registers, loads vectorised to
+ * ushort4, and the rescale folded into the accumulation — which is a
+ * different kernel, not a tuning pass on this one. The theoretical prize is
+ * real (1.37x at 1280², 1.49x at 1536², since attention is quadratic and
+ * overtakes everything else near 1400²), so it is worth doing properly rather
+ * than not at all.
+ *
+ * MPSGraph's own SDPA reaches 0.97 TFLOP/s on this model's shape — 4128
+ * tokens, 30 heads, 128 wide — against the 3.0 the int8 GEMM tiles now manage,
+ * and because attention is quadratic in the sequence it grows from 5% of a
+ * block at 320 tokens to 36% at 4128. Above about 1400 pixels square it is the
+ * largest single term in the model.
+ *
+ * The tiling is the usual one: a tile of queries is held while every tile of
+ * keys streams past, and the softmax is kept online — a running maximum and
+ * running sum per query row, with the accumulated output rescaled whenever the
+ * maximum moves. Nothing of size sequence² is ever materialised.
+ *
+ * What decides the shape here is threadgroup memory, 32 KB. Three tiles of
+ * 32x128 at bf16 come to 24 KB, the scores add 4 KB, and the running state a
+ * few hundred bytes — 29 KB, which fits. The output accumulator stays in
+ * registers instead: one thread owns one channel across all 32 queries, which
+ * is 32 floats a lane. Holding the tiles at f32 would want 48 KB for the tiles
+ * alone and does not fit at all.
+ */
+struct flash_args {
+    uint sequence;
+    uint heads;
+    float scale;
+};
+
+kernel void h3_flash_attention_bf16(
+                            device const ushort *query [[buffer(0)]],
+                            device const ushort *key [[buffer(1)]],
+                            device const ushort *value [[buffer(2)]],
+                            device ushort *output [[buffer(3)]],
+                            constant flash_args &args [[buffer(4)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 lane [[thread_position_in_threadgroup]]) {
+    constexpr uint TILE = 32;
+    constexpr uint WIDE = 128;          /* head_dim, fixed for this model */
+    constexpr uint THREADS = 128;
+    const uint tid = lane.x;
+
+    threadgroup ushort q_tile[TILE][WIDE];
+    threadgroup ushort k_tile[TILE][WIDE];
+    threadgroup ushort v_tile[TILE][WIDE];
+    threadgroup float scores[TILE][TILE];
+    threadgroup float running_max[TILE];
+    threadgroup float running_sum[TILE];
+    threadgroup float rescale[TILE];
+
+    const uint head = group.y;
+    const uint query_start = group.x * TILE;
+    const uint stride = args.heads * WIDE;      /* tokens are the outer axis */
+
+    /* Load this tile's queries. Consecutive threads take consecutive channels
+     * of a row, so the global reads coalesce. */
+    for (uint index = tid; index < TILE * WIDE; index += THREADS) {
+        const uint row = index / WIDE, channel = index % WIDE;
+        const uint token = query_start + row;
+        q_tile[row][channel] = token < args.sequence ?
+            query[(size_t)token * stride + head * WIDE + channel] : 0;
+    }
+    if (tid < TILE) {
+        running_max[tid] = -INFINITY;
+        running_sum[tid] = 0.0f;
+    }
+    float accumulator[TILE];
+#pragma clang loop unroll(full)
+    for (uint row = 0; row < TILE; row++) accumulator[row] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint key_start = 0; key_start < args.sequence; key_start += TILE) {
+        for (uint index = tid; index < TILE * WIDE; index += THREADS) {
+            const uint row = index / WIDE, channel = index % WIDE;
+            const uint token = key_start + row;
+            const bool live = token < args.sequence;
+            k_tile[row][channel] = live ?
+                key[(size_t)token * stride + head * WIDE + channel] : 0;
+            v_tile[row][channel] = live ?
+                value[(size_t)token * stride + head * WIDE + channel] : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Scores for this tile: 1024 entries over 128 threads, eight each. */
+        for (uint index = tid; index < TILE * TILE; index += THREADS) {
+            const uint row = index / TILE, column = index % TILE;
+            float sum = 0.0f;
+            for (uint channel = 0; channel < WIDE; channel++)
+                sum = fma(h3_bf16_to_f32(q_tile[row][channel]),
+                          h3_bf16_to_f32(k_tile[column][channel]), sum);
+            scores[row][column] = key_start + column < args.sequence ?
+                sum * args.scale : -INFINITY;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* One thread a query row folds this tile into the running softmax. */
+        if (tid < TILE) {
+            float largest = running_max[tid];
+            for (uint column = 0; column < TILE; column++)
+                largest = max(largest, scores[tid][column]);
+            const float shift = largest > -INFINITY ?
+                exp(running_max[tid] - largest) : 1.0f;
+            float total = 0.0f;
+            for (uint column = 0; column < TILE; column++) {
+                const float weight = scores[tid][column] > -INFINITY ?
+                    exp(scores[tid][column] - largest) : 0.0f;
+                scores[tid][column] = weight;
+                total += weight;
+            }
+            running_sum[tid] = running_sum[tid] * shift + total;
+            running_max[tid] = largest;
+            rescale[tid] = shift;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Each thread owns one channel across every query row. */
+#pragma clang loop unroll(full)
+        for (uint row = 0; row < TILE; row++) {
+            float sum = 0.0f;
+            for (uint column = 0; column < TILE; column++)
+                sum = fma(scores[row][column],
+                          h3_bf16_to_f32(v_tile[column][tid]), sum);
+            accumulator[row] = accumulator[row] * rescale[row] + sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+#pragma clang loop unroll(full)
+    for (uint row = 0; row < TILE; row++) {
+        const uint token = query_start + row;
+        if (token >= args.sequence) continue;
+        const float total = running_sum[row];
+        output[(size_t)token * stride + head * WIDE + tid] =
+            h3_f32_to_bf16(total > 0.0f ? accumulator[row] / total : 0.0f);
+    }
+}
+
 /* Draw Things/ccv-style dynamic symmetric row reduction. This helper is also
  * used by portable fused epilogues, so keep it outside the Metal 4 guard. */
 inline float h3_int8_reduce_max(float value, threadgroup float *scratch,
