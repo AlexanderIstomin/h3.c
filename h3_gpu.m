@@ -5161,6 +5161,36 @@ int h3_gpu_rope_text_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
         });
 }
 
+int h3_gpu_rope_rows_bf16(h3_gpu *opaque, h3_gpu_tensor *values,
+                          const h3_gpu_tensor *rope_cos_f32,
+                          const h3_gpu_tensor *rope_sin_f32,
+                          uint32_t rows, uint32_t heads, uint32_t head_dim,
+                          uint32_t head_stride) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)rows * heads * head_dim;
+    size_t rope_count = head_stride
+        ? (size_t)head_stride * (heads - 1) + (size_t)rows * (head_dim / 2)
+        : (size_t)rows * (head_dim / 2);
+    if (head_dim % 2 || !heads ||
+        !h3_gpu_require_bf16(gpu, values, count, @"RoPE values") ||
+        !h3_gpu_require_elements(gpu, rope_cos_f32, rope_count, @"RoPE cosine") ||
+        TENSOR(rope_cos_f32).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, rope_sin_f32, rope_count, @"RoPE sine") ||
+        TENSOR(rope_sin_f32).dtype != H3_GPU_F32) return 0;
+    /* Zero kv_heads leaves the kernel's key branch unreachable, so `values`
+     * can be bound to both slots and is rotated exactly once. */
+    text_rope_inplace_args args = {rows, heads, 0, head_dim, head_stride};
+    return h3_gpu_dispatch_3d(gpu, @"h3_rope_text_bf16_wide",
+        MTLSizeMake(rows, heads, head_dim / 2),
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(values).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(values).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(rope_cos_f32).buffer offset:0 atIndex:2];
+            [encoder setBuffer:TENSOR(rope_sin_f32).buffer offset:0 atIndex:3];
+            [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        });
+}
+
 static H3GQA *h3_gpu_gqa_graph(H3GPU *gpu, uint32_t sequence,
                                uint32_t query_heads, uint32_t kv_heads,
                                uint32_t head_dim, float scale) {

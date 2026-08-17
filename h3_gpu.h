@@ -705,6 +705,16 @@ int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           uint32_t sequence, uint32_t query_heads,
                           uint32_t kv_heads, uint32_t head_dim,
                           uint32_t head_stride);
+/* One tensor, one table. The call above rotates a query and a key together
+ * and so assumes they share a sequence length, which LTX-2.5's cross-modal
+ * attentions break: video queries meet audio keys, each with its own length
+ * and its own table. Rotating each side separately is the same arithmetic --
+ * the shared call is the special case where both sides happen to agree. */
+int h3_gpu_rope_rows_bf16(h3_gpu *gpu, h3_gpu_tensor *values,
+                          const h3_gpu_tensor *rope_cos_f32,
+                          const h3_gpu_tensor *rope_sin_f32,
+                          uint32_t rows, uint32_t heads, uint32_t head_dim,
+                          uint32_t head_stride);
 /* Index of the largest value in each row, written at indices[index_offset+row].
  * Ties go to the lower index, as a serial scan keeping its best only on a
  * strictly greater value would. `indices` must be U32, and its result can feed
