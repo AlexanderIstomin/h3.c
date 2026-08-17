@@ -42,6 +42,7 @@
  *
  * usage: h3_ltx_dit_block_test FIXTURE.safetensors */
 
+#include "h3_gpu.h"
 #include "h3_safetensors.h"
 #include "h3_weights.h"
 
@@ -433,6 +434,419 @@ static void run_feed_forward(stream *s) {
         s->x[index] += projected[index] * gate[index];
 }
 
+/* --------------------------------------------------------------- the GPU */
+
+/* The same block again, out of the engine's existing kernels, to prove the
+ * wiring rather than the arithmetic. Almost everything it needs was already
+ * here: h3_gpu_adaln_bf16 is exactly rms_norm(x) * (1 + scale) + shift and
+ * reaches LTX's per-token case through an identity row map and a unit norm
+ * weight, so the AdaLN slices below are slot indices into one modulation
+ * buffer rather than separate code.
+ *
+ * Storage is BF16 throughout, so this is compared against the same F32
+ * reference at a looser bound; the gap is rounding, not structure. */
+
+static uint16_t to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    bits += UINT32_C(0x7fff) + ((bits >> 16) & 1u);
+    return (uint16_t)(bits >> 16);
+}
+
+static float from_bf16(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static h3_gpu_tensor *upload_bf16(h3_gpu *gpu, const float *values,
+                                  size_t count) {
+    uint16_t *rounded = malloc(count * sizeof(*rounded));
+    require(rounded != NULL, "cannot allocate a BF16 staging buffer");
+    for (size_t index = 0; index < count; index++)
+        rounded[index] = to_bf16(values[index]);
+    h3_gpu_tensor *tensor = h3_gpu_tensor_from_bf16(gpu, rounded, count);
+    free(rounded);
+    require(tensor != NULL, "cannot upload a BF16 tensor");
+    return tensor;
+}
+
+static h3_gpu_tensor *upload_part(h3_gpu *gpu, const char *prefix,
+                                  const char *suffix, size_t expected) {
+    float *values = load_part(prefix, suffix, expected);
+    h3_gpu_tensor *tensor = upload_bf16(gpu, values, expected);
+    free(values);
+    return tensor;
+}
+
+static void download_bf16(const h3_gpu_tensor *tensor, float *out,
+                          size_t count) {
+    uint16_t *raw = malloc(count * sizeof(*raw));
+    require(raw != NULL, "cannot allocate a BF16 download buffer");
+    require(h3_gpu_tensor_read_bf16(tensor, raw, count),
+            "cannot read a GPU tensor");
+    for (size_t index = 0; index < count; index++) out[index] = from_bf16(raw[index]);
+    free(raw);
+}
+
+#define GPU_OP(call, what) \
+    do { if (!(call)) { \
+        fprintf(stderr, "FAIL: %s: %s\n", (what), h3_gpu_error(gpu)); \
+        exit(1); \
+    } } while (0)
+
+typedef struct {
+    size_t query_dim, context_dim, heads, head_dim, inner;
+    h3_gpu_tensor *q_w, *q_b, *k_w, *k_b, *v_w, *v_b, *o_w, *o_b;
+    h3_gpu_tensor *q_norm, *k_norm, *gate_w, *gate_b;
+} gpu_attention;
+
+static gpu_attention upload_attention(h3_gpu *gpu, const char *prefix,
+                                      size_t query_dim, size_t context_dim,
+                                      size_t heads, size_t head_dim) {
+    gpu_attention a = {0};
+    a.query_dim = query_dim;
+    a.context_dim = context_dim;
+    a.heads = heads;
+    a.head_dim = head_dim;
+    a.inner = heads * head_dim;
+    a.q_w = upload_part(gpu, prefix, "to_q.weight", a.inner * query_dim);
+    a.q_b = upload_part(gpu, prefix, "to_q.bias", a.inner);
+    a.k_w = upload_part(gpu, prefix, "to_k.weight", a.inner * context_dim);
+    a.k_b = upload_part(gpu, prefix, "to_k.bias", a.inner);
+    a.v_w = upload_part(gpu, prefix, "to_v.weight", a.inner * context_dim);
+    a.v_b = upload_part(gpu, prefix, "to_v.bias", a.inner);
+    a.o_w = upload_part(gpu, prefix, "to_out.0.weight", query_dim * a.inner);
+    a.o_b = upload_part(gpu, prefix, "to_out.0.bias", query_dim);
+    a.q_norm = upload_part(gpu, prefix, "q_norm.weight", a.inner);
+    a.k_norm = upload_part(gpu, prefix, "k_norm.weight", a.inner);
+    a.gate_w = upload_part(gpu, prefix, "to_gate_logits.weight",
+                           heads * query_dim);
+    a.gate_b = upload_part(gpu, prefix, "to_gate_logits.bias", heads);
+    return a;
+}
+
+static void free_gpu_attention(gpu_attention *a) {
+    h3_gpu_tensor_free(a->q_w); h3_gpu_tensor_free(a->q_b);
+    h3_gpu_tensor_free(a->k_w); h3_gpu_tensor_free(a->k_b);
+    h3_gpu_tensor_free(a->v_w); h3_gpu_tensor_free(a->v_b);
+    h3_gpu_tensor_free(a->o_w); h3_gpu_tensor_free(a->o_b);
+    h3_gpu_tensor_free(a->q_norm); h3_gpu_tensor_free(a->k_norm);
+    h3_gpu_tensor_free(a->gate_w); h3_gpu_tensor_free(a->gate_b);
+}
+
+/* Rotary tables are per head, so the stride between one head's slice and the
+ * next is that slice's length. Passing zero here would share one table across
+ * every head, which is Gemma's convention and not LTX's. */
+static void gpu_attention_run(h3_gpu *gpu, h3_gpu_tensor *out,
+                              const gpu_attention *a,
+                              const h3_gpu_tensor *x, uint32_t rows_q,
+                              const h3_gpu_tensor *context, uint32_t rows_kv,
+                              const h3_gpu_tensor *q_cos,
+                              const h3_gpu_tensor *q_sin,
+                              const h3_gpu_tensor *k_cos,
+                              const h3_gpu_tensor *k_sin) {
+    h3_gpu_tensor *query = h3_gpu_tensor_new_bf16(gpu, (size_t)rows_q * a->inner);
+    h3_gpu_tensor *key = h3_gpu_tensor_new_bf16(gpu, (size_t)rows_kv * a->inner);
+    h3_gpu_tensor *value = h3_gpu_tensor_new_bf16(gpu, (size_t)rows_kv * a->inner);
+    h3_gpu_tensor *joined = h3_gpu_tensor_new_bf16(gpu, (size_t)rows_q * a->inner);
+    h3_gpu_tensor *logits = h3_gpu_tensor_new_bf16(gpu, (size_t)rows_q * a->heads);
+    require(query && key && value && joined && logits,
+            "cannot allocate attention scratch");
+
+    GPU_OP(h3_gpu_linear_bf16(gpu, query, x, a->q_w, a->q_b, rows_q,
+                              (uint32_t)a->query_dim, (uint32_t)a->inner),
+           "query projection");
+    GPU_OP(h3_gpu_linear_bf16(gpu, key, context, a->k_w, a->k_b, rows_kv,
+                              (uint32_t)a->context_dim, (uint32_t)a->inner),
+           "key projection");
+    GPU_OP(h3_gpu_linear_bf16(gpu, value, context, a->v_w, a->v_b, rows_kv,
+                              (uint32_t)a->context_dim, (uint32_t)a->inner),
+           "value projection");
+    /* Full inner width, not per head. */
+    GPU_OP(h3_gpu_rms_norm_bf16(gpu, query, query, a->q_norm, rows_q,
+                                (uint32_t)a->inner, BLOCK_EPS), "query norm");
+    GPU_OP(h3_gpu_rms_norm_bf16(gpu, key, key, a->k_norm, rows_kv,
+                                (uint32_t)a->inner, BLOCK_EPS), "key norm");
+    if (q_cos) {
+        uint32_t half = (uint32_t)a->head_dim / 2;
+        GPU_OP(h3_gpu_rope_rows_bf16(gpu, query, q_cos, q_sin, rows_q,
+                                     (uint32_t)a->heads, (uint32_t)a->head_dim,
+                                     rows_q * half), "query rotation");
+        GPU_OP(h3_gpu_rope_rows_bf16(gpu, key, k_cos ? k_cos : q_cos,
+                                     k_sin ? k_sin : q_sin, rows_kv,
+                                     (uint32_t)a->heads, (uint32_t)a->head_dim,
+                                     rows_kv * half), "key rotation");
+    }
+    float scale = 1.0f / sqrtf((float)a->head_dim);
+    GPU_OP(h3_gpu_sdpa_cross_bf16(gpu, joined, query, key, value, rows_q,
+                                  rows_kv, (uint32_t)a->heads,
+                                  (uint32_t)a->head_dim, scale), "attention");
+    GPU_OP(h3_gpu_linear_bf16(gpu, logits, x, a->gate_w, a->gate_b, rows_q,
+                              (uint32_t)a->query_dim, (uint32_t)a->heads),
+           "gate logits");
+    GPU_OP(h3_gpu_head_gate_bf16(gpu, joined, logits, rows_q,
+                                 (uint32_t)a->heads, (uint32_t)a->head_dim),
+           "head gating");
+    GPU_OP(h3_gpu_linear_bf16(gpu, out, joined, a->o_w, a->o_b, rows_q,
+                              (uint32_t)a->inner, (uint32_t)a->query_dim),
+           "output projection");
+
+    h3_gpu_tensor_free(query); h3_gpu_tensor_free(key);
+    h3_gpu_tensor_free(value); h3_gpu_tensor_free(joined);
+    h3_gpu_tensor_free(logits);
+}
+
+typedef struct {
+    uint32_t dim, tokens, heads, head_dim, ff;
+    gpu_attention self_attn, text_attn;
+    h3_gpu_tensor *x, *pre, *context, *modulation, *ones, *row_map;
+    h3_gpu_tensor *cross_modulation, *cross_gate_modulation;
+    h3_gpu_tensor *ff_in_w, *ff_in_b, *ff_out_w, *ff_out_b;
+    h3_gpu_tensor *rope_cos, *rope_sin, *cross_rope_cos, *cross_rope_sin;
+    h3_gpu_tensor *branch, *scaled, *inner;
+} gpu_stream;
+
+static void gpu_self_and_text(h3_gpu *gpu, gpu_stream *s) {
+    GPU_OP(h3_gpu_adaln_bf16(gpu, s->scaled, s->x, s->ones, s->modulation,
+                             s->row_map, s->tokens, s->dim, ADA_SLOTS, 0, 1,
+                             BLOCK_EPS), "self-attention modulation");
+    gpu_attention_run(gpu, s->branch, &s->self_attn, s->scaled, s->tokens,
+                      s->scaled, s->tokens, s->rope_cos, s->rope_sin,
+                      NULL, NULL);
+    GPU_OP(h3_gpu_gate_bf16(gpu, s->x, s->x, s->branch, s->modulation,
+                            s->row_map, s->tokens, s->dim, ADA_SLOTS, 2),
+           "self-attention residual");
+    /* Slice 6..8. AdaLN normalises before modulating, which is exactly the
+     * host's rms_norm followed by the affine, so the two collapse into one
+     * call here rather than needing the intermediate. */
+    GPU_OP(h3_gpu_adaln_bf16(gpu, s->scaled, s->x, s->ones, s->modulation,
+                             s->row_map, s->tokens, s->dim, ADA_SLOTS, 6, 7,
+                             BLOCK_EPS), "text cross-attention modulation");
+    gpu_attention_run(gpu, s->branch, &s->text_attn, s->scaled, s->tokens,
+                      s->context, TEXT_TOKENS, NULL, NULL, NULL, NULL);
+    GPU_OP(h3_gpu_gate_bf16(gpu, s->x, s->x, s->branch, s->modulation,
+                            s->row_map, s->tokens, s->dim, ADA_SLOTS, 8),
+           "text cross-attention residual");
+}
+
+static void gpu_feed_forward(h3_gpu *gpu, gpu_stream *s) {
+    GPU_OP(h3_gpu_adaln_bf16(gpu, s->scaled, s->x, s->ones, s->modulation,
+                             s->row_map, s->tokens, s->dim, ADA_SLOTS, 3, 4,
+                             BLOCK_EPS), "feed-forward modulation");
+    GPU_OP(h3_gpu_linear_bf16(gpu, s->inner, s->scaled, s->ff_in_w, s->ff_in_b,
+                              s->tokens, s->dim, s->ff), "feed-forward in");
+    GPU_OP(h3_gpu_gelu_bf16(gpu, s->inner, s->inner, s->tokens * s->ff, 1),
+           "feed-forward activation");
+    GPU_OP(h3_gpu_linear_bf16(gpu, s->branch, s->inner, s->ff_out_w,
+                              s->ff_out_b, s->tokens, s->ff, s->dim),
+           "feed-forward out");
+    GPU_OP(h3_gpu_gate_bf16(gpu, s->x, s->x, s->branch, s->modulation,
+                            s->row_map, s->tokens, s->dim, ADA_SLOTS, 5),
+           "feed-forward residual");
+}
+
+/* One stream's uploads. `table` is the block's static AdaLN rows and `stamp`
+ * the per-token timestep embedding; their sum is the modulation buffer the
+ * AdaLN and gate kernels read, so it is built once here rather than per use. */
+static void gpu_stream_upload(h3_gpu *gpu, gpu_stream *s, const char *tag,
+                              uint32_t dim, uint32_t tokens, uint32_t heads,
+                              uint32_t head_dim, uint32_t ff,
+                              const char *self_prefix, const char *text_prefix,
+                              const char *table_name, const char *prompt_name,
+                              const char *ff_prefix, int ff_bias) {
+    char name[192];
+    s->dim = dim; s->tokens = tokens; s->heads = heads;
+    s->head_dim = head_dim; s->ff = ff;
+    s->self_attn = upload_attention(gpu, self_prefix, dim, dim, heads, head_dim);
+    s->text_attn = upload_attention(gpu, text_prefix, dim, dim, heads, head_dim);
+
+    snprintf(name, sizeof(name), "input.%s_x", tag);
+    float *x = load_f32(name, (size_t)tokens * dim);
+    s->x = upload_bf16(gpu, x, (size_t)tokens * dim);
+    s->pre = upload_bf16(gpu, x, (size_t)tokens * dim);
+    free(x);
+
+    /* The text side is modulated by the static table alone -- no timestep term
+     * with the prompt AdaLN MLP disabled -- so it is the same at every
+     * denoising step and is folded in here rather than on the GPU. */
+    snprintf(name, sizeof(name), "input.%s_context", tag);
+    float *context = load_f32(name, (size_t)TEXT_TOKENS * dim);
+    float *prompt = load_f32(prompt_name, 2 * (size_t)dim);
+    for (size_t token = 0; token < TEXT_TOKENS; token++)
+        for (size_t d = 0; d < dim; d++)
+            context[token * dim + d] = context[token * dim + d] *
+                (1.0f + prompt[dim + d]) + prompt[d];
+    s->context = upload_bf16(gpu, context, (size_t)TEXT_TOKENS * dim);
+    free(context); free(prompt);
+
+    snprintf(name, sizeof(name), "input.%s_timesteps", tag);
+    float *stamp = load_f32(name, (size_t)tokens * ADA_SLOTS * dim);
+    h3_gpu_tensor *stamp_gpu = upload_bf16(gpu, stamp, (size_t)tokens * ADA_SLOTS * dim);
+    free(stamp);
+    float *table = load_f32(table_name, ADA_SLOTS * (size_t)dim);
+    h3_gpu_tensor *table_gpu = h3_gpu_tensor_from_f32(gpu, table, ADA_SLOTS * (size_t)dim);
+    free(table);
+    s->modulation = h3_gpu_tensor_new_bf16(gpu, (size_t)tokens * ADA_SLOTS * dim);
+    require(s->modulation && stamp_gpu && table_gpu, "cannot allocate modulation");
+    GPU_OP(h3_gpu_add_row_bf16(gpu, s->modulation, stamp_gpu, table_gpu,
+                               tokens, ADA_SLOTS * dim), "modulation");
+    h3_gpu_tensor_free(stamp_gpu); h3_gpu_tensor_free(table_gpu);
+
+    snprintf(name, sizeof(name), "%snet.0.proj.weight", ff_prefix);
+    s->ff_in_w = upload_part(gpu, "", name, (size_t)ff * dim);
+    snprintf(name, sizeof(name), "%snet.2.weight", ff_prefix);
+    s->ff_out_w = upload_part(gpu, "", name, (size_t)dim * ff);
+    if (ff_bias) {
+        snprintf(name, sizeof(name), "%snet.0.proj.bias", ff_prefix);
+        s->ff_in_b = upload_part(gpu, "", name, ff);
+        snprintf(name, sizeof(name), "%snet.2.bias", ff_prefix);
+        s->ff_out_b = upload_part(gpu, "", name, dim);
+    }
+
+    snprintf(name, sizeof(name), "input.%s_rope_cos", tag);
+    float *cos_table = load_f32(name, (size_t)heads * tokens * (head_dim / 2));
+    s->rope_cos = h3_gpu_tensor_from_f32(gpu, cos_table,
+                                         (size_t)heads * tokens * (head_dim / 2));
+    free(cos_table);
+    snprintf(name, sizeof(name), "input.%s_rope_sin", tag);
+    float *sin_table = load_f32(name, (size_t)heads * tokens * (head_dim / 2));
+    s->rope_sin = h3_gpu_tensor_from_f32(gpu, sin_table,
+                                         (size_t)heads * tokens * (head_dim / 2));
+    free(sin_table);
+    /* The cross-modal tables are at the audio head width in both streams. */
+    snprintf(name, sizeof(name), "input.%s_cross_rope_cos", tag);
+    float *cross_cos = load_f32(name, (size_t)AUDIO_HEADS * tokens * (AUDIO_HEAD / 2));
+    s->cross_rope_cos = h3_gpu_tensor_from_f32(gpu, cross_cos,
+                                               (size_t)AUDIO_HEADS * tokens * (AUDIO_HEAD / 2));
+    free(cross_cos);
+    snprintf(name, sizeof(name), "input.%s_cross_rope_sin", tag);
+    float *cross_sin = load_f32(name, (size_t)AUDIO_HEADS * tokens * (AUDIO_HEAD / 2));
+    s->cross_rope_sin = h3_gpu_tensor_from_f32(gpu, cross_sin,
+                                               (size_t)AUDIO_HEADS * tokens * (AUDIO_HEAD / 2));
+    free(cross_sin);
+
+    uint32_t *identity = malloc(tokens * sizeof(*identity));
+    require(identity != NULL, "cannot allocate a row map");
+    for (uint32_t row = 0; row < tokens; row++) identity[row] = row;
+    s->row_map = h3_gpu_tensor_from_u32(gpu, identity, tokens);
+    free(identity);
+    float *ones = malloc(dim * sizeof(*ones));
+    require(ones != NULL, "cannot allocate a unit norm weight");
+    for (uint32_t d = 0; d < dim; d++) ones[d] = 1.0f;
+    s->ones = upload_bf16(gpu, ones, dim);
+    free(ones);
+
+    s->branch = h3_gpu_tensor_new_bf16(gpu, (size_t)tokens * dim);
+    s->scaled = h3_gpu_tensor_new_bf16(gpu, (size_t)tokens * dim);
+    s->inner = h3_gpu_tensor_new_bf16(gpu, (size_t)tokens * ff);
+    s->cross_modulation = h3_gpu_tensor_new_bf16(gpu, (size_t)tokens * 4 * dim);
+    s->cross_gate_modulation = h3_gpu_tensor_new_bf16(gpu, (size_t)tokens * dim);
+    require(s->branch && s->scaled && s->inner && s->cross_modulation &&
+            s->cross_gate_modulation && s->row_map, "cannot allocate stream scratch");
+
+    /* The cross-modal tables are five rows: four of scale and shift, one of
+     * gate, each with its own timestep width. */
+    snprintf(name, sizeof(name), "block.scale_shift_table_a2v_ca_%s", tag);
+    float *cross_table = load_f32(name, 5 * (size_t)dim);
+    snprintf(name, sizeof(name), "input.%s_cross_scale_shift", tag);
+    float *cross_stamp = load_f32(name, (size_t)tokens * 4 * dim);
+    h3_gpu_tensor *cross_stamp_gpu = upload_bf16(gpu, cross_stamp, (size_t)tokens * 4 * dim);
+    h3_gpu_tensor *cross_table_gpu = h3_gpu_tensor_from_f32(gpu, cross_table, 4 * (size_t)dim);
+    GPU_OP(h3_gpu_add_row_bf16(gpu, s->cross_modulation, cross_stamp_gpu,
+                               cross_table_gpu, tokens, 4 * dim),
+           "cross-modal modulation");
+    snprintf(name, sizeof(name), "input.%s_cross_gate", tag);
+    float *gate_stamp = load_f32(name, (size_t)tokens * dim);
+    h3_gpu_tensor *gate_stamp_gpu = upload_bf16(gpu, gate_stamp, (size_t)tokens * dim);
+    h3_gpu_tensor *gate_table_gpu = h3_gpu_tensor_from_f32(gpu, cross_table + 4 * dim, dim);
+    GPU_OP(h3_gpu_add_row_bf16(gpu, s->cross_gate_modulation, gate_stamp_gpu,
+                               gate_table_gpu, tokens, dim), "cross-modal gate");
+    h3_gpu_tensor_free(cross_stamp_gpu); h3_gpu_tensor_free(cross_table_gpu);
+    h3_gpu_tensor_free(gate_stamp_gpu); h3_gpu_tensor_free(gate_table_gpu);
+    free(cross_table); free(cross_stamp); free(gate_stamp);
+}
+
+static void run_gpu_block(h3_gpu *gpu, float *video_out, float *audio_out) {
+    gpu_stream video = {0}, audio = {0};
+
+    GPU_OP(h3_gpu_begin(gpu), "begin uploads");
+    gpu_stream_upload(gpu, &video, "video", VIDEO_DIM, VIDEO_TOKENS,
+                      VIDEO_HEADS, VIDEO_HEAD, VIDEO_FF, "attn1.", "attn2.",
+                      "block.scale_shift_table", "block.prompt_scale_shift_table",
+                      "ff.", 0);
+    gpu_stream_upload(gpu, &audio, "audio", AUDIO_DIM, AUDIO_TOKENS,
+                      AUDIO_HEADS, AUDIO_HEAD, AUDIO_FF, "audio_attn1.",
+                      "audio_attn2.", "block.audio_scale_shift_table",
+                      "block.audio_prompt_scale_shift_table", "audio_ff.", 1);
+    gpu_attention a2v = upload_attention(gpu, "audio_to_video_attn.",
+                                         VIDEO_DIM, AUDIO_DIM, AUDIO_HEADS,
+                                         AUDIO_HEAD);
+    gpu_attention v2a = upload_attention(gpu, "video_to_audio_attn.",
+                                         AUDIO_DIM, VIDEO_DIM, AUDIO_HEADS,
+                                         AUDIO_HEAD);
+    h3_gpu_tensor *video_scaled = h3_gpu_tensor_new_bf16(gpu, VIDEO_TOKENS * VIDEO_DIM);
+    h3_gpu_tensor *audio_scaled = h3_gpu_tensor_new_bf16(gpu, AUDIO_TOKENS * AUDIO_DIM);
+    require(video_scaled && audio_scaled, "cannot allocate cross-modal scratch");
+
+    gpu_self_and_text(gpu, &video);
+    gpu_self_and_text(gpu, &audio);
+
+    /* Snapshot both streams before either direction runs. */
+    GPU_OP(h3_gpu_copy_bf16(gpu, video.pre, 0, video.x, 0,
+                            VIDEO_TOKENS * VIDEO_DIM), "video snapshot");
+    GPU_OP(h3_gpu_copy_bf16(gpu, audio.pre, 0, audio.x, 0,
+                            AUDIO_TOKENS * AUDIO_DIM), "audio snapshot");
+
+    /* Audio to video. Slots 0 and 1 of the cross-modal table, and note that
+     * this one is scale before shift where the slices above are shift first. */
+    GPU_OP(h3_gpu_adaln_bf16(gpu, video_scaled, video.pre, video.ones,
+                             video.cross_modulation, video.row_map,
+                             VIDEO_TOKENS, VIDEO_DIM, 4, 1, 0, BLOCK_EPS),
+           "a2v video modulation");
+    GPU_OP(h3_gpu_adaln_bf16(gpu, audio_scaled, audio.pre, audio.ones,
+                             audio.cross_modulation, audio.row_map,
+                             AUDIO_TOKENS, AUDIO_DIM, 4, 1, 0, BLOCK_EPS),
+           "a2v audio modulation");
+    gpu_attention_run(gpu, video.branch, &a2v, video_scaled, VIDEO_TOKENS,
+                      audio_scaled, AUDIO_TOKENS,
+                      video.cross_rope_cos, video.cross_rope_sin,
+                      audio.cross_rope_cos, audio.cross_rope_sin);
+    GPU_OP(h3_gpu_gate_bf16(gpu, video.x, video.x, video.branch,
+                            video.cross_gate_modulation, video.row_map,
+                            VIDEO_TOKENS, VIDEO_DIM, 1, 0), "a2v residual");
+
+    /* Video to audio, slots 2 and 3, both streams read from the snapshot. */
+    GPU_OP(h3_gpu_adaln_bf16(gpu, audio_scaled, audio.pre, audio.ones,
+                             audio.cross_modulation, audio.row_map,
+                             AUDIO_TOKENS, AUDIO_DIM, 4, 3, 2, BLOCK_EPS),
+           "v2a audio modulation");
+    GPU_OP(h3_gpu_adaln_bf16(gpu, video_scaled, video.pre, video.ones,
+                             video.cross_modulation, video.row_map,
+                             VIDEO_TOKENS, VIDEO_DIM, 4, 3, 2, BLOCK_EPS),
+           "v2a video modulation");
+    gpu_attention_run(gpu, audio.branch, &v2a, audio_scaled, AUDIO_TOKENS,
+                      video_scaled, VIDEO_TOKENS,
+                      audio.cross_rope_cos, audio.cross_rope_sin,
+                      video.cross_rope_cos, video.cross_rope_sin);
+    GPU_OP(h3_gpu_gate_bf16(gpu, audio.x, audio.x, audio.branch,
+                            audio.cross_gate_modulation, audio.row_map,
+                            AUDIO_TOKENS, AUDIO_DIM, 1, 0), "v2a residual");
+
+    gpu_feed_forward(gpu, &video);
+    gpu_feed_forward(gpu, &audio);
+    GPU_OP(h3_gpu_submit(gpu), "submit the block");
+
+    download_bf16(video.x, video_out, VIDEO_TOKENS * VIDEO_DIM);
+    download_bf16(audio.x, audio_out, AUDIO_TOKENS * AUDIO_DIM);
+
+    free_gpu_attention(&a2v); free_gpu_attention(&v2a);
+    free_gpu_attention(&video.self_attn); free_gpu_attention(&video.text_attn);
+    free_gpu_attention(&audio.self_attn); free_gpu_attention(&audio.text_attn);
+    h3_gpu_tensor_free(video_scaled); h3_gpu_tensor_free(audio_scaled);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s FIXTURE.safetensors\n", argv[0]);
@@ -593,6 +1007,33 @@ int main(int argc, char **argv) {
             VIDEO_TOKENS * VIDEO_DIM, 1e-5f);
     compare("audio stream", audio.x, expected_audio,
             AUDIO_TOKENS * AUDIO_DIM, 1e-5f);
+
+    /* The same block out of the engine's kernels, at BF16 storage. */
+    char gpu_error[512];
+    if (h3_gpu_prepare("h3_shaders.metal", gpu_error, sizeof(gpu_error))) {
+        h3_gpu *gpu = h3_gpu_create("h3_shaders.metal", gpu_error,
+                                    sizeof(gpu_error));
+        require(gpu != NULL, "cannot create a GPU context");
+        float gpu_video[VIDEO_TOKENS * VIDEO_DIM];
+        float gpu_audio[AUDIO_TOKENS * AUDIO_DIM];
+        run_gpu_block(gpu, gpu_video, gpu_audio);
+        /* BF16 storage sets this floor, not the wiring: eight attentions and
+         * two feed-forwards accumulate rounding against an F32 reference.
+         *
+         * The floor is why the two comparisons are not redundant. Swapping
+         * the GELU flavour moves this by 1.4e-03, which sits under the bound
+         * and so passes here, while the host reference above catches the same
+         * change at 5.9e-04 against its own 1e-05. Structural mistakes clear
+         * the bound easily -- the checked mutations land between 7e-02 and
+         * 3.6e+00 -- but anything at rounding scale is the host's to catch. */
+        compare("video stream on the GPU", gpu_video, expected_video,
+                VIDEO_TOKENS * VIDEO_DIM, 3e-2f);
+        compare("audio stream on the GPU", gpu_audio, expected_audio,
+                AUDIO_TOKENS * AUDIO_DIM, 3e-2f);
+        h3_gpu_free(gpu);
+    } else {
+        printf("  --  no GPU here, host reference only (%s)\n", gpu_error);
+    }
 
     free_attention(&video.self_attn); free_attention(&video.text_attn);
     free_attention(&audio.self_attn); free_attention(&audio.text_attn);
