@@ -587,7 +587,7 @@ static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,
                                   TEXT_KV_HEADS, TEXT_HEAD_DIM,
                                   TEXT_RMS_EPSILON), "key RMSNorm");
     OP(h3_gpu_rope_text_bf16(gpu, query, key, rope_cos, rope_sin, tokens,
-                              TEXT_QUERY_HEADS, TEXT_KV_HEADS, TEXT_HEAD_DIM),
+                              TEXT_QUERY_HEADS, TEXT_KV_HEADS, TEXT_HEAD_DIM, 0),
        "RoPE");
     OP(h3_gpu_gqa_causal_bf16(gpu, attention_heads, query, key, value, tokens,
                                TEXT_QUERY_HEADS, TEXT_KV_HEADS, TEXT_HEAD_DIM,

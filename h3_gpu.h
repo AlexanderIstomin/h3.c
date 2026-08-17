@@ -690,12 +690,21 @@ int h3_gpu_head_rms_norm_coop_bf16(h3_gpu *gpu, h3_gpu_tensor *tensor,
                                    const h3_gpu_tensor *weight,
                                    uint32_t sequence, uint32_t heads,
                                    uint32_t head_dim, float epsilon);
+/* Rotate queries and keys in place against an F32 cosine/sine table.
+ *
+ * `head_stride` is the number of table elements between one head and the next.
+ * Zero shares a single [sequence, head_dim/2] table across every head, which
+ * is what Qwen3-VL and Gemma 4 use. LTX-2.5 splits its frequencies across
+ * heads instead, so each head reads its own slice and the stride is that
+ * slice's length. The arithmetic is identical either way -- only the table
+ * lookup moves -- so both models run the same rotation. */
 int h3_gpu_rope_text_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                           h3_gpu_tensor *key,
                           const h3_gpu_tensor *rope_cos_f32,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
-                          uint32_t kv_heads, uint32_t head_dim);
+                          uint32_t kv_heads, uint32_t head_dim,
+                          uint32_t head_stride);
 /* Index of the largest value in each row, written at indices[index_offset+row].
  * Ties go to the lower index, as a serial scan keeping its best only on a
  * strictly greater value would. `indices` must be U32, and its result can feed

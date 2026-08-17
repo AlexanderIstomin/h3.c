@@ -4912,6 +4912,10 @@ struct text_rope_inplace_args {
     uint query_heads;
     uint kv_heads;
     uint head_dim;
+    /* Elements between one head's rotary table and the next. Zero shares a
+     * single table across every head, which is what Qwen and Gemma want; LTX
+     * splits its frequencies across heads and passes a real stride. */
+    uint head_stride;
 };
 
 /* Iris-style text RoPE. F32 tables avoid compounding table quantization while
@@ -4927,13 +4931,14 @@ kernel void h3_rope_text_bf16(
     uint head = gid.y;
     if (row >= args.sequence) return;
     uint half_dim = args.head_dim / 2;
+    uint table = head * args.head_stride + row * half_dim;
     if (head < args.query_heads) {
         uint base = (row * args.query_heads + head) * args.head_dim;
         for (uint d = 0; d < half_dim; d++) {
             float first = h3_bf16_to_f32(query[base + d]);
             float second = h3_bf16_to_f32(query[base + half_dim + d]);
-            float c = rope_cos[row * half_dim + d];
-            float s = rope_sin[row * half_dim + d];
+            float c = rope_cos[table + d];
+            float s = rope_sin[table + d];
             query[base + d] = h3_f32_to_bf16(first * c - second * s);
             query[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
         }
@@ -4943,8 +4948,8 @@ kernel void h3_rope_text_bf16(
         for (uint d = 0; d < half_dim; d++) {
             float first = h3_bf16_to_f32(key[base + d]);
             float second = h3_bf16_to_f32(key[base + half_dim + d]);
-            float c = rope_cos[row * half_dim + d];
-            float s = rope_sin[row * half_dim + d];
+            float c = rope_cos[table + d];
+            float s = rope_sin[table + d];
             key[base + d] = h3_f32_to_bf16(first * c - second * s);
             key[base + half_dim + d] = h3_f32_to_bf16(second * c + first * s);
         }
@@ -5050,8 +5055,9 @@ kernel void h3_rope_text_bf16_wide(
     const uint d = gid.z;
     const uint half_dim = args.head_dim / 2;
     if (row >= args.sequence || d >= half_dim) return;
-    const float c = rope_cos[row * half_dim + d];
-    const float s = rope_sin[row * half_dim + d];
+    const uint table = head * args.head_stride + row * half_dim;
+    const float c = rope_cos[table + d];
+    const float s = rope_sin[table + d];
     if (head < args.query_heads) {
         const uint base = (row * args.query_heads + head) * args.head_dim;
         const float first = h3_bf16_to_f32(query[base + d]);

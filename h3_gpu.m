@@ -1321,7 +1321,9 @@ typedef struct {
     float epsilon;
 } text_rope_args;
 typedef struct { uint32_t sequence, heads, head_dim; float epsilon; } head_norm_args;
-typedef struct { uint32_t sequence, query_heads, kv_heads, head_dim; } text_rope_inplace_args;
+typedef struct {
+    uint32_t sequence, query_heads, kv_heads, head_dim, head_stride;
+} text_rope_inplace_args;
 typedef struct {
     uint32_t sequence, query_heads, kv_heads, head_dim;
     float scale;
@@ -5112,11 +5114,16 @@ int h3_gpu_rope_text_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
                           const h3_gpu_tensor *rope_cos_f32,
                           const h3_gpu_tensor *rope_sin_f32,
                           uint32_t sequence, uint32_t query_heads,
-                          uint32_t kv_heads, uint32_t head_dim) {
+                          uint32_t kv_heads, uint32_t head_dim,
+                          uint32_t head_stride) {
     H3GPU *gpu = GPU(opaque);
     size_t query_count = (size_t)sequence * query_heads * head_dim;
     size_t key_count = (size_t)sequence * kv_heads * head_dim;
-    size_t rope_count = (size_t)sequence * (head_dim / 2);
+    uint32_t widest = query_heads > kv_heads ? query_heads : kv_heads;
+    /* A shared table spans one sequence; per-head tables span one per head. */
+    size_t rope_count = head_stride
+        ? (size_t)head_stride * (widest - 1) + (size_t)sequence * (head_dim / 2)
+        : (size_t)sequence * (head_dim / 2);
     if (head_dim % 2 || !kv_heads || query_heads % kv_heads ||
         !h3_gpu_require_bf16(gpu, query, query_count, @"RoPE query") ||
         !h3_gpu_require_bf16(gpu, key, key_count, @"RoPE key") ||
@@ -5124,8 +5131,9 @@ int h3_gpu_rope_text_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
         TENSOR(rope_cos_f32).dtype != H3_GPU_F32 ||
         !h3_gpu_require_elements(gpu, rope_sin_f32, rope_count, @"RoPE sine") ||
         TENSOR(rope_sin_f32).dtype != H3_GPU_F32) return 0;
-    text_rope_inplace_args args = {sequence, query_heads, kv_heads, head_dim};
-    uint32_t maximum_heads = query_heads > kv_heads ? query_heads : kv_heads;
+    text_rope_inplace_args args = {sequence, query_heads, kv_heads,
+                                   head_dim, head_stride};
+    uint32_t maximum_heads = widest;
     /* A thread per channel pair rather than per head. Every element is computed
      * by the same expression from the same inputs and the pairs are disjoint,
      * so this is bit-identical to the kernel below and only wider — which is

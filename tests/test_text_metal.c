@@ -220,7 +220,8 @@ int main(int argc, char **argv) {
                 "key head RMSNorm");
     require_gpu(&test, h3_gpu_rope_text_bf16(test.gpu, query, key, rope_cos,
                                               rope_sin, SEQUENCE, QUERY_HEADS,
-                                              KV_HEADS, HEAD_DIM), "text RoPE");
+                                              KV_HEADS, HEAD_DIM, 0),
+                "text RoPE");
     require_gpu(&test, h3_gpu_gqa_causal_bf16(
                            test.gpu, attention_heads, query, key, value,
                            SEQUENCE, QUERY_HEADS, KV_HEADS, HEAD_DIM,

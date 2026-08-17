@@ -263,18 +263,42 @@ static void rope_tables(float *cos_table, float *sin_table, uint32_t tokens,
     }
 }
 
+/* Per-head tables, as LTX-2.5 builds them: the frequencies are split across
+ * heads so no two heads rotate alike. Head h occupies elements
+ * [h * tokens * half, (h + 1) * tokens * half). */
+static void rope_tables_per_head(float *cos_table, float *sin_table,
+                                 uint32_t tokens, uint32_t heads,
+                                 uint32_t head_dim) {
+    uint32_t half = head_dim / 2;
+    for (uint32_t head = 0; head < heads; head++) {
+        for (uint32_t position = 0; position < tokens; position++) {
+            for (uint32_t index = 0; index < half; index++) {
+                double slot = (double)(head * half + index);
+                double inverse = 1.0 / pow(10000.0,
+                    slot / (double)(heads * half));
+                double angle = (double)position * inverse;
+                size_t at = (size_t)head * tokens * half + position * half + index;
+                cos_table[at] = (float)cos(angle);
+                sin_table[at] = (float)sin(angle);
+            }
+        }
+    }
+}
+
 static void rope_reference(uint16_t *values, const float *cos_table,
                            const float *sin_table, uint32_t tokens,
-                           uint32_t heads, uint32_t head_dim) {
+                           uint32_t heads, uint32_t head_dim,
+                           uint32_t head_stride) {
     uint32_t half = head_dim / 2;
     for (uint32_t token = 0; token < tokens; token++) {
         for (uint32_t head = 0; head < heads; head++) {
             uint16_t *x = values + ((size_t)token * heads + head) * head_dim;
+            size_t table = (size_t)head * head_stride + token * half;
             for (uint32_t index = 0; index < half; index++) {
                 float first = bf16_f32(x[index]);
                 float second = bf16_f32(x[half + index]);
-                float c = cos_table[token * half + index];
-                float sn = sin_table[token * half + index];
+                float c = cos_table[table + index];
+                float sn = sin_table[table + index];
                 x[index] = bf16(first * c - second * sn);
                 x[half + index] = bf16(second * c + first * sn);
             }
@@ -286,14 +310,19 @@ static void rope_reference(uint16_t *values, const float *cos_table,
  * and, on its global layers, a head twice as wide as anything H3 uses. */
 static void run_rope(h3_gpu *gpu, const char *label, uint32_t tokens,
                      uint32_t query_heads, uint32_t kv_heads,
-                     uint32_t head_dim, double theta, double partial) {
+                     uint32_t head_dim, double theta, double partial,
+                     int per_head) {
     size_t qn = (size_t)tokens * query_heads * head_dim;
     size_t kn = (size_t)tokens * kv_heads * head_dim;
     size_t half = head_dim / 2;
     uint16_t *q = malloc(qn * sizeof(*q)), *k = malloc(kn * sizeof(*k));
     uint16_t *eq = malloc(qn * sizeof(*eq)), *ek = malloc(kn * sizeof(*ek));
-    float *ct = malloc(tokens * half * sizeof(*ct));
-    float *st = malloc(tokens * half * sizeof(*st));
+    uint32_t widest = query_heads > kv_heads ? query_heads : kv_heads;
+    uint32_t head_stride = per_head ? tokens * (uint32_t)half : 0;
+    size_t table_elements = per_head ? (size_t)widest * tokens * half
+                                     : (size_t)tokens * half;
+    float *ct = malloc(table_elements * sizeof(*ct));
+    float *st = malloc(table_elements * sizeof(*st));
     uint16_t *gq = malloc(qn * sizeof(*gq)), *gk = malloc(kn * sizeof(*gk));
     require(q && k && eq && ek && ct && st && gq && gk,
             "cannot allocate rotary buffers");
@@ -301,18 +330,19 @@ static void run_rope(h3_gpu *gpu, const char *label, uint32_t tokens,
     fill(k, tokens, kv_heads, head_dim, 12);
     memcpy(eq, q, qn * sizeof(*eq));
     memcpy(ek, k, kn * sizeof(*ek));
-    rope_tables(ct, st, tokens, head_dim, theta, partial);
-    rope_reference(eq, ct, st, tokens, query_heads, head_dim);
-    rope_reference(ek, ct, st, tokens, kv_heads, head_dim);
+    if (per_head) rope_tables_per_head(ct, st, tokens, widest, head_dim);
+    else rope_tables(ct, st, tokens, head_dim, theta, partial);
+    rope_reference(eq, ct, st, tokens, query_heads, head_dim, head_stride);
+    rope_reference(ek, ct, st, tokens, kv_heads, head_dim, head_stride);
 
     h3_gpu_tensor *tq = h3_gpu_tensor_from_bf16(gpu, q, qn);
     h3_gpu_tensor *tk = h3_gpu_tensor_from_bf16(gpu, k, kn);
-    h3_gpu_tensor *tc = h3_gpu_tensor_from_f32(gpu, ct, tokens * half);
-    h3_gpu_tensor *ts = h3_gpu_tensor_from_f32(gpu, st, tokens * half);
+    h3_gpu_tensor *tc = h3_gpu_tensor_from_f32(gpu, ct, table_elements);
+    h3_gpu_tensor *ts = h3_gpu_tensor_from_f32(gpu, st, table_elements);
     require(tq && tk && tc && ts, "cannot allocate rotary tensors");
     require(h3_gpu_begin(gpu), "cannot begin the rotary path");
     if (!h3_gpu_rope_text_bf16(gpu, tq, tk, tc, ts, tokens, query_heads,
-                               kv_heads, head_dim)) {
+                               kv_heads, head_dim, head_stride)) {
         fprintf(stderr, "FAIL %-36s unsupported: %s\n", label,
                 h3_gpu_error(gpu));
         failures++;
@@ -357,19 +387,23 @@ int main(void) {
 
     printf("Gemma 4 rotary application through the text RoPE kernel:\n");
     /* Sliding layers rotate the whole 256-wide head at theta 10,000. */
-    run_rope(gpu, "sliding rotation, 16:8 of 256", 256, 16, 8, 256, 10000.0, 1.0);
+    run_rope(gpu, "sliding rotation, 16:8 of 256", 256, 16, 8, 256, 10000.0, 1.0, 0);
     /* Global layers rotate a quarter of a 512-wide head at theta 1,000,000
      * and leave the remaining 192 frequency slots at zero. */
-    run_rope(gpu, "global rotation, 16:1 of 512", 256, 16, 1, 512, 1000000.0, 0.25);
-    run_rope(gpu, "global rotation, short prompt", 7, 16, 1, 512, 1000000.0, 0.25);
+    run_rope(gpu, "global rotation, 16:1 of 512", 256, 16, 1, 512, 1000000.0, 0.25, 0);
+    run_rope(gpu, "global rotation, short prompt", 7, 16, 1, 512, 1000000.0, 0.25, 0);
+    /* LTX-2.5's connector, where every head rotates differently. */
+    run_rope(gpu, "per-head rotation, 32 of 128", 256, 32, 32, 128, 0.0, 0.0, 1);
+    run_rope(gpu, "per-head rotation, 32 of 64", 64, 32, 32, 64, 0.0, 0.0, 1);
     h3_gpu_free(gpu);
 
     if (failures) {
         fprintf(stderr, "\n%d attention cases failed\n", failures);
         return 1;
     }
-    printf("ok: %zu causal attention shapes match a host reference and the "
-           "rotary kernel applies Gemma's rotation at 3 shapes, including the "
-           "256- and 512-wide heads the tower needs\n", count);
+    printf("ok: %zu causal attention shapes match a host reference, and the "
+           "rotary kernel applies both a shared and a per-head table at 5 "
+           "shapes, including the 256- and 512-wide heads the tower needs\n",
+           count);
     return 0;
 }

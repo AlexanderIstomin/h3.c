@@ -451,7 +451,7 @@ static void run_gpu_tower(h3_gpu *gpu, const int32_t *ids,
                "key norm");
         GPU_OP(h3_gpu_rope_text_bf16(gpu, query, key, rope_cos, rope_sin,
                                      TOKENS, QUERY_HEADS, spec->kv_heads,
-                                     head_dim), "rotary");
+                                     head_dim, 0), "rotary");
         GPU_OP(h3_gpu_rms_norm_bf16(gpu, value_normed, value, ones_norm,
                                     TOKENS * spec->kv_heads, head_dim, NORM_EPS),
                "value norm");
