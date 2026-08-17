@@ -72,6 +72,9 @@ h3_ltx_conditioning_test: tests/test_ltx_conditioning.o $(LIB_OBJ)
 h3_ltx_dit_block_test: tests/test_ltx_dit_block.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_ltx_adaln_single_test: tests/test_ltx_adaln_single.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_optimized_qwen_test: tests/test_real_optimized_qwen.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 

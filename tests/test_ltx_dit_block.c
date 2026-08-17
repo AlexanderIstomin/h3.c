@@ -35,10 +35,14 @@
  * Four of the reference's paths are not exercised, because the fixture leaves
  * them at their defaults, and each will need its own check before a real clip
  * runs: a self-attention mask, a text context mask that is not additive zeros,
- * a perturbation mask below one, and a prompt timestep. The last of those is
- * not hypothetical -- the released checkpoint carries prompt_adaln_single
- * weights, so the key/value modulation may well be timestep-dependent in the
- * real model, and if it is, it stops being cacheable across steps.
+ * a perturbation mask below one, and a prompt timestep.
+ *
+ * The last of those is now settled, and against this file: `use_prompt_adaln_single`
+ * defaults to *true*, and the prompt timestep it produces is driven by the
+ * modality's scalar sigma, which changes at every denoising step. So the
+ * key/value modulation below is timestep-dependent in the released model and
+ * is **not** cacheable across steps, the opposite of what the fixture's
+ * configuration suggests. The driver must recompute it per step.
  *
  * usage: h3_ltx_dit_block_test FIXTURE.safetensors */
 
@@ -378,9 +382,9 @@ static void run_self_and_text(stream *s) {
     ada_value(gate, s->scale_shift_table, s->timesteps, ADA_SLOTS, 8, s->tokens, s->dim);
     for (size_t index = 0; index < span; index++)
         modulated[index] = normed[index] * (1.0f + scale[index]) + shift[index];
-    /* The key/value side is modulated by the static table alone. With the
-     * prompt AdaLN MLP disabled there is no timestep term, so the projected
-     * text is the same at every denoising step and could be cached. */
+    /* The key/value side is modulated by the static table alone, because this
+     * fixture has no prompt timestep. The released model does -- see the
+     * header -- so the driver adds a per-step term here rather than caching. */
     for (size_t token = 0; token < TEXT_TOKENS; token++)
         for (size_t d = 0; d < s->dim; d++)
             context[token * s->dim + d] =
@@ -668,9 +672,10 @@ static void gpu_stream_upload(h3_gpu *gpu, gpu_stream *s, const char *tag,
     s->pre = upload_bf16(gpu, x, (size_t)tokens * dim);
     free(x);
 
-    /* The text side is modulated by the static table alone -- no timestep term
-     * with the prompt AdaLN MLP disabled -- so it is the same at every
-     * denoising step and is folded in here rather than on the GPU. */
+    /* The text side is modulated by the static table alone in this fixture, so
+     * it is folded in at upload. That shortcut does not survive contact with
+     * the released model, which adds a per-step prompt timestep on top; see
+     * the header. */
     snprintf(name, sizeof(name), "input.%s_context", tag);
     float *context = load_f32(name, (size_t)TEXT_TOKENS * dim);
     float *prompt = load_f32(prompt_name, 2 * (size_t)dim);
