@@ -231,14 +231,28 @@ int h3_avwriter_write_av_rgb24_f32(const char *path, const uint8_t *frames,
         }
         [writer startSessionAtSourceTime:kCMTimeZero];
 
-        if (!append_video(video, adaptor, frames, frame_count, width, height,
-                          fps, error, error_size)) {
-            [writer cancelWriting];
-            return 0;
-        }
+        /* Soundtrack first, and it is one buffer.
+         *
+         * The writer interleaves, so it stops taking video once that track
+         * runs far enough ahead of the audio — and with the video loop
+         * spinning on readyForMoreMediaData until audio it has not been given
+         * arrives, that is a deadlock rather than a wait. A 22-frame clip
+         * stayed inside the tolerance and muxed; 73 frames hung for as long as
+         * it was left, which is every clip over about a second.
+         *
+         * Appending the audio first and marking it finished leaves nothing for
+         * the writer to wait for, so the video runs to the end. This works
+         * because the whole soundtrack is a single sample buffer; were it
+         * chunked, the two would have to be interleaved by presentation time
+         * or driven from requestMediaDataWhenReady. */
         if (with_audio &&
             !append_audio(audio, pcm, samples, channels, sample_rate, error,
                           error_size)) {
+            [writer cancelWriting];
+            return 0;
+        }
+        if (!append_video(video, adaptor, frames, frame_count, width, height,
+                          fps, error, error_size)) {
             [writer cancelWriting];
             return 0;
         }
