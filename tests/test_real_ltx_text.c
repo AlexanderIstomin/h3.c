@@ -850,7 +850,10 @@ int main(int argc, char **argv) {
     /* ------------------------------------------------------ 2: the rotation */
 
     printf("\nThe fixture's Hadamard against the engine's kernel:\n");
-    {
+    if (!h3_weight_find(anchor, "convrot_probe_in", NULL)) {
+        printf("  --  the anchor carries no ConvRot probe, so this is a "
+               "prompt run; skipping\n");
+    } else {
         const size_t count = (size_t)3 * HIDDEN;
         float *probe_in = load_anchor("convrot_probe_in", count);
         float *probe_out = load_anchor("convrot_probe_out", count);
@@ -895,13 +898,29 @@ int main(int argc, char **argv) {
              "not apply yet", tokens, SLIDING_WINDOW);
     }
 
+    /* A run driven by a real prompt supplies only `input_ids` -- there is no
+     * golden tower output for an arbitrary caption, and generating one would
+     * need the 12B model at F32. Phases 2 and 3 compare against a fixture, so
+     * they are skipped in that case and the note says so; phase 4 is the part
+     * that produces conditioning, and it is the same code either way. */
+    const int anchored = h3_weight_find(anchor, "hidden_0", NULL) != NULL;
+    if (!anchored)
+        printf("\nthe anchor carries only input_ids, so this is a prompt run: "
+               "phase 3's comparisons are skipped and phase 4 runs unchanged\n");
+
+    /* Shared with phase 4, which reassigns `hidden` and reuses the scratch. */
+    const size_t state = (size_t)tokens * HIDDEN;
+    h3_gpu_tensor *hidden = NULL;
+    scratch space;
+    scratch_create(&space, tokens);
+
+    if (anchored) {
     printf("\nThe first %d layers against Gemma4Unified on the same weights, "
            "%u tokens:\n", ANCHOR_LAYERS, tokens);
-    const size_t state = (size_t)tokens * HIDDEN;
     float *actual = malloc(state * sizeof(*actual));
     require(actual != NULL, "cannot allocate the readback");
 
-    h3_gpu_tensor *hidden = embed(ids, tokens);
+    hidden = embed(ids, tokens);
     read_bf16_as_f32(hidden, actual, state);
     compare_state("scaled embeddings", "hidden_0", actual, state, 3e-3);
     /* And directly against the BF16 reference, which is the only thing that
@@ -916,8 +935,6 @@ int main(int argc, char **argv) {
         free(rounded);
     }
 
-    scratch space;
-    scratch_create(&space, tokens);
     for (int index = 0; index < ANCHOR_LAYERS; index++) {
         layer_weights weights;
         load_layer(index, &weights);
@@ -958,6 +975,9 @@ int main(int argc, char **argv) {
     }
 
     h3_gpu_tensor_free(hidden);
+    free(actual);
+
+    }
 
     /* --------------------------------------------- 4: the whole conditioning */
 
@@ -1037,7 +1057,6 @@ int main(int argc, char **argv) {
     }
 
     scratch_free(&space);
-    free(actual);
     free(ids);
     h3_gpu_free(gpu);
     h3_weight_store_free(store);
