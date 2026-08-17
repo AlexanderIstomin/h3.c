@@ -58,15 +58,24 @@ typedef struct {
 
 /* One projection per distinct shape family across both checkpoints. Each LTX
  * block repeats the first four widths over its eight attentions and two
- * feed-forwards; the Gemma tower repeats the rest over its 48 layers. */
+ * feed-forwards; the Gemma tower repeats the rest over its 48 layers.
+ *
+ * The DiT names carry their full path, which is what the released file uses.
+ * They were written bare here first, against a block-0 extract that had the
+ * prefix stripped, and matched nothing when the real checkpoint arrived. The
+ * text encoder's names needed no change: its file already ships them whole. */
 static const ltx_projection PROJECTIONS[] = {
-    {"attn1.to_q.weight", VIDEO_HIDDEN, VIDEO_HIDDEN,
+    {"model.diffusion_model.transformer_blocks.0.attn1.to_q.weight",
+     VIDEO_HIDDEN, VIDEO_HIDDEN,
      "DiT video self-attention query"},
-    {"audio_to_video_attn.to_q.weight", AUDIO_HIDDEN, VIDEO_HIDDEN,
+    {"model.diffusion_model.transformer_blocks.0.audio_to_video_attn.to_q.weight",
+     AUDIO_HIDDEN, VIDEO_HIDDEN,
      "DiT cross-modal query, video rows into audio width"},
-    {"audio_ff.net.2.weight", AUDIO_HIDDEN, AUDIO_FFN,
+    {"model.diffusion_model.transformer_blocks.0.audio_ff.net.2.weight",
+     AUDIO_HIDDEN, AUDIO_FFN,
      "DiT audio feed-forward down"},
-    {"ff.net.0.proj.weight", VIDEO_FFN, VIDEO_HIDDEN,
+    {"model.diffusion_model.transformer_blocks.0.ff.net.0.proj.weight",
+     VIDEO_FFN, VIDEO_HIDDEN,
      "DiT video feed-forward up"},
     {"model.layers.0.self_attn.q_proj.weight", TEXT_QUERY, TEXT_HIDDEN,
      "Gemma GQA query, 16 heads of 256"},
