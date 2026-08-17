@@ -25,6 +25,12 @@ typedef struct {
 @property(nonatomic, strong) NSArray<NSString *> *addedAlternatives;
 @property(nonatomic, strong) NSMutableDictionary<NSString *, NSArray<NSNumber *> *> *bpeCache;
 @property(nonatomic, strong) NSArray<NSString *> *byteEncoder;
+/* Two tokenizer families are supported. Qwen3-VL is byte-level BPE: bytes are
+ * remapped into printable codepoints and every symbol resolves in the vocab.
+ * Gemma 4 is SentencePiece-style: spaces become U+2581, BPE runs over literal
+ * codepoints, and any symbol the vocab lacks decomposes into <0xNN> tokens. */
+@property(nonatomic) BOOL metaspace;
+@property(nonatomic, strong) NSDictionary<NSNumber *, NSNumber *> *byteFallback;
 @end
 @implementation H3Tokenizer
 @end
@@ -198,19 +204,60 @@ static NSString *h3_pair_key(NSString *left, NSString *right) {
     return [NSString stringWithFormat:@"%@\uffff%@", left, right];
 }
 
+/* Resolve one BPE symbol that the vocabulary does not contain by emitting a
+ * <0xNN> token per UTF-8 byte, which is what byte_fallback means. */
+static int h3_append_byte_fallback(H3Tokenizer *tokenizer, NSString *symbol,
+                                   NSMutableArray<NSNumber *> *ids,
+                                   NSString **failure) {
+    NSData *utf8 = [symbol dataUsingEncoding:NSUTF8StringEncoding];
+    const unsigned char *bytes = utf8.bytes;
+    for (NSUInteger index = 0; index < utf8.length; index++) {
+        NSNumber *token_id = tokenizer.byteFallback[@(bytes[index])];
+        if (!token_id) {
+            if (failure) *failure = [NSString stringWithFormat:
+                @"no byte-fallback token for 0x%02X in symbol: %@",
+                bytes[index], symbol];
+            return 0;
+        }
+        [ids addObject:token_id];
+    }
+    return 1;
+}
+
 static NSArray<NSNumber *> *h3_bpe(H3Tokenizer *tokenizer, NSString *piece,
                                    NSString **failure) {
+    NSString *encoded;
+    NSMutableArray<NSString *> *symbols = [NSMutableArray array];
+    if (tokenizer.metaspace) {
+        /* Symbols are whole codepoints, so astral characters stay intact
+         * instead of splitting into surrogate halves. */
+        encoded = piece;
+        NSArray<NSNumber *> *cached_metaspace = tokenizer.bpeCache[encoded];
+        if (cached_metaspace) return cached_metaspace;
+        size_t count = 0;
+        H3Codepoint *points = h3_codepoints(piece, &count);
+        if (!points) {
+            if (failure) *failure = @"out of memory splitting tokenizer input";
+            return nil;
+        }
+        for (size_t index = 0; index < count; index++) {
+            [symbols addObject:[piece substringWithRange:
+                NSMakeRange(points[index].location, points[index].length)]];
+        }
+        free(points);
+    } else {
     NSData *utf8 = [piece dataUsingEncoding:NSUTF8StringEncoding];
     const unsigned char *bytes = utf8.bytes;
-    NSMutableString *encoded = [NSMutableString string];
+    NSMutableString *remapped = [NSMutableString string];
     for (NSUInteger index = 0; index < utf8.length; index++) {
-        [encoded appendString:tokenizer.byteEncoder[bytes[index]]];
+        [remapped appendString:tokenizer.byteEncoder[bytes[index]]];
     }
+    encoded = remapped;
     NSArray<NSNumber *> *cached = tokenizer.bpeCache[encoded];
     if (cached) return cached;
-    NSMutableArray<NSString *> *symbols = [NSMutableArray array];
     for (NSUInteger index = 0; index < encoded.length; index++) {
         [symbols addObject:[encoded substringWithRange:NSMakeRange(index, 1)]];
+    }
     }
     while (symbols.count > 1) {
         NSNumber *best_rank = nil;
@@ -243,6 +290,11 @@ static NSArray<NSNumber *> *h3_bpe(H3Tokenizer *tokenizer, NSString *piece,
     for (NSString *symbol in symbols) {
         NSNumber *token_id = tokenizer.vocab[symbol];
         if (!token_id) {
+            if (tokenizer.metaspace) {
+                if (!h3_append_byte_fallback(tokenizer, symbol, ids, failure))
+                    return nil;
+                continue;
+            }
             if (failure) *failure = [NSString stringWithFormat:
                 @"BPE symbol is absent from vocabulary: %@", symbol];
             return nil;
@@ -257,6 +309,18 @@ static NSArray<NSNumber *> *h3_bpe(H3Tokenizer *tokenizer, NSString *piece,
 static int h3_encode_plain(H3Tokenizer *tokenizer, NSString *text,
                            NSMutableArray<NSNumber *> *output,
                            NSString **failure) {
+    if (tokenizer.metaspace) {
+        /* The Replace normalizer turns every space into U+2581 before the
+         * Split pre-tokenizer runs, so the pre-tokenizer never finds a space
+         * to split on and BPE sees the whole span as one piece. */
+        NSString *normalized = [text
+            stringByReplacingOccurrencesOfString:@" " withString:@"▁"];
+        if (!normalized.length) return 1;
+        NSArray<NSNumber *> *ids = h3_bpe(tokenizer, normalized, failure);
+        if (!ids) return 0;
+        [output addObjectsFromArray:ids];
+        return 1;
+    }
     NSArray<NSString *> *pieces = h3_pretokenize(text);
     if (!pieces) {
         if (failure) *failure = @"unable to pre-tokenize input";
@@ -314,14 +378,29 @@ h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
         NSDictionary *model = config[@"model"];
         NSDictionary *normalizer = config[@"normalizer"];
         if (![model[@"type"] isEqual:@"BPE"] ||
-            model[@"unk_token"] != NSNull.null ||
-            ![normalizer[@"type"] isEqual:@"NFC"] ||
             ![model[@"vocab"] isKindOfClass:NSDictionary.class] ||
             ![model[@"merges"] isKindOfClass:NSArray.class]) {
             h3_tok_error(error, error_size, @"unexpected tokenizer specification");
             return NULL;
         }
+        /* Qwen3-VL: byte-level BPE behind an NFC normalizer, every symbol in
+         * the vocabulary. Gemma 4: spaces rewritten to U+2581 with byte
+         * fallback for the rest. Anything else is not a tokenizer this
+         * implements, and guessing would silently mis-encode prompts. */
+        BOOL byte_level = [normalizer[@"type"] isEqual:@"NFC"] &&
+                          model[@"unk_token"] == NSNull.null;
+        NSDictionary *pattern = normalizer[@"pattern"];
+        BOOL metaspace = [normalizer[@"type"] isEqual:@"Replace"] &&
+                         [pattern[@"String"] isEqual:@" "] &&
+                         [normalizer[@"content"] isEqual:@"▁"] &&
+                         [model[@"byte_fallback"] boolValue];
+        if (byte_level == metaspace) {
+            h3_tok_error(error, error_size,
+                         @"unsupported tokenizer normalizer or fallback policy");
+            return NULL;
+        }
         H3Tokenizer *tokenizer = [[H3Tokenizer alloc] init];
+        tokenizer.metaspace = metaspace;
         tokenizer.vocab = model[@"vocab"];
         NSUInteger maximum_id = 0;
         for (NSNumber *number in tokenizer.vocab.allValues) {
@@ -403,6 +482,26 @@ h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
         }
         tokenizer.byteEncoder = byte_encoder;
         memcpy(tokenizer->byteDecoder, decoder, sizeof(decoder));
+
+        if (metaspace) {
+            /* Byte fallback is spelled as 256 literal <0xNN> vocabulary
+             * entries. Index them once so encode and decode can both map
+             * between a raw byte and its token. */
+            NSMutableDictionary<NSNumber *, NSNumber *> *fallback =
+                [NSMutableDictionary dictionaryWithCapacity:256];
+            for (unsigned byte = 0; byte < 256; byte++) {
+                NSString *name = [NSString stringWithFormat:@"<0x%02X>", byte];
+                NSNumber *token_id = tokenizer.vocab[name];
+                if (token_id) fallback[@(byte)] = token_id;
+            }
+            if (fallback.count != 256) {
+                h3_tok_error(error, error_size,
+                             @"tokenizer declares byte fallback without all "
+                             @"256 <0xNN> tokens");
+                return NULL;
+            }
+            tokenizer.byteFallback = fallback;
+        }
         return (__bridge_retained h3_tokenizer *)tokenizer;
     }
 }
@@ -501,6 +600,24 @@ char *h3_tokenizer_decode(const h3_tokenizer *opaque,
             if (symbol == NSNull.null) {
                 h3_tok_error(error, error_size, @"unknown token ID");
                 return NULL;
+            }
+            if (tokenizer.metaspace) {
+                /* Sequence[Replace U+2581 -> space, ByteFallback, Fuse]:
+                 * <0xNN> tokens accumulate as raw bytes so a multi-byte
+                 * character spanning several tokens reassembles, and every
+                 * other token is literal text. */
+                unsigned byte = 0;
+                if ([symbol length] == 6 &&
+                    [symbol hasPrefix:@"<0x"] && [symbol hasSuffix:@">"] &&
+                    sscanf([symbol UTF8String], "<0x%02X>", &byte) == 1) {
+                    unsigned char value = (unsigned char)byte;
+                    [bytes appendBytes:&value length:1];
+                    continue;
+                }
+                flush();
+                [result appendString:[symbol
+                    stringByReplacingOccurrencesOfString:@"▁" withString:@" "]];
+                continue;
             }
             for (NSUInteger offset = 0; offset < [symbol length]; offset++) {
                 unichar codepoint = [symbol characterAtIndex:offset];
