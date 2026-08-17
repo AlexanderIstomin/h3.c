@@ -4,15 +4,27 @@
  * smallest shape that exercises every stage, since the stack compresses 8x in
  * time (8*(k-1)+1 frames) and 32x in space.
  *
- * **The reference this is anchored against is patched.** The public
- * `CausalVideoAutoencoder` builds `compress_time` and `compress_space` without
- * passing their `multiplier` through, and LTX-2.5 was trained with all three
- * compress blocks honouring it; the names and the tensor count match either
- * way, so `load_state_dict(strict=False)` says nothing and only 45 of 84
- * shapes disagree. Two things say the patch is right, and the second is the
- * one that matters: all 84 shapes reconcile *and* the patched pair encodes and
- * decodes a structured image at 30.8 dB. Shapes agreeing only proves the parts
- * fit; a round trip proves they are wired in the right order.
+ * Anchored against `ltx_core`, the package that ships with the model -- the
+ * same one the DiT and the text tower use. An earlier version of this test
+ * used `ltx_video`'s `CausalVideoAutoencoder` with a hand-written patch,
+ * because that looked like the only implementation available. It was not, and
+ * the reference that came with the model needs no patch at all.
+ *
+ * That mattered, because the two disagree about something the patch could not
+ * have supplied. **The latent the DiT works in is normalized, and the VAE is
+ * what maps in and out of that space**: the encoder ends with
+ * `(x - mean) / std` and the decoder *begins* with `x * std + mean`, from the
+ * per-channel statistics stored beside the weights. `ltx_video` has neither.
+ * The scales are not small -- std spans 0.074 to 0.914 and mean -0.55 to
+ * +0.43 -- so a decoder without them is wrong by up to 13x per channel plus
+ * an offset, and would turn any real DiT latent into noise.
+ *
+ * **A round trip cannot catch that, and this file used to rely on one.** Both
+ * omissions sit at opposite ends and are exact inverses, so encode-then-decode
+ * closes at precisely the right 30.80 dB with both steps missing. Forcing the
+ * statistics to an identity leaves every stage comparison here off by 3x to
+ * 12x of peak while the round-trip line still reports 30.80 dB. A round trip
+ * validates the composition; only the boundary tensors validate the boundary.
  *
  * The two halves are here together because their conventions only make sense
  * side by side -- they are mirror images that disagree in three places:
@@ -129,6 +141,13 @@ static h3_weight_store *store = NULL;
 static h3_weight_store *anchor = NULL;
 static h3_gpu *gpu = NULL;
 static h3_gpu_tensor *ones = NULL;
+/* Per-channel latent statistics. The DiT works in the *normalized* latent
+ * space and the VAE is what maps in and out of it: the encoder ends with
+ * `(x - mean) / std` and the decoder begins with `x * std + mean`. Neither is
+ * cosmetic -- std spans 0.074 to 0.914 and mean -0.55 to +0.43, so a decoder
+ * without them is wrong by up to 13x per channel plus an offset. */
+static float *latent_mean = NULL;
+static float *latent_std = NULL;
 
 static void fail(const char *format, ...)
     __attribute__((format(printf, 1, 2), noreturn));
@@ -672,7 +691,7 @@ static h3_gpu_tensor *downsample(int block, const vae_block *plan,
 /* Image in [C][D][H][W] to moments in [D][H][W][C]. `check` compares every
  * stage; the second pass through skips that so the end-to-end round trip does
  * not report the same numbers twice. */
-static h3_gpu_tensor *encode(const float *image, shape *of, int check_stages) {
+static float *encode(const float *image, shape *of, int check_stages) {
     shape packed = {IMAGE_FRAMES, IMAGE_SIZE / PATCH, IMAGE_SIZE / PATCH,
                     PACKED_CHANNELS};
     float *staged = malloc(volume(packed) * sizeof(*staged));
@@ -729,14 +748,53 @@ static h3_gpu_tensor *encode(const float *image, shape *of, int check_stages) {
     h3_gpu_tensor_free(normed);
     at.channels = MOMENT_CHANNELS;
     if (check_stages) check("enc_conv_out", moments, at);
-    *of = at;
-    return moments;
+
+    /* The leading 128 of the 129 channels are the means; the last is a shared
+     * log variance the deterministic path never reads. Normalizing them is
+     * what produces a latent in the space the DiT works in -- and it is
+     * invisible to a round trip, because the decoder's inverse step cancels
+     * it exactly. Only this comparison catches it. */
+    shape latent = {at.depth, at.height, at.width, LATENT_CHANNELS};
+    float *host = download(moments, volume(at));
+    h3_gpu_tensor_free(moments);
+    float *normalized = malloc(volume(latent) * sizeof(*normalized));
+    require(normalized != NULL, "cannot allocate the normalized latent");
+    for (size_t position = 0; position < positions(latent); position++)
+        for (uint32_t channel = 0; channel < LATENT_CHANNELS; channel++)
+            normalized[position * LATENT_CHANNELS + channel] =
+                (host[position * MOMENT_CHANNELS + channel] -
+                 latent_mean[channel]) / latent_std[channel];
+    free(host);
+    if (check_stages) {
+        float *want = golden("enc_normalized", volume(latent));
+        compare("enc_normalized", normalized, want, latent,
+                tolerance_for("enc_normalized"));
+        free(want);
+    }
+    *of = latent;
+    return normalized;
 }
 
 /* Latent in [D][H][W][C] to frames in [C][D][H][W]. Takes ownership of its
  * input. */
-static float *decode(h3_gpu_tensor *x, shape at, int check_stages,
+static float *decode(const float *latent, shape at, int check_stages,
                      shape *image_shape) {
+    /* The inverse of the encoder's last step, and the decoder's first. */
+    float *denormalized = malloc(volume(at) * sizeof(*denormalized));
+    require(denormalized != NULL, "cannot allocate the denormalized latent");
+    for (size_t position = 0; position < positions(at); position++)
+        for (uint32_t channel = 0; channel < LATENT_CHANNELS; channel++)
+            denormalized[position * LATENT_CHANNELS + channel] =
+                latent[position * LATENT_CHANNELS + channel] *
+                latent_std[channel] + latent_mean[channel];
+    if (check_stages) {
+        float *want = golden("dec_denormalized", volume(at));
+        compare("dec_denormalized", denormalized, want, at,
+                tolerance_for("dec_denormalized"));
+        free(want);
+    }
+    h3_gpu_tensor *x = upload(denormalized, volume(at));
+    free(denormalized);
     {
         conv3d kernel;
         load_conv("decoder", "conv_in", WIDEST_CHANNELS, at.channels, &kernel);
@@ -847,6 +905,9 @@ int main(int argc, char **argv) {
     ones = upload(ones_host, WIDEST_CHANNELS);
     free(ones_host);
 
+    latent_mean = golden("mean_of_means", LATENT_CHANNELS);
+    latent_std = golden("std_of_means", LATENT_CHANNELS);
+
     shape image_shape = {IMAGE_FRAMES, IMAGE_SIZE, IMAGE_SIZE, IMAGE_CHANNELS};
     float *image = golden("image", volume(image_shape));
 
@@ -856,25 +917,10 @@ int main(int argc, char **argv) {
            IMAGE_FRAMES, IMAGE_SIZE, IMAGE_SIZE, LATENT_CHANNELS,
            LATENT_FRAMES, LATENT_HEIGHT, LATENT_WIDTH);
     const double began = now();
-    shape moment_shape;
-    h3_gpu_tensor *moments = encode(image, &moment_shape, 1);
+    shape latent_shape;
+    float *engine_latent = encode(image, &latent_shape, 1);
     const double encoded = now();
 
-    /* The mean is the leading 128 of the 129 channels; the trailing one is the
-     * uniform log variance, which a deterministic decode never reads. */
-    shape latent_shape = {moment_shape.depth, moment_shape.height,
-                          moment_shape.width, LATENT_CHANNELS};
-    float *engine_latent = malloc(volume(latent_shape) * sizeof(*engine_latent));
-    require(engine_latent != NULL, "cannot allocate the engine's latent");
-    {
-        float *host = download(moments, volume(moment_shape));
-        for (size_t position = 0; position < positions(moment_shape); position++)
-            memcpy(engine_latent + position * LATENT_CHANNELS,
-                   host + position * MOMENT_CHANNELS,
-                   LATENT_CHANNELS * sizeof(float));
-        free(host);
-        h3_gpu_tensor_free(moments);
-    }
     require(latent_shape.depth == LATENT_FRAMES &&
             latent_shape.height == LATENT_HEIGHT &&
             latent_shape.width == LATENT_WIDTH,
@@ -892,8 +938,7 @@ int main(int argc, char **argv) {
         for (uint32_t channel = 0; channel < LATENT_CHANNELS; channel++)
             staged[position * LATENT_CHANNELS + channel] =
                 want_latent[(size_t)channel * positions(latent_shape) + position];
-    float *frames = decode(upload(staged, volume(latent_shape)), latent_shape,
-                           1, &decoded_shape);
+    float *frames = decode(staged, latent_shape, 1, &decoded_shape);
     free(staged); free(want_latent);
     const double decoded = now();
 
@@ -927,8 +972,7 @@ int main(int argc, char **argv) {
      * number that says the two halves are inverses of each other rather than
      * separately close to something. */
     shape round_shape;
-    float *restored = decode(upload(engine_latent, volume(latent_shape)),
-                             latent_shape, 0, &round_shape);
+    float *restored = decode(engine_latent, latent_shape, 0, &round_shape);
     double square_error = 0.0;
     for (size_t index = 0; index < volume(round_shape); index++) {
         const double delta = (double)restored[index] - (double)image[index];
@@ -946,6 +990,7 @@ int main(int argc, char **argv) {
         failures++;
     }
     free(restored); free(engine_latent); free(image);
+    free(latent_mean); free(latent_std);
 
     printf("\nencode %.2f s, decode %.2f s, round trip %.2f s total\n",
            encoded - began, decoded - encoded, now() - began);
