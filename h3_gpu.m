@@ -281,6 +281,10 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         @"h3_scale_add_f32", @"h3_layer_norm_f32",
         @"h3_video_qkv_rope_f32",
         @"h3_adaln_f32", @"h3_gate_f32", @"h3_qkv_rope_f32",
+        @"h3_zimage_modulation_f32", @"h3_zimage_modulation_bf16",
+        @"h3_linear_i8_weight_bf16_simd_wide",
+        @"h3_linear_i8_weight_bf16_simd_square",
+        @"h3_linear_i8_weight_bf16_simd_deep",
         @"h3_swiglu_f32", @"h3_linear_bf16", @"h3_convrot_bf16",
         @"h3_linear_i8_weight_bf16", @"h3_silu_bf16",
         @"h3_convrot_f32", @"h3_linear_i8_weight_f32",
@@ -1283,6 +1287,7 @@ typedef struct {
     float epsilon;
 } adaln_args;
 typedef struct { uint32_t rows, width, slots, gate_slot; } gate_args;
+typedef struct { uint32_t width; } zimage_modulation_args;
 typedef struct {
     uint32_t sequence, heads, head_dim, rope_half, grouped;
     float epsilon;
@@ -1303,6 +1308,7 @@ typedef struct {
 typedef struct {
     uint32_t batch, depth, height, width, channels, groups;
     float epsilon;
+    uint32_t activate;
 } vae_encoder_norm_args;
 typedef struct { uint32_t rows, width; } swiglu_args;
 typedef struct { uint32_t elements, approximate; } gelu_bf16_args;
@@ -1742,6 +1748,40 @@ int h3_gpu_gate_f32(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(row_map).buffer offset:0 atIndex:3];
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
             [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        });
+}
+
+int h3_gpu_zimage_modulation_f32(h3_gpu *opaque, h3_gpu_tensor *modulation,
+                                 const h3_gpu_tensor *linear, uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    /* Four blocks in, five slots out: the extra one is the shift Z-Image
+     * does not have, held at zero so h3_adaln_f32 can read it anyway. */
+    if (!h3_gpu_require_elements(gpu, linear, (size_t)width * 4,
+                                 @"zimage modulation input") ||
+        !h3_gpu_require_elements(gpu, modulation, (size_t)width * 5,
+                                 @"zimage modulation output")) return 0;
+    zimage_modulation_args args = {width};
+    return h3_gpu_dispatch_1d(gpu, @"h3_zimage_modulation_f32", width,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(linear).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(modulation).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
+        });
+}
+
+int h3_gpu_zimage_modulation_bf16(h3_gpu *opaque, h3_gpu_tensor *modulation,
+                                  const h3_gpu_tensor *linear, uint32_t width) {
+    H3GPU *gpu = GPU(opaque);
+    if (!h3_gpu_require_elements(gpu, linear, (size_t)width * 4,
+                                 @"zimage modulation input") ||
+        !h3_gpu_require_elements(gpu, modulation, (size_t)width * 5,
+                                 @"zimage modulation output")) return 0;
+    zimage_modulation_args args = {width};
+    return h3_gpu_dispatch_1d(gpu, @"h3_zimage_modulation_bf16", width,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(linear).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(modulation).buffer offset:0 atIndex:1];
+            [encoder setBytes:&args length:sizeof(args) atIndex:2];
         });
 }
 
@@ -2741,6 +2781,19 @@ int h3_gpu_vae_encoder_pad_f32(
         });
 }
 
+int h3_gpu_vae_group_norm_f32(h3_gpu *opaque, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *input,
+                              const h3_gpu_tensor *weight,
+                              const h3_gpu_tensor *bias, uint32_t batch,
+                              uint32_t depth, uint32_t height, uint32_t width,
+                              uint32_t channels, uint32_t groups,
+                              float epsilon) {
+    return h3_gpu_vae_group_norm_activated_f32(opaque, output, input, weight,
+                                               bias, batch, depth, height,
+                                               width, channels, groups,
+                                               epsilon, 0);
+}
+
 int h3_gpu_vae_encoder_group_norm_silu_f32(
                       h3_gpu *opaque, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
@@ -2748,6 +2801,20 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
                       const h3_gpu_tensor *bias, uint32_t batch,
                       uint32_t depth, uint32_t height, uint32_t width,
                       uint32_t channels, uint32_t groups, float epsilon) {
+    return h3_gpu_vae_group_norm_activated_f32(opaque, output, input, weight,
+                                               bias, batch, depth, height,
+                                               width, channels, groups,
+                                               epsilon, 1);
+}
+
+int h3_gpu_vae_group_norm_activated_f32(
+                      h3_gpu *opaque, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t channels, uint32_t groups, float epsilon,
+                      uint32_t activate) {
     H3GPU *gpu = GPU(opaque);
     size_t count = (size_t)batch * depth * height * width * channels;
     if (!batch || !depth || !height || !width || !channels || !groups ||
@@ -2765,7 +2832,7 @@ int h3_gpu_vae_encoder_group_norm_silu_f32(
                                  @"VAE encoder norm output") ||
         TENSOR(output).dtype != H3_GPU_F32) return 0;
     vae_encoder_norm_args args = {
-        batch, depth, height, width, channels, groups, epsilon
+        batch, depth, height, width, channels, groups, epsilon, activate
     };
     uint64_t rows = (uint64_t)batch * depth * groups;
     if (rows > UINT32_MAX) return 0;
@@ -3173,6 +3240,125 @@ int h3_gpu_linear_i8_weight_f32(h3_gpu *opaque, h3_gpu_tensor *output,
     gpu.stats = stats;
     return 1;
 }
+/* Same product as h3_gpu_linear_i8_weight_bf16, but each simdgroup holds
+ * eight accumulators against one loaded weight fragment. On a skinny GEMM the
+ * weight is the traffic and the narrow tile re-reads it `rows / 8` times, so
+ * this is worth taking whenever there are enough rows to fill the taller
+ * tile. Kept separate rather than folded into the existing entry point so the
+ * video and speech paths keep the geometry they were tuned against. */
+/* The square tile. Traffic for a BMxBN tile is (M/BM)*N*K weight bytes plus
+ * (N/BN)*M*K*2 input bytes; the tall 64x8 tile minimises the first and pays
+ * for it in the second, and squaring balances them. */
+int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *opaque, h3_gpu_tensor *output,
+                                        const h3_gpu_tensor *input,
+                                        const h3_gpu_tensor *weight,
+                                        const h3_gpu_tensor *weight_scales,
+                                        const h3_gpu_tensor *bias, uint32_t rows,
+                                        uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !input_dim || !output_dim ||
+        ![gpu.device supportsFamily:MTLGPUFamilyApple7])
+        return h3_gpu_linear_i8_weight_bf16(opaque, output, input, weight,
+                                            weight_scales, bias, rows,
+                                            input_dim, output_dim);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"square int8-weight linear input") ||
+        !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
+                           @"square int8-weight linear weight") ||
+        !h3_gpu_require_f32(gpu, weight_scales, output_dim,
+                            @"square int8-weight linear scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"square int8-weight linear output") ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
+                                      @"square int8-weight linear bias")) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    /* 32x64 everywhere except deep-K shapes, where the narrower 32x32 tile
+     * measures about a quarter faster — the DiT's w2 is the only one, at
+     * K = 10240 against everyone else's 3840. */
+    const int deep = input_dim > 8192;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, deep ? @"h3_linear_i8_weight_bf16_simd_deep"
+                  : @"h3_linear_i8_weight_bf16_simd_square");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32u) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch the square int8 linear");
+        return 0;
+    }
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        const NSUInteger span = deep ? 32u : 64u;
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + span - 1) / span,
+                                                  (rows + 31) / 32, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_linear_i8_weight_bf16_wide(h3_gpu *opaque, h3_gpu_tensor *output,
+                                      const h3_gpu_tensor *input,
+                                      const h3_gpu_tensor *weight,
+                                      const h3_gpu_tensor *weight_scales,
+                                      const h3_gpu_tensor *bias, uint32_t rows,
+                                      uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !input_dim || !output_dim ||
+        ![gpu.device supportsFamily:MTLGPUFamilyApple7])
+        return h3_gpu_linear_i8_weight_bf16(opaque, output, input, weight,
+                                            weight_scales, bias, rows,
+                                            input_dim, output_dim);
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"wide int8-weight linear input") ||
+        !h3_gpu_require_i8(gpu, weight, (size_t)output_dim * input_dim,
+                           @"wide int8-weight linear weight") ||
+        !h3_gpu_require_f32(gpu, weight_scales, output_dim,
+                            @"wide int8-weight linear scales") ||
+        !h3_gpu_require_bf16(gpu, output, (size_t)rows * output_dim,
+                             @"wide int8-weight linear output") ||
+        (bias && !h3_gpu_require_bf16(gpu, bias, output_dim,
+                                      @"wide int8-weight linear bias")) ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_i8_weight_bf16_simd_wide");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32u) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch the wide int8 linear");
+        return 0;
+    }
+    linear_args args = {rows, input_dim, output_dim, bias ? 1u : 0u};
+    const h3_gpu_tensor *bias_buffer = bias ? bias : input;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(weight_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(bias_buffer).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:4];
+        [encoder setBytes:&args length:sizeof(args) atIndex:5];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim + 7) / 8,
+                                                  (rows + 63) / 64, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_linear_i8_weight_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                                  const h3_gpu_tensor *input,
                                  const h3_gpu_tensor *weight,
@@ -5019,7 +5205,7 @@ static int h3_gpu_gqa_causal_check(H3GPU *gpu, h3_gpu_tensor *output,
     size_t query_count = (size_t)sequence * query_heads * head_dim;
     size_t kv_count = keys * kv_heads * head_dim;
     return sequence && query_heads && kv_heads && head_dim &&
-        !(query_heads % kv_heads) && head_dim <= 128 &&
+        !(query_heads % kv_heads) &&
         h3_gpu_require_bf16(gpu, query, query_count, @"GQA query") &&
         h3_gpu_require_bf16(gpu, key, kv_count, @"GQA key") &&
         h3_gpu_require_bf16(gpu, value, kv_count, @"GQA value") &&
@@ -5126,9 +5312,17 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     H3GPU *gpu = GPU(opaque);
     if (!h3_gpu_gqa_causal_check(gpu, output, query, key, value, sequence, 0,
                                  query_heads, kv_heads, head_dim)) return 0;
-    if (getenv("H3_MPS_GQA") && h3_gpu_gqa_mps(
-            gpu, output, query, key, value, sequence, query_heads,
-            kv_heads, head_dim, scale)) return 1;
+    /* The cooperative kernel keeps one query row in a 128-float threadgroup
+     * array, which covers every H3 shape but not Gemma 4's text tower, whose
+     * sliding layers are 256 wide and its global layers 512. Those route to
+     * the shape-generic MPSGraph graph, which supports kv_heads natively. */
+    if (head_dim > 128 || getenv("H3_MPS_GQA")) {
+        if (h3_gpu_gqa_mps(gpu, output, query, key, value, sequence,
+                           query_heads, kv_heads, head_dim, scale)) return 1;
+        /* The cooperative kernel stages a query row in a 128-float threadgroup
+         * array, so wider heads have nowhere to go and must not fall back. */
+        if (head_dim > 128) return 0;
+    }
     return h3_gpu_gqa_causal_dispatch(gpu, output, query, key, value, sequence,
                                       0, query_heads, kv_heads, head_dim,
                                       scale);
@@ -5144,6 +5338,12 @@ int h3_gpu_gqa_causal_cache_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     H3GPU *gpu = GPU(opaque);
     if (!h3_gpu_gqa_causal_check(gpu, output, query, key, value, sequence, past,
                                  query_heads, kv_heads, head_dim)) return 0;
+    /* The MPSGraph graph has no cached form, so the continued path can only
+     * refuse what the cooperative kernel cannot compute correctly. */
+    if (head_dim > 128) {
+        h3_gpu_set_error(gpu, @"cached causal GQA needs head_dim <= 128");
+        return 0;
+    }
     return h3_gpu_gqa_causal_dispatch(gpu, output, query, key, value, sequence,
                                       past, query_heads, kv_heads, head_dim,
                                       scale);

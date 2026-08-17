@@ -189,6 +189,15 @@ int h3_gpu_gate_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *modulation,
                     const h3_gpu_tensor *row_map, uint32_t rows,
                     uint32_t width, uint32_t slots, uint32_t gate_slot);
+/* Reshapes Z-Image's four adaLN blocks into the five-slot table
+ * h3_gpu_adaln_f32 and h3_gpu_gate_f32 read: a zero shift slot, the two
+ * scales untouched, and the two gates through tanh. */
+int h3_gpu_zimage_modulation_f32(h3_gpu *gpu, h3_gpu_tensor *modulation,
+                                 const h3_gpu_tensor *linear,
+                                 uint32_t width);
+int h3_gpu_zimage_modulation_bf16(h3_gpu *gpu, h3_gpu_tensor *modulation,
+                                  const h3_gpu_tensor *linear,
+                                  uint32_t width);
 int h3_gpu_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                         h3_gpu_tensor *key, h3_gpu_tensor *value,
                         const h3_gpu_tensor *qkv,
@@ -345,6 +354,23 @@ int h3_gpu_relu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_nearest2x_nhwc_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                               const h3_gpu_tensor *input, uint32_t height,
                               uint32_t width, uint32_t channels);
+/* GroupNorm without an activation, for the decoder's attention block; the
+ * resnets want the SiLU-fused form below. */
+int h3_gpu_vae_group_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                              const h3_gpu_tensor *input,
+                              const h3_gpu_tensor *weight,
+                              const h3_gpu_tensor *bias, uint32_t batch,
+                              uint32_t depth, uint32_t height, uint32_t width,
+                              uint32_t channels, uint32_t groups,
+                              float epsilon);
+int h3_gpu_vae_group_norm_activated_f32(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input,
+                      const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t batch,
+                      uint32_t depth, uint32_t height, uint32_t width,
+                      uint32_t channels, uint32_t groups, float epsilon,
+                      uint32_t activate);
 int h3_gpu_vae_encoder_group_norm_silu_f32(
                       h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
@@ -377,6 +403,23 @@ int h3_gpu_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                        uint32_t input_dim, uint32_t output_dim);
 /* Portable weight-only int8 path for pre-M5 Apple GPUs. Activations and
  * outputs remain BF16; weights use one F32 scale per output channel. */
+/* A taller row tile for skinny GEMMs: eight accumulators share one loaded
+ * weight fragment, so the weight crosses the bus `rows / 64` times instead of
+ * `rows / 8`. Falls back to the 8x8 path on devices without simdgroup
+ * matrices. */
+int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *gpu, h3_gpu_tensor *output,
+                                        const h3_gpu_tensor *input,
+                                        const h3_gpu_tensor *weight,
+                                        const h3_gpu_tensor *weight_scales,
+                                        const h3_gpu_tensor *bias,
+                                        uint32_t rows, uint32_t input_dim,
+                                        uint32_t output_dim);
+int h3_gpu_linear_i8_weight_bf16_wide(h3_gpu *gpu, h3_gpu_tensor *output,
+                                      const h3_gpu_tensor *input,
+                                      const h3_gpu_tensor *weight,
+                                      const h3_gpu_tensor *weight_scales,
+                                      const h3_gpu_tensor *bias, uint32_t rows,
+                                      uint32_t input_dim, uint32_t output_dim);
 int h3_gpu_linear_i8_weight_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                                  const h3_gpu_tensor *input,
                                  const h3_gpu_tensor *weight,

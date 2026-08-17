@@ -409,6 +409,52 @@ kernel void h3_adaln_f32(device const float *input [[buffer(0)]],
     output[row * args.width + column] = normalized * (1.0f + scale) + shift;
 }
 
+struct zimage_modulation_args {
+    uint width;
+};
+
+/* Z-Image's per-block modulation, laid out for h3_adaln_f32 and h3_gate_f32
+ * to read directly.
+ *
+ * Its adaLN produces four contiguous blocks — scale_msa, gate_msa, scale_mlp,
+ * gate_mlp — while the two consumers want a [slots][width] table: adaln reads
+ * a shift slot and a scale slot, and Z-Image's pre-norm has no shift at all,
+ * so slot 0 is written zero and read as one. The scales pass through
+ * untouched because adaln already adds the 1; the gates pass through tanh,
+ * which is the single piece of the block no existing kernel supplies and the
+ * only reason this file gained a kernel for the port. */
+kernel void h3_zimage_modulation_f32(
+                            device const float *linear [[buffer(0)]],
+                            device float *modulation [[buffer(1)]],
+                            constant zimage_modulation_args &args [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    uint width = args.width;
+    if (gid >= width) return;
+    modulation[gid] = 0.0f;
+    modulation[width + gid] = linear[gid];
+    modulation[width * 2 + gid] = tanh(linear[width + gid]);
+    modulation[width * 3 + gid] = linear[width * 2 + gid];
+    modulation[width * 4 + gid] = tanh(linear[width * 3 + gid]);
+}
+
+/* The BF16 counterpart, for the path that carries BF16 activations. A BF16
+ * zero is a zero word, so the absent shift slot needs no conversion. */
+kernel void h3_zimage_modulation_bf16(
+                            device const ushort *linear [[buffer(0)]],
+                            device ushort *modulation [[buffer(1)]],
+                            constant zimage_modulation_args &args [[buffer(2)]],
+                            uint gid [[thread_position_in_grid]]) {
+    uint width = args.width;
+    if (gid >= width) return;
+    modulation[gid] = 0;
+    modulation[width + gid] = linear[gid];
+    modulation[width * 2 + gid] =
+        h3_f32_to_bf16(tanh(h3_bf16_to_f32(linear[width + gid])));
+    modulation[width * 3 + gid] = linear[width * 2 + gid];
+    modulation[width * 4 + gid] =
+        h3_f32_to_bf16(tanh(h3_bf16_to_f32(linear[width * 3 + gid])));
+}
+
 struct gate_args {
     uint rows;
     uint width;
@@ -571,6 +617,10 @@ struct vae_encoder_norm_args {
     uint channels;
     uint groups;
     float epsilon;
+    /* The VAE's resnets want GroupNorm followed by SiLU, but the attention
+     * block's norm carries no activation. One flag is cheaper than a second
+     * copy of a two-pass reduction. */
+    uint activate;
 };
 
 kernel void h3_vae_encoder_group_norm_silu_f32(
@@ -633,7 +683,7 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
             args.channels + channel;
         float value = (input[destination] - mean) * inverse * weight[channel] +
                       bias[channel];
-        output[destination] = value / (1.0f + exp(-value));
+        output[destination] = args.activate ? value / (1.0f + exp(-value)) : value;
     }
 }
 
@@ -1144,6 +1194,369 @@ kernel void h3_linear_i8_weight_bf16_simd(
         if (args.has_bias) value += h3_bf16_to_f32(bias[output_column + 1]);
         output[output_row * args.output_dim + output_column + 1] =
             h3_f32_to_bf16(value);
+    }
+}
+
+/* The same GEMM with a taller row tile, for skinny shapes where the weight is
+ * the whole traffic.
+ *
+ * The 8x8 variant above reads a Kx8 slice of the weight to produce only eight
+ * rows, so a matrix is re-read `rows / 8` times: at 320 tokens against a
+ * 3840x11520 projection that is forty passes over the weight and 1.77 G
+ * element reads where 44 M would do. Holding eight accumulators against one
+ * loaded weight fragment cuts that eightfold; the fragment is loaded once per
+ * k step and multiplied into sixty-four rows instead of eight.
+ *
+ * Registers stay modest — sixteen floats per lane of accumulator and two of
+ * weight — and the arithmetic is identical, so this is purely a question of
+ * how often the weight crosses the bus. */
+kernel void h3_linear_i8_weight_bf16_simd_wide(
+                           device const ushort *input [[buffer(0)]],
+                           device const char *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device const ushort *bias [[buffer(3)]],
+                           device ushort *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint TILE = 8;
+    constexpr uint TILES = 8;
+    uint row_start = group.y * (TILE * TILES);
+    uint column_start = group.x * TILE;
+    ushort quad = lane / 4;
+    uint fragment_row = (quad & 4) + ((lane / 2) % 4);
+    uint fragment_column = (quad & 2) * 2 + (lane % 2) * 2;
+    simdgroup_matrix<float, TILE, TILE> a;
+    simdgroup_matrix<float, TILE, TILE> b;
+    simdgroup_matrix<float, TILE, TILE> accumulator[TILES];
+#pragma clang loop unroll(full)
+    for (uint tile = 0; tile < TILES; tile++) {
+        accumulator[tile].thread_elements()[0] = 0.0f;
+        accumulator[tile].thread_elements()[1] = 0.0f;
+    }
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        uint weight_row = k + fragment_row;
+        uint weight_column = column_start + fragment_column;
+        b.thread_elements()[0] =
+            weight_row < args.input_dim && weight_column < args.output_dim ?
+            float(weight[weight_column * args.input_dim + weight_row]) : 0.0f;
+        b.thread_elements()[1] =
+            weight_row < args.input_dim && weight_column + 1 < args.output_dim ?
+            float(weight[(weight_column + 1) * args.input_dim + weight_row]) :
+            0.0f;
+        uint input_column = k + fragment_column;
+#pragma clang loop unroll(full)
+        for (uint tile = 0; tile < TILES; tile++) {
+            uint input_row = row_start + tile * TILE + fragment_row;
+            a.thread_elements()[0] =
+                input_row < args.rows && input_column < args.input_dim ?
+                h3_bf16_to_f32(input[input_row * args.input_dim + input_column]) :
+                0.0f;
+            a.thread_elements()[1] =
+                input_row < args.rows && input_column + 1 < args.input_dim ?
+                h3_bf16_to_f32(
+                    input[input_row * args.input_dim + input_column + 1]) : 0.0f;
+            simdgroup_multiply_accumulate(accumulator[tile], a, b,
+                                          accumulator[tile]);
+        }
+    }
+#pragma clang loop unroll(full)
+    for (uint tile = 0; tile < TILES; tile++) {
+        uint output_row = row_start + tile * TILE + fragment_row;
+        uint output_column = column_start + fragment_column;
+        if (output_row < args.rows && output_column < args.output_dim) {
+            float value = accumulator[tile].thread_elements()[0] *
+                weight_scales[output_column];
+            if (args.has_bias) value += h3_bf16_to_f32(bias[output_column]);
+            output[output_row * args.output_dim + output_column] =
+                h3_f32_to_bf16(value);
+        }
+        if (output_row < args.rows && output_column + 1 < args.output_dim) {
+            float value = accumulator[tile].thread_elements()[1] *
+                weight_scales[output_column + 1];
+            if (args.has_bias) value += h3_bf16_to_f32(bias[output_column + 1]);
+            output[output_row * args.output_dim + output_column + 1] =
+                h3_f32_to_bf16(value);
+        }
+    }
+}
+
+/* The same GEMM again, on a square tile.
+ *
+ * Traffic for a BMxBN tile is (M/BM)*N*K weight bytes plus (N/BN)*M*K*2 input
+ * bytes, so a tile that is tall and narrow trades one re-read for the other.
+ * The 64x8 variant above fixed the weight re-read and made the *input* the
+ * traffic: at 320 tokens it moves 3.54 GB of activations against 221 MB of
+ * weights. Squaring the tile balances the two — 1.33 GB against 3.76 GB — and
+ * that is the whole of the change; the arithmetic is untouched.
+ *
+ * Sixteen accumulators, four input fragments and four weight fragments come
+ * to forty-eight floats per lane, which still fits without staging through
+ * threadgroup memory. Going wider than this needs several simdgroups sharing
+ * a staged tile, which is a different kernel.
+ */
+kernel void h3_linear_i8_weight_bf16_simd_square(
+                           device const ushort *input [[buffer(0)]],
+                           device const char *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device const ushort *bias [[buffer(3)]],
+                           device ushort *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint TILE = 8;
+    /* 32 rows by 64 columns. Loads per k step are 2*(DOWN + ACROSS) elements a
+     * lane, the products DOWN*ACROSS*16, so a wider tile buys arithmetic per
+     * load: 21 against the square tile's 16. Wider still would be better again
+     * and does not fit — 64x64 wants 128 floats a lane of accumulator alone,
+     * which spills. */
+    constexpr uint DOWN = 4;
+    constexpr uint ACROSS = 8;
+    uint row_start = group.y * (TILE * DOWN);
+    uint column_start = group.x * (TILE * ACROSS);
+    ushort quad = lane / 4;
+    uint fragment_row = (quad & 4) + ((lane / 2) % 4);
+    uint fragment_column = (quad & 2) * 2 + (lane % 2) * 2;
+
+    simdgroup_matrix<float, TILE, TILE> a[DOWN];
+    simdgroup_matrix<float, TILE, TILE> b[ACROSS];
+    simdgroup_matrix<float, TILE, TILE> accumulator[DOWN * ACROSS];
+#pragma clang loop unroll(full)
+    for (uint index = 0; index < DOWN * ACROSS; index++) {
+        accumulator[index].thread_elements()[0] = 0.0f;
+        accumulator[index].thread_elements()[1] = 0.0f;
+    }
+
+    /* Whether this tile lies wholly inside the matrix is a property of the
+     * tile, not of any element, so ask once. The DiT's shapes make the
+     * interior case near-universal — 3840 and 10240 inputs, 3840 to 20480
+     * outputs, token counts that are multiples of 32 — and the edge path then
+     * costs only the handful of tiles that really do hang over. Asking per
+     * element instead put a pair of comparisons in front of all sixteen loads
+     * of every k step, which is the inner loop. */
+    const bool interior = row_start + TILE * DOWN <= args.rows &&
+                          column_start + TILE * ACROSS <= args.output_dim &&
+                          (args.input_dim % TILE) == 0;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        uint step_row = k + fragment_row;
+        uint step_column = k + fragment_column;
+        if (interior) {
+#pragma clang loop unroll(full)
+            for (uint down = 0; down < DOWN; down++) {
+                device const ushort *row =
+                    input + (row_start + down * TILE + fragment_row) *
+                            args.input_dim + step_column;
+                a[down].thread_elements()[0] = h3_bf16_to_f32(row[0]);
+                a[down].thread_elements()[1] = h3_bf16_to_f32(row[1]);
+            }
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++) {
+                device const char *column =
+                    weight + (column_start + across * TILE + fragment_column) *
+                             args.input_dim + step_row;
+                b[across].thread_elements()[0] = float(column[0]);
+                b[across].thread_elements()[1] = float(column[args.input_dim]);
+            }
+        } else {
+#pragma clang loop unroll(full)
+            for (uint down = 0; down < DOWN; down++) {
+                uint input_row = row_start + down * TILE + fragment_row;
+                a[down].thread_elements()[0] =
+                    input_row < args.rows && step_column < args.input_dim ?
+                    h3_bf16_to_f32(input[input_row * args.input_dim + step_column]) :
+                    0.0f;
+                a[down].thread_elements()[1] =
+                    input_row < args.rows && step_column + 1 < args.input_dim ?
+                    h3_bf16_to_f32(
+                        input[input_row * args.input_dim + step_column + 1]) : 0.0f;
+            }
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++) {
+                uint weight_column = column_start + across * TILE + fragment_column;
+                b[across].thread_elements()[0] =
+                    step_row < args.input_dim && weight_column < args.output_dim ?
+                    float(weight[weight_column * args.input_dim + step_row]) : 0.0f;
+                b[across].thread_elements()[1] =
+                    step_row < args.input_dim && weight_column + 1 < args.output_dim ?
+                    float(weight[(weight_column + 1) * args.input_dim + step_row]) :
+                    0.0f;
+            }
+        }
+#pragma clang loop unroll(full)
+        for (uint down = 0; down < DOWN; down++)
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++)
+                simdgroup_multiply_accumulate(accumulator[down * ACROSS + across],
+                                              a[down], b[across],
+                                              accumulator[down * ACROSS + across]);
+    }
+
+#pragma clang loop unroll(full)
+    for (uint down = 0; down < DOWN; down++) {
+        uint output_row = row_start + down * TILE + fragment_row;
+        if (output_row >= args.rows) continue;
+#pragma clang loop unroll(full)
+        for (uint across = 0; across < ACROSS; across++) {
+            uint output_column = column_start + across * TILE + fragment_column;
+            uint slot = down * ACROSS + across;
+            if (output_column < args.output_dim) {
+                float value = accumulator[slot].thread_elements()[0] *
+                    weight_scales[output_column];
+                if (args.has_bias) value += h3_bf16_to_f32(bias[output_column]);
+                output[output_row * args.output_dim + output_column] =
+                    h3_f32_to_bf16(value);
+            }
+            if (output_column + 1 < args.output_dim) {
+                float value = accumulator[slot].thread_elements()[1] *
+                    weight_scales[output_column + 1];
+                if (args.has_bias)
+                    value += h3_bf16_to_f32(bias[output_column + 1]);
+                output[output_row * args.output_dim + output_column + 1] =
+                    h3_f32_to_bf16(value);
+            }
+        }
+    }
+}
+
+/* The same kernel at 32x32 instead of 32x64, for deep-K shapes.
+ *
+ * Identical but for ACROSS. The wider tile wins on everything the DiT runs
+ * except `w2`, whose K is 10240 where the others are 3840; there it loses
+ * about a quarter, so the wrapper picks by input width. The two bodies are
+ * generated from one source so they cannot drift.
+ *
+ * Traffic for a BMxBN tile is (M/BM)*N*K weight bytes plus (N/BN)*M*K*2 input
+ * bytes, so a tile that is tall and narrow trades one re-read for the other.
+ * The 64x8 variant above fixed the weight re-read and made the *input* the
+ * traffic: at 320 tokens it moves 3.54 GB of activations against 221 MB of
+ * weights. Squaring the tile balances the two — 1.33 GB against 3.76 GB — and
+ * that is the whole of the change; the arithmetic is untouched.
+ *
+ * Sixteen accumulators, four input fragments and four weight fragments come
+ * to forty-eight floats per lane, which still fits without staging through
+ * threadgroup memory. Going wider than this needs several simdgroups sharing
+ * a staged tile, which is a different kernel.
+ */
+kernel void h3_linear_i8_weight_bf16_simd_deep(
+                           device const ushort *input [[buffer(0)]],
+                           device const char *weight [[buffer(1)]],
+                           device const float *weight_scales [[buffer(2)]],
+                           device const ushort *bias [[buffer(3)]],
+                           device ushort *output [[buffer(4)]],
+                           constant linear_args &args [[buffer(5)]],
+                           uint2 group [[threadgroup_position_in_grid]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr uint TILE = 8;
+    /* 32 rows by 64 columns. Loads per k step are 2*(DOWN + ACROSS) elements a
+     * lane, the products DOWN*ACROSS*16, so a wider tile buys arithmetic per
+     * load: 21 against the square tile's 16. Wider still would be better again
+     * and does not fit — 64x64 wants 128 floats a lane of accumulator alone,
+     * which spills. */
+    constexpr uint DOWN = 4;
+    constexpr uint ACROSS = 4;
+    uint row_start = group.y * (TILE * DOWN);
+    uint column_start = group.x * (TILE * ACROSS);
+    ushort quad = lane / 4;
+    uint fragment_row = (quad & 4) + ((lane / 2) % 4);
+    uint fragment_column = (quad & 2) * 2 + (lane % 2) * 2;
+
+    simdgroup_matrix<float, TILE, TILE> a[DOWN];
+    simdgroup_matrix<float, TILE, TILE> b[ACROSS];
+    simdgroup_matrix<float, TILE, TILE> accumulator[DOWN * ACROSS];
+#pragma clang loop unroll(full)
+    for (uint index = 0; index < DOWN * ACROSS; index++) {
+        accumulator[index].thread_elements()[0] = 0.0f;
+        accumulator[index].thread_elements()[1] = 0.0f;
+    }
+
+    /* Whether this tile lies wholly inside the matrix is a property of the
+     * tile, not of any element, so ask once. The DiT's shapes make the
+     * interior case near-universal — 3840 and 10240 inputs, 3840 to 20480
+     * outputs, token counts that are multiples of 32 — and the edge path then
+     * costs only the handful of tiles that really do hang over. Asking per
+     * element instead put a pair of comparisons in front of all sixteen loads
+     * of every k step, which is the inner loop. */
+    const bool interior = row_start + TILE * DOWN <= args.rows &&
+                          column_start + TILE * ACROSS <= args.output_dim &&
+                          (args.input_dim % TILE) == 0;
+    for (uint k = 0; k < args.input_dim; k += TILE) {
+        uint step_row = k + fragment_row;
+        uint step_column = k + fragment_column;
+        if (interior) {
+#pragma clang loop unroll(full)
+            for (uint down = 0; down < DOWN; down++) {
+                device const ushort *row =
+                    input + (row_start + down * TILE + fragment_row) *
+                            args.input_dim + step_column;
+                a[down].thread_elements()[0] = h3_bf16_to_f32(row[0]);
+                a[down].thread_elements()[1] = h3_bf16_to_f32(row[1]);
+            }
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++) {
+                device const char *column =
+                    weight + (column_start + across * TILE + fragment_column) *
+                             args.input_dim + step_row;
+                b[across].thread_elements()[0] = float(column[0]);
+                b[across].thread_elements()[1] = float(column[args.input_dim]);
+            }
+        } else {
+#pragma clang loop unroll(full)
+            for (uint down = 0; down < DOWN; down++) {
+                uint input_row = row_start + down * TILE + fragment_row;
+                a[down].thread_elements()[0] =
+                    input_row < args.rows && step_column < args.input_dim ?
+                    h3_bf16_to_f32(input[input_row * args.input_dim + step_column]) :
+                    0.0f;
+                a[down].thread_elements()[1] =
+                    input_row < args.rows && step_column + 1 < args.input_dim ?
+                    h3_bf16_to_f32(
+                        input[input_row * args.input_dim + step_column + 1]) : 0.0f;
+            }
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++) {
+                uint weight_column = column_start + across * TILE + fragment_column;
+                b[across].thread_elements()[0] =
+                    step_row < args.input_dim && weight_column < args.output_dim ?
+                    float(weight[weight_column * args.input_dim + step_row]) : 0.0f;
+                b[across].thread_elements()[1] =
+                    step_row < args.input_dim && weight_column + 1 < args.output_dim ?
+                    float(weight[(weight_column + 1) * args.input_dim + step_row]) :
+                    0.0f;
+            }
+        }
+#pragma clang loop unroll(full)
+        for (uint down = 0; down < DOWN; down++)
+#pragma clang loop unroll(full)
+            for (uint across = 0; across < ACROSS; across++)
+                simdgroup_multiply_accumulate(accumulator[down * ACROSS + across],
+                                              a[down], b[across],
+                                              accumulator[down * ACROSS + across]);
+    }
+
+#pragma clang loop unroll(full)
+    for (uint down = 0; down < DOWN; down++) {
+        uint output_row = row_start + down * TILE + fragment_row;
+        if (output_row >= args.rows) continue;
+#pragma clang loop unroll(full)
+        for (uint across = 0; across < ACROSS; across++) {
+            uint output_column = column_start + across * TILE + fragment_column;
+            uint slot = down * ACROSS + across;
+            if (output_column < args.output_dim) {
+                float value = accumulator[slot].thread_elements()[0] *
+                    weight_scales[output_column];
+                if (args.has_bias) value += h3_bf16_to_f32(bias[output_column]);
+                output[output_row * args.output_dim + output_column] =
+                    h3_f32_to_bf16(value);
+            }
+            if (output_column + 1 < args.output_dim) {
+                float value = accumulator[slot].thread_elements()[1] *
+                    weight_scales[output_column + 1];
+                if (args.has_bias)
+                    value += h3_bf16_to_f32(bias[output_column + 1]);
+                output[output_row * args.output_dim + output_column + 1] =
+                    h3_f32_to_bf16(value);
+            }
+        }
     }
 }
 
@@ -4428,6 +4841,14 @@ static void h3_gqa_causal_core(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float maximum = reductions[0];
+    /* The sum reduction below reuses this same array, and slot 0 is what every
+     * thread just read. Without a barrier here thread 0 can finish its share of
+     * the exponentials and overwrite reductions[0] while another thread has yet
+     * to load `maximum`, which then exponentiates against a partial sum instead
+     * of the row maximum. The threads stay in step while each owns at most one
+     * key, so this only bites once the sequence outgrows the threadgroup --
+     * which is why a 32-key test never saw it and a prompt did. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float local_sum = 0.0f;
     for (uint key_row = tid; key_row < key_count; key_row += threads) {
         float probability = exp(scores[key_row] - maximum);
