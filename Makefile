@@ -93,6 +93,9 @@ h3_real_ltx_connector_test: tests/test_real_ltx_connector.o $(LIB_OBJ)
 h3_real_ltx_dit_test: tests/test_real_ltx_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_ltx_dit_block_test: tests/test_real_ltx_dit_block.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_real_optimized_qwen_test: tests/test_real_optimized_qwen.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
