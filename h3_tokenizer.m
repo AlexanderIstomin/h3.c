@@ -350,21 +350,10 @@ static int h3_added_match(H3Tokenizer *tokenizer, NSString *text,
     return found;
 }
 
-h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
-                                size_t error_size) {
+/* The parse, once the bytes are in hand from wherever they came. */
+static h3_tokenizer *h3_tokenizer_from_data(NSData *data, char *error,
+                                            size_t error_size) {
     @autoreleasepool {
-        if (error && error_size) error[0] = '\0';
-        if (!path) {
-            h3_tok_error(error, error_size, @"tokenizer path is required");
-            return NULL;
-        }
-        NSData *data = [NSData dataWithContentsOfFile:
-            [NSString stringWithUTF8String:path]];
-        if (!data) {
-            h3_tok_error(error, error_size, [NSString stringWithFormat:
-                         @"cannot read tokenizer: %s", path]);
-            return NULL;
-        }
         NSError *json_error = nil;
         NSDictionary *config = [NSJSONSerialization JSONObjectWithData:data
                                                                 options:0
@@ -503,6 +492,45 @@ h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
             tokenizer.byteFallback = fallback;
         }
         return (__bridge_retained h3_tokenizer *)tokenizer;
+    }
+}
+
+h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
+                                size_t error_size) {
+    @autoreleasepool {
+        if (error && error_size) error[0] = '\0';
+        if (!path) {
+            h3_tok_error(error, error_size, @"tokenizer path is required");
+            return NULL;
+        }
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:path]];
+        if (!data) {
+            h3_tok_error(error, error_size, [NSString stringWithFormat:
+                         @"cannot read tokenizer: %s", path]);
+            return NULL;
+        }
+        return h3_tokenizer_from_data(data, error, error_size);
+    }
+}
+
+/* Same parse, for a tokenizer that arrives as bytes rather than a file --
+ * LTX-2.5 carries Gemma's in the text encoder checkpoint as a `tokenizer_json`
+ * tensor, and staging 32 MB through a temporary file to read it back is a cost
+ * with nothing to show for it. The bytes are not copied and need only outlive
+ * this call. */
+h3_tokenizer *h3_tokenizer_load_json(const void *bytes, size_t length,
+                                     char *error, size_t error_size) {
+    @autoreleasepool {
+        if (error && error_size) error[0] = '\0';
+        if (!bytes || !length) {
+            h3_tok_error(error, error_size, @"tokenizer JSON is required");
+            return NULL;
+        }
+        NSData *data = [NSData dataWithBytesNoCopy:(void *)bytes
+                                            length:length
+                                      freeWhenDone:NO];
+        return h3_tokenizer_from_data(data, error, error_size);
     }
 }
 

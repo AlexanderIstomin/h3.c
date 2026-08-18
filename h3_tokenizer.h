@@ -10,6 +10,11 @@ typedef struct h3_tokenizer h3_tokenizer;
 
 h3_tokenizer *h3_tokenizer_load(const char *tokenizer_json,
                                 char *error, size_t error_size);
+/* The same, for a tokenizer that arrives as bytes rather than a file: LTX-2.5
+ * ships Gemma's inside the text encoder checkpoint. The bytes are not copied
+ * and need only outlive the call. */
+h3_tokenizer *h3_tokenizer_load_json(const void *bytes, size_t length,
+                                     char *error, size_t error_size);
 void h3_tokenizer_free(h3_tokenizer *tokenizer);
 
 /* The caller owns *ids and releases it with h3_tokenizer_ids_free(). */
