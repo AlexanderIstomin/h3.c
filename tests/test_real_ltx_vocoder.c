@@ -60,7 +60,7 @@
 
 enum {
     STEREO = 2,
-    MEL_FRAMES = 29, MEL_BINS = 64,
+    MEL_BINS = 64,
     /* Stereo folded into channels: what `conv_pre` actually sees. */
     INPUT_CHANNELS = STEREO * MEL_BINS,
     INITIAL_CHANNELS = 1536,
@@ -78,37 +78,23 @@ static const uint32_t upsample_kernels[STAGES] = {11, 4, 4, 4, 4, 4};
 static const uint32_t residual_kernels[RESBLOCKS] = {3, 7, 11};
 static const uint32_t residual_dilations[RESIDUAL_PAIRS] = {1, 3, 5};
 
-/* Both sides compute in F32, so these bound MPS's accumulation order against
- * torch's rather than a difference in precision.
+/* Both sides compute in F32, so the bounds below hold MPS's accumulation
+ * order against torch's rather than a difference in precision. They are read
+ * out of the anchor rather than written here, because the floor is a property
+ * of the input and its length, not of this code -- see `gen_ltx_vocoder.py`.
  *
- * `gen_ltx_vocoder.py --floor` runs the reference at F32 and F64. Unlike the
- * audio VAE's stack, which is flat at 1e-06 the whole way down, this one
- * climbs by a factor of thirty: six upsamples turn 29 frames into 4640
- * samples, and the arithmetic per output grows with them. A single bound here
- * would be either too loose to catch anything early or too tight to pass late,
- * so each stage carries what F32 itself costs at that depth. */
+ * Used only where the anchor carries no floor for a stage. */
 #define TOLERANCE 5e-6
 
-static const struct { const char *label; double floor; } MEASURED_FLOOR[] = {
-    {"voc_conv_pre",  1.17e-06}, {"voc_up0",  6.42e-07}, {"voc_res0", 1.60e-06},
-    {"voc_up1",       1.83e-06}, {"voc_res1", 3.55e-06},
-    {"voc_up2",       2.09e-06}, {"voc_res2", 4.96e-06},
-    {"voc_up3",       4.76e-06}, {"voc_res3", 6.54e-06},
-    {"voc_up4",       9.04e-06}, {"voc_res4", 3.50e-05},
-    {"voc_up5",       3.79e-05}, {"voc_res5", 2.61e-05},
-    {"voc_act_post",  2.96e-05},
-    {"voc_conv_post", 2.50e-05}, {"voc_waveform", 2.50e-05}
-};
+/* What a composed run is allowed to drift to before it counts as broken. This
+ * is deliberately loose and deliberately not the gate: see `drift` below. */
+#define COMPOSED_TOLERANCE 1e-3
 
-static double tolerance_for(const char *label) {
-    for (size_t index = 0; index < sizeof(MEASURED_FLOOR) /
-                                   sizeof(*MEASURED_FLOOR); index++)
-        if (!strcmp(label, MEASURED_FLOOR[index].label)) {
-            const double bound = 2.0 * MEASURED_FLOOR[index].floor;
-            return bound > TOLERANCE ? bound : TOLERANCE;
-        }
-    return TOLERANCE;
-}
+/* Read off the anchor's `mel` rather than fixed, so one binary checks whatever
+ * length the fixture was generated at. Nothing in the vocoder cares -- the six
+ * stages multiply the frame count by exactly the hop however long it is -- but
+ * only running a second length demonstrates that rather than asserting it. */
+static uint32_t mel_frames = 0;
 
 static int failures = 0;
 static h3_weight_store *store = NULL;
@@ -194,9 +180,55 @@ static float *golden(const char *name, size_t expected) {
     return read_tensor(anchor, name, expected);
 }
 
+/* What F32 costs this stage on this input, measured by the generator and
+ * carried in the fixture. Negative if the fixture predates that. */
+static double floor_for(const char *label) {
+    char name[192];
+    snprintf(name, sizeof(name), "floor.%s", label);
+    const h3_st_header *header = NULL;
+    if (!h3_weight_find(anchor, name, &header)) return -1.0;
+    float *value = read_tensor(anchor, name, 1);
+    const double measured = (double)value[0];
+    free(value);
+    return measured;
+}
+
+/* Twice the floor, or the base bound where the floor is smaller than the
+ * difference two correct implementations can have for reasons other than
+ * precision -- MPS and torch do not share an accumulation order. */
+static double tolerance_for(const char *label) {
+    const double measured = floor_for(label);
+    if (measured < 0.0) return TOLERANCE;
+    return 2.0 * measured > TOLERANCE ? 2.0 * measured : TOLERANCE;
+}
+
+static const h3_st_tensor *shape_of(const h3_weight_store *from,
+                                    const char *name) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(from, name, &header);
+    if (!tensor) fail("no tensor %s", name);
+    return tensor;
+}
+
 static h3_gpu_tensor *upload(const float *values, size_t count) {
     h3_gpu_tensor *tensor = h3_gpu_tensor_from_f32(gpu, values, count);
     require(tensor != NULL, "cannot upload a tensor");
+    return tensor;
+}
+
+/* The anchor's [channels][length] into the engine's [length][channels]. This
+ * is how a stage is given the *reference's* input rather than the engine's
+ * own, which is the only way to ask about that stage alone. */
+static h3_gpu_tensor *upload_golden(const char *label, shape of) {
+    float *want = golden(label, volume(of));
+    float *staged = malloc(volume(of) * sizeof(*staged));
+    require(staged != NULL, "cannot allocate a staged golden tensor");
+    for (uint32_t time = 0; time < of.length; time++)
+        for (uint32_t channel = 0; channel < of.channels; channel++)
+            staged[(size_t)time * of.channels + channel] =
+                want[(size_t)channel * of.length + time];
+    h3_gpu_tensor *tensor = upload(staged, volume(of));
+    free(want); free(staged);
     return tensor;
 }
 
@@ -370,40 +402,78 @@ static int load_filters(void) {
 
 /* ---------------------------------------------------------------- compare */
 
-static void compare(const char *label, const float *engine, const float *expect,
-                    shape of, double tolerance) {
+/* Both the engine's and the anchor's tensor, with the anchor's convention
+ * ([channels][length]) undone on the way past. */
+static double deviation(const float *engine, const float *expect, shape of,
+                        double *peak_out, size_t *worst_at) {
     double worst = 0.0, peak = 0.0;
-    size_t worst_at = 0;
     for (uint32_t time = 0; time < of.length; time++)
         for (uint32_t channel = 0; channel < of.channels; channel++) {
             const double actual = engine[(size_t)time * of.channels + channel];
             const double wanted = expect[(size_t)channel * of.length + time];
-            if (!isfinite(actual)) {
-                fprintf(stderr, "FAIL %-18s produced %f\n", label, actual);
-                failures++;
-                return;
-            }
+            if (!isfinite(actual)) return INFINITY;
             const double delta = fabs(actual - wanted);
-            if (delta > worst) { worst = delta; worst_at = time; }
+            if (delta > worst) { worst = delta; if (worst_at) *worst_at = time; }
             if (fabs(wanted) > peak) peak = fabs(wanted);
         }
-    const double relative = peak > 0.0 ? worst / peak : worst;
-    if (relative > tolerance) {
-        fprintf(stderr, "FAIL %-18s %.3e = %.2e of peak %.4g (bound %.1e), "
-                "at sample %zu\n", label, worst, relative, peak, tolerance,
+    if (peak_out) *peak_out = peak;
+    return peak > 0.0 ? worst / peak : worst;
+}
+
+/* ---- the gate: one stage, from the anchor's own input -------------------
+ *
+ * This is what says the port is right. Every stage is run twice -- once
+ * carrying the engine's own output forward, and once from the tensor the
+ * reference produced -- and only the second is allowed to fail. The reason is
+ * that this stack amplifies: `voc_res1` multiplies a difference in its input
+ * by about thirteen, so by the last stage a composed comparison is measuring
+ * how ill-conditioned the *model* is and no longer whether the engine is
+ * right. Held this way the error is flat at about 1e-06 from the first stage
+ * to the last, which is the statement worth making. */
+static void gate(const char *label, const h3_gpu_tensor *tensor, shape of) {
+    float *have = download(tensor, volume(of));
+    float *want = golden(label, volume(of));
+    double peak = 0.0;
+    size_t worst_at = 0;
+    const double relative = deviation(have, want, of, &peak, &worst_at);
+    const double bound = tolerance_for(label);
+    if (!(relative <= bound)) {
+        fprintf(stderr, "FAIL %-14s isolated %.2e of peak %.4g, over the "
+                "%.1e floor, at sample %zu\n", label, relative, peak, bound,
                 worst_at);
         failures++;
     } else {
-        printf("  ok  %-18s [%5u,%6u] %.3e = %.2e of peak %.4g\n", label,
-               of.channels, of.length, worst, relative, peak);
+        const double measured = floor_for(label);
+        printf("  ok  %-14s [%5u,%6u] isolated %.2e   floor %.1e, bound %.1e"
+               "%s\n", label, of.channels, of.length, relative, measured,
+               bound, 2.0 * measured < TOLERANCE ? " (the base)" : "");
     }
+    free(have); free(want);
 }
 
-static void check(const char *label, const h3_gpu_tensor *tensor, shape of) {
+/* ---- the report: the whole chain, carried forward ----------------------
+ *
+ * Not a gate, and the number it prints is mostly the model's. It earns its
+ * place by showing *where* the amplification happens -- one stage does almost
+ * all of it -- and by failing if the chain ever runs away rather than drifts.
+ * Returns this stage's drift so the next can report what it multiplied. */
+static double drift(const char *label, const h3_gpu_tensor *tensor, shape of,
+                    double incoming) {
     float *have = download(tensor, volume(of));
     float *want = golden(label, volume(of));
-    compare(label, have, want, of, tolerance_for(label));
+    const double relative = deviation(have, want, of, NULL, NULL);
     free(have); free(want);
+    if (!(relative <= COMPOSED_TOLERANCE)) {
+        fprintf(stderr, "FAIL %-14s composed %.2e of peak, past the %.0e a "
+                "drift can reach\n", label, relative, COMPOSED_TOLERANCE);
+        failures++;
+    } else if (incoming > 0.0) {
+        printf("      %-14s composed %.2e  x%.1f\n", label, relative,
+               relative / incoming);
+    } else {
+        printf("      %-14s composed %.2e\n", label, relative);
+    }
+    return relative;
 }
 
 /* ------------------------------------------------------------- the stages */
@@ -477,6 +547,34 @@ static void run_resblock(h3_gpu_tensor *out, const h3_gpu_tensor *in,
     }
 }
 
+/* Encode one stage's upsample. Split out so it can be run twice: once on the
+ * engine's own input and once on the anchor's. */
+static void encode_upsample(h3_gpu_tensor *out, const h3_gpu_tensor *in,
+                            const conv1d *up, uint32_t length) {
+    GPU_OP(h3_gpu_begin(gpu), "begin upsample");
+    run_conv(out, in, up, length);
+    GPU_OP(h3_gpu_submit(gpu), "submit upsample");
+}
+
+/* Every block reads the same input and the stage takes their *mean*. Summing
+ * is a factor of three and still sounds like something. */
+static void encode_blocks(h3_gpu_tensor *out, const h3_gpu_tensor *in,
+                          const stage *weights, shape of, h3_gpu_tensor *work,
+                          h3_gpu_tensor *activated, h3_gpu_tensor *branch) {
+    GPU_OP(h3_gpu_begin(gpu), "begin resblocks");
+    for (int block = 0; block < RESBLOCKS; block++) {
+        h3_gpu_tensor *target = block == 0 ? out : work;
+        run_resblock(target, in, &weights->blocks[block], of, activated,
+                     branch);
+        if (block == 0) continue;
+        const float scale =
+            block == RESBLOCKS - 1 ? 1.0f / (float)RESBLOCKS : 1.0f;
+        GPU_OP(h3_gpu_add_scaled_f32(gpu, out, out, work, scale, scale,
+                                     (uint32_t)volume(of)), "resblock mean");
+    }
+    GPU_OP(h3_gpu_submit(gpu), "submit resblocks");
+}
+
 /* ------------------------------------------------------------------- main */
 
 int main(int argc, char **argv) {
@@ -505,20 +603,30 @@ int main(int argc, char **argv) {
      * a transpose and a fold, and the reason `conv_pre` takes 128 channels
      * rather than 64. Reading those 128 as anything else -- a latent width, or
      * mel-major -- fits and runs. */
-    shape at = {MEL_FRAMES, INPUT_CHANNELS};
-    float *mel = golden("mel", (size_t)STEREO * MEL_FRAMES * MEL_BINS);
+    const h3_st_tensor *geometry = shape_of(anchor, "mel");
+    if (geometry->ndim != 3 || geometry->shape[0] != STEREO ||
+        geometry->shape[2] != MEL_BINS)
+        fail("the anchor's mel is not [%d, frames, %d]", STEREO, MEL_BINS);
+    mel_frames = (uint32_t)geometry->shape[1];
+
+    shape at = {mel_frames, INPUT_CHANNELS};
+    float *mel = golden("mel", (size_t)STEREO * mel_frames * MEL_BINS);
     float *staged = malloc(volume(at) * sizeof(*staged));
     require(staged != NULL, "cannot allocate the folded mel");
     for (uint32_t side = 0; side < STEREO; side++)
-        for (uint32_t frame = 0; frame < MEL_FRAMES; frame++)
+        for (uint32_t frame = 0; frame < mel_frames; frame++)
             for (uint32_t bin = 0; bin < MEL_BINS; bin++)
                 staged[(size_t)frame * INPUT_CHANNELS + side * MEL_BINS + bin] =
-                    mel[((size_t)side * MEL_FRAMES + frame) * MEL_BINS + bin];
+                    mel[((size_t)side * mel_frames + frame) * MEL_BINS + bin];
     free(mel);
     {
         float *want = golden("voc_input", volume(at));
-        compare("voc_input", staged, want, at, TOLERANCE);
+        const double relative = deviation(staged, want, at, NULL, NULL);
         free(want);
+        if (relative != 0.0) fail("the folded mel is not the anchor's input: "
+                                  "%.2e of peak", relative);
+        printf("  ok  %-14s [%5u,%6u] the fold is exact\n", "voc_input",
+               at.channels, at.length);
     }
     h3_gpu_tensor *x = upload(staged, volume(at));
     free(staged);
@@ -539,7 +647,10 @@ int main(int argc, char **argv) {
         x = out;
         at = wide;
     }
-    check("voc_conv_pre", x, at);
+    /* conv_pre's input is the mel, which both sides build identically, so
+     * isolated and composed are the same run here. */
+    gate("voc_conv_pre", x, at);
+    double carried = drift("voc_conv_pre", x, at, 0.0);
 
     /* ------------------------------------------------------- the six stages */
 
@@ -556,32 +667,36 @@ int main(int argc, char **argv) {
         h3_gpu_tensor *activated = allocate(volume(wider));
         h3_gpu_tensor *branch = allocate(volume(wider));
 
-        GPU_OP(h3_gpu_begin(gpu), "begin upsample");
-        run_conv(upsampled, x, &weights.up, at.length);
-        GPU_OP(h3_gpu_submit(gpu), "submit upsample");
-        h3_gpu_tensor_free(x);
-        at = wider;
-        char label[32];
-        snprintf(label, sizeof(label), "voc_up%d", index);
-        check(label, upsampled, at);
+        char previous[32], up_label[32], res_label[32];
+        snprintf(previous, sizeof(previous), index ? "voc_res%d" : "voc_conv_pre",
+                 index - 1);
+        snprintf(up_label, sizeof(up_label), "voc_up%d", index);
+        snprintf(res_label, sizeof(res_label), "voc_res%d", index);
 
-        /* Every block reads the same input and the stage takes their *mean*.
-         * Summing is a factor of three and still sounds like something. */
-        GPU_OP(h3_gpu_begin(gpu), "begin resblocks");
-        for (int block = 0; block < RESBLOCKS; block++) {
-            h3_gpu_tensor *target = block == 0 ? accumulated : work;
-            run_resblock(target, upsampled, &weights.blocks[block], at,
-                         activated, branch);
-            if (block == 0) continue;
-            const float scale =
-                block == RESBLOCKS - 1 ? 1.0f / (float)RESBLOCKS : 1.0f;
-            GPU_OP(h3_gpu_add_scaled_f32(gpu, accumulated, accumulated, work,
-                                         scale, scale, (uint32_t)volume(at)),
-                   "resblock mean");
-        }
-        GPU_OP(h3_gpu_submit(gpu), "submit resblocks");
-        snprintf(label, sizeof(label), "voc_res%d", index);
-        check(label, accumulated, at);
+        /* Composed: the engine's own output carried forward. */
+        encode_upsample(upsampled, x, &weights.up, at.length);
+        h3_gpu_tensor_free(x);
+        const shape narrow = at;
+        at = wider;
+        encode_blocks(accumulated, upsampled, &weights, at, work, activated,
+                      branch);
+
+        /* Isolated: the same two steps from the anchor's own tensors, which
+         * is what the bounds are set for. */
+        h3_gpu_tensor *seed = upload_golden(previous, narrow);
+        h3_gpu_tensor *alone = allocate(volume(at));
+        encode_upsample(alone, seed, &weights.up, narrow.length);
+        gate(up_label, alone, at);
+        h3_gpu_tensor_free(seed);
+
+        seed = upload_golden(up_label, at);
+        encode_blocks(alone, seed, &weights, at, work, activated, branch);
+        gate(res_label, alone, at);
+        h3_gpu_tensor_free(seed);
+        h3_gpu_tensor_free(alone);
+
+        carried = drift(up_label, upsampled, at, carried);
+        carried = drift(res_label, accumulated, at, carried);
 
         x = accumulated;
         h3_gpu_tensor_free(upsampled);
@@ -603,8 +718,18 @@ int main(int argc, char **argv) {
         free_activation(&post);
         h3_gpu_tensor_free(x);
         x = out;
+        h3_gpu_tensor *seed = upload_golden("voc_res5", at);
+        h3_gpu_tensor *alone = allocate(volume(at));
+        load_activation("act_post", &post, at.channels);
+        GPU_OP(h3_gpu_begin(gpu), "begin act_post alone");
+        run_activation(alone, seed, &post, at);
+        GPU_OP(h3_gpu_submit(gpu), "submit act_post alone");
+        free_activation(&post);
+        gate("voc_act_post", alone, at);
+        h3_gpu_tensor_free(seed);
+        h3_gpu_tensor_free(alone);
     }
-    check("voc_act_post", x, at);
+    carried = drift("voc_act_post", x, at, carried);
 
     {
         conv1d post;
@@ -615,14 +740,22 @@ int main(int argc, char **argv) {
         GPU_OP(h3_gpu_begin(gpu), "begin conv_post");
         run_conv(out, x, &post, at.length);
         GPU_OP(h3_gpu_submit(gpu), "submit conv_post");
+        h3_gpu_tensor *seed = upload_golden("voc_act_post", at);
+        h3_gpu_tensor *alone = allocate(volume(narrow));
+        GPU_OP(h3_gpu_begin(gpu), "begin conv_post alone");
+        run_conv(alone, seed, &post, at.length);
+        GPU_OP(h3_gpu_submit(gpu), "submit conv_post alone");
+        gate("voc_conv_post", alone, narrow);
+        h3_gpu_tensor_free(seed);
+        h3_gpu_tensor_free(alone);
         free_conv(&post);
         h3_gpu_tensor_free(x);
         x = out;
         at = narrow;
     }
-    check("voc_conv_post", x, at);
+    carried = drift("voc_conv_post", x, at, carried);
 
-    require(at.length == MEL_FRAMES * HOP_LENGTH,
+    require(at.length == mel_frames * HOP_LENGTH,
             "the six stages did not multiply the frame count by the hop");
 
     /* The clamp. `use_tanh_at_final` is false and `apply_final_activation` is
@@ -637,8 +770,16 @@ int main(int argc, char **argv) {
     }
     {
         float *want = golden("voc_waveform", volume(at));
-        compare("voc_waveform", samples, want, at, tolerance_for("voc_waveform"));
+        const double relative = deviation(samples, want, at, NULL, NULL);
         free(want);
+        if (!(relative <= COMPOSED_TOLERANCE)) {
+            fprintf(stderr, "FAIL %-14s composed %.2e of peak\n",
+                    "voc_waveform", relative);
+            failures++;
+        } else {
+            printf("      %-14s composed %.2e  x%.1f\n", "voc_waveform",
+                   relative, carried > 0.0 ? relative / carried : 1.0);
+        }
     }
     /* Say plainly what this run does and does not establish. The clamp is read
      * off the config, and on a sample that never reaches +-1 the anchor agrees
@@ -669,8 +810,8 @@ int main(int argc, char **argv) {
                "wrote", argv[3], at.length, SAMPLE_RATE);
     }
 
-    printf("\nspoke %u samples of %d Hz stereo from %d mel frames in %.2f s\n",
-           at.length, SAMPLE_RATE, MEL_FRAMES, now() - began);
+    printf("\nspoke %u samples of %d Hz stereo from %u mel frames in %.2f s\n",
+           at.length, SAMPLE_RATE, mel_frames, now() - began);
     free(samples);
     h3_gpu_tensor_free(x);
     h3_gpu_tensor_free(upsample_filter);
