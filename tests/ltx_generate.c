@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <time.h>
 
 #ifndef LTX_FRAMES
@@ -927,6 +928,46 @@ static void euler_step(float *sample, const float *denoised, double sigma,
  * is. Swap them and a run where both streams share a sigma agrees exactly. */
 
 
+/* -------------------------------------------------------------- prefetch */
+
+/* The weights for one block, loaded off the critical path, the way
+ * `h3_dit.c` streams H3's. On by default; `H3_LTX_PREFETCH=0` disables it.
+ *
+ * Measured A/B at 512x512 over 4 steps, alternating so both modes see the
+ * same machine:
+ *
+ *     serial    71.7 s blocks + 43.3 s loading = 126.1 s
+ *     prefetch  45.8 s blocks +  0.4 s loading =  56.5 s
+ *     serial    45.0 s blocks + 28.1 s loading =  82.4 s
+ *     prefetch  44.9 s blocks +  0.5 s loading =  55.7 s
+ *
+ * Block time is unchanged between modes, so the worker costs the GPU nothing;
+ * loading essentially disappears. It is also the *stable* one -- the serial
+ * runs swing with whatever else the machine is doing while the prefetched ones
+ * do not, because the slack absorbs it.
+ *
+ * A first attempt at this measurement said the opposite, and said it
+ * confidently: 242 s serial against 320 s prefetched, with a tidy explanation
+ * about unified memory and a bandwidth-bound GEMM. Another generation was
+ * running on the same machine at the time. **One timing run on a shared
+ * machine is not a measurement**, and a mechanism invented to explain one is
+ * worse than no explanation. Alternate the configurations.
+ *
+ * `load_block` only reads the checkpoint and uploads; it never touches the
+ * command buffer, so it is safe beside a submit. The latents are bit identical
+ * either way, which is what says the concurrency is correct. */
+typedef struct {
+    int index;
+    const conditioning *cond;
+    block_weights weights;
+} preload_job;
+
+static void *preload_thread(void *opaque) {
+    preload_job *job = opaque;
+    load_block(job->index, job->cond, &job->weights);
+    return NULL;
+}
+
 /* ---------------------------------------------------------------- noise */
 
 /* xorshift plus a Box-Muller pair: deterministic from a seed, and self
@@ -1228,17 +1269,60 @@ int main(int argc, char **argv) {
         s.video = upload(video_tokens, (size_t)VIDEO_ROWS * VIDEO_DIM);
         s.audio = upload(audio_tokens, (size_t)AUDIO_ROWS * AUDIO_DIM);
 
-        for (int index = 0; index < TOTAL_BLOCKS; index++) {
-            block_weights weights;
+        /* Block N + 1 loads on a worker while block N runs on the GPU, which
+         * is the shape `h3_dit.c` settled on for H3's SSD streaming. What is
+         * hidden is worth having: a block is 388 MB of int8 and the file
+         * layout scatters it -- the checkpoint is sorted by tensor name, so a
+         * block's hundred tensors interleave with every other block's and span
+         * the whole 21.5 GB at 1.8% density. There is no sequential read to be
+         * had here without rewriting the file.
+         *
+         * Prefetch stops at the step boundary rather than wrapping as H3's
+         * does: `cond` carries this step's modulation, so block 0 of the next
+         * step cannot be built until the step advances. That forfeits one
+         * block of 48, which the measurement says is not worth chasing --
+         * loading already falls to under a second. */
+        const char *prefetch_env = getenv("H3_LTX_PREFETCH");
+        const int prefetch = !prefetch_env || !*prefetch_env ||
+                             *prefetch_env != '0';
+        preload_job jobs[2];
+        memset(jobs, 0, sizeof(jobs));
+        int slot = 0;
+        {
             const double loading = now();
-            load_block(index, &cond, &weights);
+            load_block(0, &cond, &jobs[0].weights);
             load_seconds += now() - loading;
+        }
+        for (int index = 0; index < TOTAL_BLOCKS; index++) {
+            pthread_t worker;
+            int started = 0;
+            if (prefetch && index + 1 < TOTAL_BLOCKS) {
+                jobs[slot ^ 1].index = index + 1;
+                jobs[slot ^ 1].cond = &cond;
+                if (pthread_create(&worker, NULL, preload_thread,
+                                   &jobs[slot ^ 1]) != 0)
+                    fail("cannot start the prefetch for block %d", index + 1);
+                started = 1;
+            }
             const double running = now();
             GPU_OP(h3_gpu_begin(gpu), "begin block");
-            run_block(&weights, &s, &space);
+            run_block(&jobs[slot].weights, &s, &space);
             GPU_OP(h3_gpu_submit(gpu), "submit block");
             block_seconds += now() - running;
-            free_block(&weights);
+            if (started) {
+                /* Only the part the GPU failed to cover is a cost. */
+                const double waiting = now();
+                if (pthread_join(worker, NULL) != 0)
+                    fail("cannot join the prefetch for block %d", index + 1);
+                load_seconds += now() - waiting;
+            }
+            if (!prefetch && index + 1 < TOTAL_BLOCKS) {
+                const double loading = now();
+                load_block(index + 1, &cond, &jobs[slot ^ 1].weights);
+                load_seconds += now() - loading;
+            }
+            free_block(&jobs[slot].weights);
+            slot ^= 1;
         }
 
         read_bf16_as_f32(s.video, video_out, (size_t)VIDEO_ROWS * VIDEO_DIM);
