@@ -93,8 +93,14 @@ enum {
     LATENTS_PER_SECOND = 25,
     AUDIO_ROWS = LTX_AUDIO_ROWS ? LTX_AUDIO_ROWS :
         (2 * PIXEL_FRAMES * LATENTS_PER_SECOND + LTX_FPS) / (2 * LTX_FPS),
-    /* The connector emits a fixed 128-token span, registers included. */
-    TEXT_ROWS = 128,
+    /* The context span is NOT fixed and is NOT the register count. The
+     * tokenizer left-pads to 256 (`LTXVGemmaTokenizer(max_length=256)`) and
+     * the connector's 128 learnable registers *replace the padded positions*
+     * rather than setting the length -- `_replace_padded_with_learnable_
+     * registers` keeps `hidden_states.shape[1]`. So the span is whatever was
+     * tokenized, and it is read from the context header rather than assumed;
+     * this constant is only the buffer ceiling. */
+    MAX_TEXT_ROWS = 512,
     VIDEO_AXES = 3,
     AUDIO_AXES = 1,
     MAX_STEPS = 32,
@@ -147,6 +153,9 @@ enum {
 static const double VIDEO_MAX_POS[VIDEO_AXES] = {20.0, 2048.0, 2048.0};
 static const double AUDIO_MAX_POS[AUDIO_AXES] = {20.0};
 static const double ROPE_THETA = 10000.0;
+
+/* However many tokens the connector emitted; see MAX_TEXT_ROWS. */
+static uint32_t text_rows = 0;
 
 static int failures = 0;
 static h3_weight_store *store = NULL;
@@ -724,10 +733,10 @@ static void load_block(int index, const conditioning *from,
         CROSS_TABLE_SLOTS, CROSS_SLOTS, GATE_SLOTS, GATE_SLOTS, LEVELS);
     weights->video_context = modulate_context(
         block, "prompt_scale_shift_table", from->video_context,
-        from->video_prompt, TEXT_ROWS, VIDEO_DIM);
+        from->video_prompt, text_rows, VIDEO_DIM);
     weights->audio_context = modulate_context(
         block, "audio_prompt_scale_shift_table", from->audio_context,
-        from->audio_prompt, TEXT_ROWS, AUDIO_DIM);
+        from->audio_prompt, text_rows, AUDIO_DIM);
 }
 
 static void free_block(block_weights *weights) {
@@ -774,7 +783,7 @@ static void self_and_text(const attention *self, const attention *text,
     GPU_OP(h3_gpu_adaln_bf16(gpu, scaled, x, ones, modulation, row_map, rows,
                              dim, ADA_SLOTS, 6, 7, BLOCK_EPSILON),
            "text cross-attention modulation");
-    run_attention(text, branch, scaled, rows, context, TEXT_ROWS,
+    run_attention(text, branch, scaled, rows, context, text_rows,
                   NULL, NULL, NULL, NULL, space);
     GPU_OP(h3_gpu_gate_bf16(gpu, x, x, branch, modulation, row_map, rows, dim,
                             ADA_SLOTS, 8), "text cross-attention residual");
@@ -1063,24 +1072,28 @@ int main(int argc, char **argv) {
 
     /* --------------------------------------------------- the conditioning */
 
-    float *video_context = malloc((size_t)TEXT_ROWS * VIDEO_DIM * sizeof(float));
-    float *audio_context = malloc((size_t)TEXT_ROWS * AUDIO_DIM * sizeof(float));
-    require(video_context && audio_context, "cannot allocate the context");
+    float *video_context = NULL, *audio_context = NULL;
     {
         FILE *file = fopen(argv[2], "rb");
         if (!file) fail("cannot open %s", argv[2]);
         uint32_t header[4];
         require(fread(header, sizeof(header), 1, file) == 1,
                 "cannot read the context header");
-        if (header[1] != TEXT_ROWS || header[2] != VIDEO_DIM ||
-            header[3] != AUDIO_DIM)
-            fail("the context is %u x %u/%u, expected %d x %d/%d", header[1],
-                 header[2], header[3], TEXT_ROWS, VIDEO_DIM, AUDIO_DIM);
-        require(fread(video_context, sizeof(float), (size_t)TEXT_ROWS * VIDEO_DIM,
-                      file) == (size_t)TEXT_ROWS * VIDEO_DIM,
+        if (header[2] != VIDEO_DIM || header[3] != AUDIO_DIM)
+            fail("the context is %u x %u/%u, expected %u x %d/%d", header[1],
+                 header[2], header[3], header[1], VIDEO_DIM, AUDIO_DIM);
+        if (!header[1] || header[1] > MAX_TEXT_ROWS)
+            fail("the context has %u rows, outside 1..%d", header[1],
+                 MAX_TEXT_ROWS);
+        text_rows = header[1];
+        video_context = malloc((size_t)text_rows * VIDEO_DIM * sizeof(float));
+        audio_context = malloc((size_t)text_rows * AUDIO_DIM * sizeof(float));
+        require(video_context && audio_context, "cannot allocate the context");
+        require(fread(video_context, sizeof(float), (size_t)text_rows * VIDEO_DIM,
+                      file) == (size_t)text_rows * VIDEO_DIM,
                 "cannot read the video context");
-        require(fread(audio_context, sizeof(float), (size_t)TEXT_ROWS * AUDIO_DIM,
-                      file) == (size_t)TEXT_ROWS * AUDIO_DIM,
+        require(fread(audio_context, sizeof(float), (size_t)text_rows * AUDIO_DIM,
+                      file) == (size_t)text_rows * AUDIO_DIM,
                 "cannot read the audio context");
         fclose(file);
     }
@@ -1088,8 +1101,8 @@ int main(int argc, char **argv) {
     float sigmas[MAX_STEPS + 1];
     schedule(sigmas, steps, (double)VIDEO_ROWS);
     printf("LTX-2.5, %d steps, %d video tokens (%dx%dx%d), %d audio, "
-           "%d context\n", steps, VIDEO_ROWS, FRAMES, HEIGHT, WIDTH,
-           AUDIO_ROWS, TEXT_ROWS);
+           "%u context\n", steps, VIDEO_ROWS, FRAMES, HEIGHT, WIDTH,
+           AUDIO_ROWS, text_rows);
     printf("%d latent frames = %d pixel frames at %d fps = %.3f s; "
            "%d audio rows = %.3f s\n", FRAMES, PIXEL_FRAMES, LTX_FPS,
            (double)PIXEL_FRAMES / LTX_FPS, AUDIO_ROWS,

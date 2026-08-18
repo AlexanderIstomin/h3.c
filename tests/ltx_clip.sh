@@ -32,8 +32,12 @@ VIDEO_VAE="$LTX/vae/ltx-2.5-video-vae-conv-bf16.safetensors"
 AUDIO_VAE="$LTX/vae/ltx-2.5-audio-vae-bf16.safetensors"
 
 echo "== 1/6 tokenize =="
-uv run --python 3.12 --with transformers --with torch --with safetensors \
-    --no-project python "$SCRATCH/tokenize_prompt.py" "$PROMPT" "$OUT.ids.safetensors"
+# From $SCRATCH: the tokenizer is loaded by the relative name `gemma_tok`, and
+# from anywhere else transformers silently falls through to the network and
+# fails there instead of saying it could not find the local copy.
+( cd "$SCRATCH" && uv run --python 3.12 --with transformers --with torch \
+    --with safetensors --no-project python tokenize_prompt.py "$PROMPT" \
+    "$(cd "$(dirname "$OUT")" && pwd)/$(basename "$OUT").ids.safetensors" )
 
 echo "== 2/6 Gemma tower =="
 ./h3_real_ltx_text_test "$ENCODER" "$OUT.ids.safetensors" "$OUT.states.bin"
