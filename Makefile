@@ -120,6 +120,9 @@ h3_ltx_generate: tests/ltx_generate.o $(LIB_OBJ)
 h3_ltx_decode: tests/ltx_decode.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_ltx_audio_decode: tests/ltx_audio_decode.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_ltx_generate_512: tests/ltx_generate_512.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
