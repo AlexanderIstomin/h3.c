@@ -111,6 +111,9 @@ h3_real_ltx_video_vae_test: tests/test_real_ltx_video_vae.o $(LIB_OBJ)
 h3_real_ltx_audio_vae_test: tests/test_real_ltx_audio_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_real_ltx_vocoder_test: tests/test_real_ltx_vocoder.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_ltx_generate: tests/ltx_generate.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
