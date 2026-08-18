@@ -27,7 +27,7 @@ SEED="${4:-16}"
 GEN="${GEN:-./h3_ltx_generate_long}"
 
 DIT="$LTX/diffusion_models/ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
-ENCODER="$LTX/text_encoders"
+ENCODER="$LTX/text_encoders/gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
 VIDEO_VAE="$LTX/vae/ltx-2.5-video-vae-conv-bf16.safetensors"
 AUDIO_VAE="$LTX/vae/ltx-2.5-audio-vae-bf16.safetensors"
 
