@@ -128,7 +128,14 @@ h3_ltx_generate_512: tests/ltx_generate_512.o $(LIB_OBJ)
 
 tests/ltx_generate_512.o: tests/ltx_generate.c
 	$(CC) $(CFLAGS) -I. -DLTX_FRAMES=3 -DLTX_HEIGHT=16 -DLTX_WIDTH=16 \
-		-DLTX_AUDIO_ROWS=24 -c $< -o $@
+		-c $< -o $@
+
+h3_ltx_generate_long: tests/ltx_generate_long.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+tests/ltx_generate_long.o: tests/ltx_generate.c
+	$(CC) $(CFLAGS) -I. -DLTX_FRAMES=9 -DLTX_HEIGHT=16 -DLTX_WIDTH=16 \
+		-c $< -o $@
 
 h3_real_optimized_qwen_test: tests/test_real_optimized_qwen.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)

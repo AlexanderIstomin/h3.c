@@ -40,8 +40,16 @@
 #ifndef LTX_WIDTH
 #define LTX_WIDTH 8
 #endif
+/* The rate the clip is meant to be played at. It is not in the checkpoint --
+ * `VideoPixelShape.fps` is supplied by the caller -- but it is not free
+ * either: it sets the scale of the video rope's time axis and, through that,
+ * the audio row count. 24 is LTX's conventional rate. */
+#ifndef LTX_FPS
+#define LTX_FPS 24
+#endif
+
 #ifndef LTX_AUDIO_ROWS
-#define LTX_AUDIO_ROWS 16
+#define LTX_AUDIO_ROWS 0
 #endif
 
 enum {
@@ -73,9 +81,18 @@ enum {
      * iterate on. `h3_ltx_generate_512` is 17 frames of 512x512. */
     FRAMES = LTX_FRAMES, HEIGHT = LTX_HEIGHT, WIDTH = LTX_WIDTH,
     VIDEO_ROWS = FRAMES * HEIGHT * WIDTH,
-    /* Free parameter: nothing yet pins the audio token count to the video
-     * duration, and this is where that would go once it is settled. */
-    AUDIO_ROWS = LTX_AUDIO_ROWS,
+    /* The video VAE compresses 8x in time and cannot produce the seven
+     * leading frames, so N latent frames decode to 8(N-1)+1 pixel frames. */
+    PIXEL_FRAMES = 8 * (FRAMES - 1) + 1,
+    /* Not a free parameter, though it was treated as one until the reference
+     * was read properly. `AudioLatentShape.from_video_pixel_shape` takes the
+     * video's duration in *seconds* and multiplies by
+     * `sample_rate / hop_length / downsample` = 16000/160/4 = 25 latent frames
+     * per second, rounded. Written with integer arithmetic so it can size an
+     * array: round(x) is (2x + 1) / 2. */
+    LATENTS_PER_SECOND = 25,
+    AUDIO_ROWS = LTX_AUDIO_ROWS ? LTX_AUDIO_ROWS :
+        (2 * PIXEL_FRAMES * LATENTS_PER_SECOND + LTX_FPS) / (2 * LTX_FPS),
     /* The connector emits a fixed 128-token span, registers included. */
     TEXT_ROWS = 128,
     VIDEO_AXES = 3,
@@ -1073,6 +1090,10 @@ int main(int argc, char **argv) {
     printf("LTX-2.5, %d steps, %d video tokens (%dx%dx%d), %d audio, "
            "%d context\n", steps, VIDEO_ROWS, FRAMES, HEIGHT, WIDTH,
            AUDIO_ROWS, TEXT_ROWS);
+    printf("%d latent frames = %d pixel frames at %d fps = %.3f s; "
+           "%d audio rows = %.3f s\n", FRAMES, PIXEL_FRAMES, LTX_FPS,
+           (double)PIXEL_FRAMES / LTX_FPS, AUDIO_ROWS,
+           (double)(4 * AUDIO_ROWS - 3) / 100.0);
     printf("  schedule");
     for (int step = 0; step <= steps; step++) printf(" %.4f", sigmas[step]);
     printf("\n");
@@ -1147,8 +1168,18 @@ int main(int argc, char **argv) {
                     if (begin < 0) begin = 0;
                     if (end < 0) end = 0;
                 }
-                video_grid[at] = (float)begin;
-                video_grid[at + 1] = (float)end;
+                /* And the time axis is in **seconds**, not frames:
+                 * `create_initial_state` divides axis 0 by the fps right
+                 * after `get_pixel_coords`. Leaving it in frames is the same
+                 * mistake as leaving it in latent cells, one level up -- it
+                 * scales the whole axis by the frame rate, and it puts the
+                 * video on a different footing from the audio, whose bounds
+                 * are already seconds. The two streams attend to each other
+                 * through these positions, so they have to share units. */
+                video_grid[at] = axis == 0 ? (float)begin / (float)LTX_FPS
+                                           : (float)begin;
+                video_grid[at + 1] = axis == 0 ? (float)end / (float)LTX_FPS
+                                               : (float)end;
             }
         }
         /* The audio patchifier's bounds are **timestamps in seconds**, not
