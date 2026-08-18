@@ -33,3 +33,5 @@ libh3.a
 h3_ltx_generate
 h3_ltx_decode
 h3_ltx_generate_512
+h3_ltx_audio_decode
+h3_ltx_generate_long
