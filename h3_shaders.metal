@@ -462,6 +462,19 @@ struct gate_args {
     uint gate_slot;
 };
 
+/* Three scalars, laid out to match the host's struct byte for byte.
+ *
+ * This was a `uint3`, which is **16 bytes in Metal, not 12** -- so the host's
+ * three uint32s left the fourth component unbound. Nothing ever read it, so
+ * the kernel produced correct output and the mismatch only surfaced under
+ * Metal's API validation, which the command-line harnesses run without and the
+ * app turns on. A named struct cannot drift from the host that way. */
+struct head_gate_args {
+    uint rows;
+    uint heads;
+    uint head_dim;
+};
+
 kernel void h3_gate_f32(device const float *residual [[buffer(0)]],
                         device const float *branch [[buffer(1)]],
                         device const float *modulation [[buffer(2)]],
@@ -5593,10 +5606,10 @@ kernel void h3_add_row_bf16(device const ushort *input [[buffer(0)]],
  * runs after the heads are joined rather than before. */
 kernel void h3_head_gate_bf16(device ushort *values [[buffer(0)]],
                            device const ushort *logits [[buffer(1)]],
-                           constant uint3 &shape [[buffer(2)]],
+                           constant head_gate_args &shape [[buffer(2)]],
                            uint2 gid [[thread_position_in_grid]]) {
-    uint heads = shape.y, head_dim = shape.z;
-    if (gid.x >= heads * head_dim || gid.y >= shape.x) return;
+    uint heads = shape.heads, head_dim = shape.head_dim;
+    if (gid.x >= heads * head_dim || gid.y >= shape.rows) return;
     uint head = gid.x / head_dim;
     float logit = h3_bf16_to_f32(logits[gid.y * heads + head]);
     float gate = 2.0f / (1.0f + precise::exp(-logit));
