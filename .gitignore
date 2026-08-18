@@ -32,3 +32,4 @@ libh3.a
 # the LTX-2.5 generation drivers
 h3_ltx_generate
 h3_ltx_decode
+h3_ltx_generate_512

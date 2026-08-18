@@ -30,6 +30,19 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef LTX_FRAMES
+#define LTX_FRAMES 2
+#endif
+#ifndef LTX_HEIGHT
+#define LTX_HEIGHT 8
+#endif
+#ifndef LTX_WIDTH
+#define LTX_WIDTH 8
+#endif
+#ifndef LTX_AUDIO_ROWS
+#define LTX_AUDIO_ROWS 16
+#endif
+
 enum {
     VIDEO_DIM = 4096,
     AUDIO_DIM = 2048,
@@ -49,11 +62,19 @@ enum {
     CONVROT_GROUP = 256,
     TOTAL_BLOCKS = 48,
     ANCHOR_BLOCKS = 2,
-    /* 9 pixel frames of 256x256: the VAE compresses 8x in time (8*(k-1)+1)
-     * and 32x in space, so this is 2 latent frames of 8x8. */
-    FRAMES = 2, HEIGHT = 8, WIDTH = 8,
+    /* The latent geometry. The VAE compresses 8x in time -- so `FRAMES` latent
+     * frames decode to `8 * (FRAMES - 1) + 1` pixel frames -- and 32x in each
+     * spatial axis. Overridable at compile time because these size stack
+     * arrays and the block helpers, so they cannot be runtime values without
+     * threading a shape through every one of them.
+     *
+     * The default is 9 pixel frames of 256x256, which is small enough to
+     * iterate on. `h3_ltx_generate_512` is 17 frames of 512x512. */
+    FRAMES = LTX_FRAMES, HEIGHT = LTX_HEIGHT, WIDTH = LTX_WIDTH,
     VIDEO_ROWS = FRAMES * HEIGHT * WIDTH,
-    AUDIO_ROWS = 16,
+    /* Free parameter: nothing yet pins the audio token count to the video
+     * duration, and this is where that would go once it is settled. */
+    AUDIO_ROWS = LTX_AUDIO_ROWS,
     /* The connector emits a fixed 128-token span, registers included. */
     TEXT_ROWS = 128,
     VIDEO_AXES = 3,
