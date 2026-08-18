@@ -594,15 +594,15 @@ static void run_attention(const attention *a, h3_gpu_tensor *out,
                                    a->kv_in, CONVROT_GROUP), "context ConvRot");
         rotated_kv = space->rotated_kv;
     }
-    GPU_OP(h3_gpu_linear_i8_weight_bf16(gpu, space->query, space->rotated_query,
+    GPU_OP(h3_gpu_linear_i8_weight_bf16_square_output_major(gpu, space->query, space->rotated_query,
                                         a->query.weight, a->query.scales,
                                         a->query.bias, query_rows, a->query_in,
                                         a->inner), "query projection");
-    GPU_OP(h3_gpu_linear_i8_weight_bf16(gpu, space->key, rotated_kv,
+    GPU_OP(h3_gpu_linear_i8_weight_bf16_square_output_major(gpu, space->key, rotated_kv,
                                         a->key.weight, a->key.scales,
                                         a->key.bias, kv_rows, a->kv_in,
                                         a->inner), "key projection");
-    GPU_OP(h3_gpu_linear_i8_weight_bf16(gpu, space->value, rotated_kv,
+    GPU_OP(h3_gpu_linear_i8_weight_bf16_square_output_major(gpu, space->value, rotated_kv,
                                         a->value.weight, a->value.scales,
                                         a->value.bias, kv_rows, a->kv_in,
                                         a->inner), "value projection");
@@ -627,7 +627,7 @@ static void run_attention(const attention *a, h3_gpu_tensor *out,
                                  HEADS, head_dim), "head gate");
     GPU_OP(h3_gpu_convrot_bf16(gpu, space->heads, space->heads, query_rows,
                                a->inner, CONVROT_GROUP), "output ConvRot");
-    GPU_OP(h3_gpu_linear_i8_weight_bf16(gpu, out, space->heads,
+    GPU_OP(h3_gpu_linear_i8_weight_bf16_square_output_major(gpu, out, space->heads,
                                         a->output.weight, a->output.scales,
                                         a->output.bias, query_rows, a->inner,
                                         a->out_dim), "output projection");
@@ -774,14 +774,14 @@ static void feed_forward(const projection *in, const projection *out,
            "feed-forward modulation");
     GPU_OP(h3_gpu_convrot_bf16(gpu, scaled, scaled, rows, dim, CONVROT_GROUP),
            "feed-forward ConvRot");
-    GPU_OP(h3_gpu_linear_i8_weight_bf16(gpu, space->inner, scaled, in->weight,
+    GPU_OP(h3_gpu_linear_i8_weight_bf16_square_output_major(gpu, space->inner, scaled, in->weight,
                                         in->scales, in->bias, rows, dim, width),
            "feed-forward in");
     GPU_OP(h3_gpu_gelu_bf16(gpu, space->inner, space->inner, rows * width, 1),
            "feed-forward activation");
     GPU_OP(h3_gpu_convrot_bf16(gpu, space->inner, space->inner, rows, width,
                                CONVROT_GROUP), "feed-forward out ConvRot");
-    GPU_OP(h3_gpu_linear_i8_weight_bf16(gpu, branch, space->inner, out->weight,
+    GPU_OP(h3_gpu_linear_i8_weight_bf16_square_output_major(gpu, branch, space->inner, out->weight,
                                         out->scales, out->bias, rows, width,
                                         dim), "feed-forward out");
     GPU_OP(h3_gpu_gate_bf16(gpu, x, x, branch, modulation, row_map, rows, dim,
