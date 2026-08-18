@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <time.h>
 
 /* Casting three operands up and the result back costs time linear in the
@@ -263,6 +264,21 @@ static void fail(char *error, size_t error_size, const char *format, ...) {
  * H3_DIT_TILE=8x8 restores the old kernel, which is how the two were compared
  * end to end in one build.
  */
+/* How much of this machine the f32 attention scratch may take.
+ *
+ * A sixteenth of physical memory, which is 2 GB on the 32 GB machine this was
+ * measured on. That admits it at the sequences where it was shown to pay —
+ * 0.58 GB at 5095 rows — and refuses it at the 2.5 GB a 768-canvas
+ * five-second clip wants, where 21 GB of weights already has the machine in
+ * swap. That configuration completed only with this scratch turned off, and
+ * finishing is worth more than the 18% the trade buys. */
+static uint64_t h3_dit_memory_budget(void) {
+    uint64_t bytes = 0;
+    size_t size = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &size, NULL, 0) != 0) return 0;
+    return bytes / 16u;
+}
+
 static int use_retuned_tile(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -1952,11 +1968,19 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
             return 0;
         }
     }
-    /* Four f32 buffers for attention, allocated only where it will use them.
-     * At 5095 rows they are 146 MB each; below the threshold the bf16 path
-     * runs and they would be dead weight. Failing to get them is not fatal —
-     * the bf16 path is still correct, just slower. */
+    /* Four f32 buffers for attention, allocated only where it will use them
+     * and only where they are affordable.
+     *
+     * They grow with the sequence: 146 MB each at 5095 rows, 622 MB each at
+     * the 21700 a 768-canvas five-second clip runs, which is 2.5 GB on top of
+     * 21 GB of weights. That was enough to push a 32 GB machine into swap and
+     * get the process killed mid-pass. Speed is worth nothing if the run does
+     * not finish, so the trade is refused when it is a large share of the
+     * machine; the bf16 path is slower and always correct. */
+    const uint64_t f32_attention_bytes =
+        (uint64_t)sequence * INNER * sizeof(float) * 4u;
     if (sequence > H3_DIT_F32_ATTENTION_ROWS &&
+        f32_attention_bytes <= h3_dit_memory_budget() &&
         !getenv("H3_DISABLE_F32_ATTENTION")) {
         dit->query32 = h3_gpu_tensor_new_f32(dit->gpu, sequence * INNER);
         dit->key32 = h3_gpu_tensor_new_f32(dit->gpu, sequence * INNER);
