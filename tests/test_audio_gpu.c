@@ -197,6 +197,15 @@ int main(void) {
                               0.5f * right_values[index];
         clip_expected[index] = fminf(0.4f, fmaxf(-0.4f, add_expected[index]));
     }
+    float downsample_input[4 * 6 * 3], downsample_expected[2 * 3 * 3];
+    for (size_t index = 0; index < 4 * 6 * 3; index++)
+        downsample_input[index] = (float)index + 0.25f;
+    for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 3; x++)
+            for (int channel = 0; channel < 3; channel++)
+                downsample_expected[(y * 3 + x) * 3 + channel] =
+                    downsample_input[((y * 2 + 1) * 6 + x * 2 + 1) * 3 +
+                                     channel];
 
     h3_gpu_tensor *input = own(&test, h3_gpu_tensor_from_f32(
         test.gpu, input_values, 8));
@@ -226,6 +235,10 @@ int main(void) {
         test.gpu, right_values, 4));
     h3_gpu_tensor *added = own(&test, h3_gpu_tensor_new_f32(test.gpu, 4));
     h3_gpu_tensor *clipped = own(&test, h3_gpu_tensor_new_f32(test.gpu, 4));
+    h3_gpu_tensor *downsample_source = own(&test, h3_gpu_tensor_from_f32(
+        test.gpu, downsample_input, 4 * 6 * 3));
+    h3_gpu_tensor *downsampled = own(&test, h3_gpu_tensor_new_f32(
+        test.gpu, 2 * 3 * 3));
 
     gpu_ok(&test, h3_gpu_begin(test.gpu), "begin");
     gpu_ok(&test, h3_gpu_weight_norm_f32(test.gpu, weight, vector, magnitude,
@@ -247,6 +260,9 @@ int main(void) {
                                         0.25f, 0.5f, 4), "scaled add");
     gpu_ok(&test, h3_gpu_clip_f32(test.gpu, clipped, added, 4, -0.4f, 0.4f),
            "clip");
+    gpu_ok(&test, h3_gpu_downsample2x_odd_nhwc_f32(
+        test.gpu, downsampled, downsample_source, 4, 6, 3),
+        "odd 2x downsample");
     gpu_ok(&test, h3_gpu_submit(test.gpu), "submit");
 
     compare(weight, normalized, 12, 2e-6f, "weight norm");
@@ -257,6 +273,8 @@ int main(void) {
     compare(snaked, snake_expected, 8, 2e-5f, "SnakeBeta");
     compare(added, add_expected, 4, 1e-7f, "scaled add");
     compare(clipped, clip_expected, 4, 1e-7f, "clip");
+    compare(downsampled, downsample_expected, 2 * 3 * 3, 0.0f,
+            "odd downsample");
 
     h3_gpu_stats stats;
     if (!h3_gpu_get_stats(test.gpu, &stats) || stats.mps_conv_dispatches != 3)

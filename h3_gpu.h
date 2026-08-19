@@ -354,6 +354,14 @@ int h3_gpu_relu_f32(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_nearest2x_nhwc_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                               const h3_gpu_tensor *input, uint32_t height,
                               uint32_t width, uint32_t channels);
+/* Keep the odd row and column of each 2x2 NHWC cell. Z-Image uses this after
+ * a same-padded convolution to reproduce asymmetric right/bottom padding
+ * followed by a stride-2 convolution without leaving the device. */
+int h3_gpu_downsample2x_odd_nhwc_f32(h3_gpu *gpu,
+                                     h3_gpu_tensor *output,
+                                     const h3_gpu_tensor *input,
+                                     uint32_t height, uint32_t width,
+                                     uint32_t channels);
 /* GroupNorm without an activation, for the decoder's attention block; the
  * resnets want the SiLU-fused form below. */
 int h3_gpu_vae_group_norm_f32(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -422,6 +430,16 @@ int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *gpu, h3_gpu_tensor *output,
                                         const h3_gpu_tensor *bias,
                                         uint32_t rows, uint32_t input_dim,
                                         uint32_t output_dim);
+/* Project through two equally shaped input-major matrices as one virtual
+ * concatenated matrix. Output rows are [first | second]. This avoids copying
+ * large checkpoint tensors merely to satisfy a fused SwiGLU layout. */
+int h3_gpu_linear_i8_weight_bf16_square_pair(
+        h3_gpu *gpu, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+        const h3_gpu_tensor *first_weight,
+        const h3_gpu_tensor *first_weight_scales,
+        const h3_gpu_tensor *second_weight,
+        const h3_gpu_tensor *second_weight_scales,
+        uint32_t rows, uint32_t input_dim, uint32_t output_dim);
 /* The same tile on `[output][input]` weights — the layout every package on
  * disk already uses. About 9% slower than the input-major variant above and
  * a drop-in for `h3_gpu_linear_i8_weight_bf16`, needing no re-quantization. */
@@ -588,6 +606,19 @@ int h3_gpu_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
                          const h3_gpu_tensor *rope_sin, uint32_t sequence,
                          uint32_t heads, uint32_t head_dim,
                          uint32_t rope_half, float epsilon);
+/* Z-Image pairs adjacent Q/K channels. The outputs retain the engine's
+ * half-paired order, so attention arithmetic stays identical to explicitly
+ * permuting the QKV projection and norm weights at load time. */
+int h3_gpu_zimage_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                                h3_gpu_tensor *key, h3_gpu_tensor *value,
+                                const h3_gpu_tensor *qkv,
+                                const h3_gpu_tensor *q_norm,
+                                const h3_gpu_tensor *k_norm,
+                                const h3_gpu_tensor *rope_cos,
+                                const h3_gpu_tensor *rope_sin,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t rope_half,
+                                float epsilon);
 /* H3 checkpoint QKV rows are [head, q/k/v, dimension], unlike the
  * conventional [q/k/v, head, dimension] layout accepted above. */
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,

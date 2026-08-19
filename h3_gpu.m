@@ -274,6 +274,7 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         @"h3_linear_f32", @"h3_linear_f32_tiled",
         @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
         @"h3_relu_f32", @"h3_nearest2x_nhwc_f32",
+        @"h3_downsample2x_odd_nhwc_f32",
         @"h3_linear_f32_tiled_bf16_map",
         @"h3_cast_f32_to_bf16",
         @"h3_cast_bf16_to_f32",
@@ -284,6 +285,8 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         @"h3_zimage_modulation_f32", @"h3_zimage_modulation_bf16",
         @"h3_linear_i8_weight_bf16_simd_wide",
         @"h3_linear_i8_weight_bf16_simd_square",
+        @"h3_linear_i8_weight_bf16_pair",
+        @"h3_linear_i8_weight_bf16_simd_square_pair",
         @"h3_linear_i8_weight_bf16_simd_square_om",
         @"h3_linear_i8_weight_bf16_simd_deep",
         @"h3_flash_attention_bf16",
@@ -1296,7 +1299,7 @@ typedef struct { uint32_t rows, heads, head_dim; } head_gate_args;
 typedef struct { uint32_t width; } zimage_modulation_args;
 typedef struct { uint32_t sequence, heads; float scale; } flash_args;
 typedef struct {
-    uint32_t sequence, heads, head_dim, rope_half, grouped;
+    uint32_t sequence, heads, head_dim, rope_half, grouped, pairwise_permute;
     float epsilon;
 } qkv_args;
 typedef struct { uint32_t outer, inner; } weight_norm_args;
@@ -1598,6 +1601,35 @@ int h3_gpu_nearest2x_nhwc_f32(h3_gpu *opaque, h3_gpu_tensor *output,
         });
 }
 
+int h3_gpu_downsample2x_odd_nhwc_f32(h3_gpu *opaque,
+                                     h3_gpu_tensor *output,
+                                     const h3_gpu_tensor *input,
+                                     uint32_t height, uint32_t width,
+                                     uint32_t channels) {
+    H3GPU *gpu = GPU(opaque);
+    if (!height || !width || !channels || (height & 1u) || (width & 1u))
+        return 0;
+    const size_t input_elements = (size_t)height * width * channels;
+    const size_t output_elements =
+        (size_t)(height / 2) * (width / 2) * channels;
+    if (output_elements > UINT32_MAX ||
+        !h3_gpu_require_elements(gpu, input, input_elements,
+                                 @"odd downsample input") ||
+        TENSOR(input).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, output, output_elements,
+                                 @"odd downsample output") ||
+        TENSOR(output).dtype != H3_GPU_F32) return 0;
+    return h3_gpu_dispatch_1d(
+        gpu, @"h3_downsample2x_odd_nhwc_f32", (uint32_t)output_elements,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:1];
+            [encoder setBytes:&height length:sizeof(height) atIndex:2];
+            [encoder setBytes:&width length:sizeof(width) atIndex:3];
+            [encoder setBytes:&channels length:sizeof(channels) atIndex:4];
+        });
+}
+
 int h3_gpu_cast_f32_to_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                             const h3_gpu_tensor *input, uint32_t elements) {
     H3GPU *gpu = GPU(opaque);
@@ -1816,7 +1848,7 @@ int h3_gpu_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
         !h3_gpu_require_elements(gpu, key, count, @"key") ||
         !h3_gpu_require_elements(gpu, value, count, @"value") ||
         rope_half * 2 > head_dim) return 0;
-    qkv_args args = {sequence, heads, head_dim, rope_half, 0, epsilon};
+    qkv_args args = {sequence, heads, head_dim, rope_half, 0, 0, epsilon};
     return h3_gpu_dispatch_3d(gpu, @"h3_qkv_rope_f32",
         MTLSizeMake(head_dim, heads, sequence),
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -2114,7 +2146,7 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *opaque, h3_gpu_tensor *query,
         TENSOR(key).dtype != H3_GPU_F32 ||
         !h3_gpu_require_elements(gpu, value, count, @"video value") ||
         TENSOR(value).dtype != H3_GPU_F32 || rope_half * 2 > head_dim) return 0;
-    qkv_args args = {sequence, heads, head_dim, rope_half, 0, epsilon};
+    qkv_args args = {sequence, heads, head_dim, rope_half, 0, 0, epsilon};
     return h3_gpu_dispatch_3d(gpu, @"h3_video_qkv_rope_f32",
         MTLSizeMake(head_dim, heads, sequence),
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -3446,6 +3478,76 @@ int h3_gpu_linear_i8_weight_bf16_square(h3_gpu *opaque, h3_gpu_tensor *output,
     return 1;
 }
 
+int h3_gpu_linear_i8_weight_bf16_square_pair(
+        h3_gpu *opaque, h3_gpu_tensor *output, const h3_gpu_tensor *input,
+        const h3_gpu_tensor *first_weight,
+        const h3_gpu_tensor *first_weight_scales,
+        const h3_gpu_tensor *second_weight,
+        const h3_gpu_tensor *second_weight_scales,
+        uint32_t rows, uint32_t input_dim, uint32_t output_dim) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !input_dim || !output_dim || output_dim > UINT32_MAX / 2)
+        return 0;
+    const size_t weight_count = (size_t)input_dim * output_dim;
+    const size_t output_count = (size_t)rows * output_dim * 2;
+    if (!h3_gpu_require_bf16(gpu, input, (size_t)rows * input_dim,
+                             @"paired int8-weight linear input") ||
+        !h3_gpu_require_i8(gpu, first_weight, weight_count,
+                           @"paired int8-weight first matrix") ||
+        !h3_gpu_require_f32(gpu, first_weight_scales, output_dim,
+                            @"paired int8-weight first scales") ||
+        !h3_gpu_require_i8(gpu, second_weight, weight_count,
+                           @"paired int8-weight second matrix") ||
+        !h3_gpu_require_f32(gpu, second_weight_scales, output_dim,
+                            @"paired int8-weight second scales") ||
+        !h3_gpu_require_bf16(gpu, output, output_count,
+                             @"paired int8-weight linear output")) return 0;
+    linear_args args = {rows, input_dim, output_dim, 0};
+    if (![gpu.device supportsFamily:MTLGPUFamilyApple7]) {
+        return h3_gpu_dispatch_2d(
+            gpu, @"h3_linear_i8_weight_bf16_pair", output_dim * 2, rows,
+            ^(id<MTLComputeCommandEncoder> encoder) {
+                [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+                [encoder setBuffer:TENSOR(first_weight).buffer offset:0 atIndex:1];
+                [encoder setBuffer:TENSOR(first_weight_scales).buffer
+                              offset:0 atIndex:2];
+                [encoder setBuffer:TENSOR(second_weight).buffer offset:0 atIndex:3];
+                [encoder setBuffer:TENSOR(second_weight_scales).buffer
+                              offset:0 atIndex:4];
+                [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:5];
+                [encoder setBytes:&args length:sizeof(args) atIndex:6];
+            });
+    }
+    if (!h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_linear_i8_weight_bf16_simd_square_pair");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 32u) {
+        h3_gpu_set_error(gpu,
+                         @"device cannot dispatch the paired square int8 linear");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(input).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(first_weight).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(first_weight_scales).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(second_weight).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(second_weight_scales).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:5];
+        [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake((output_dim * 2 + 39) / 40,
+                                                  (rows + 63) / 64, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
 int h3_gpu_linear_i8_weight_bf16_wide(h3_gpu *opaque, h3_gpu_tensor *output,
                                       const h3_gpu_tensor *input,
                                       const h3_gpu_tensor *weight,
@@ -4345,7 +4447,7 @@ int h3_gpu_vision_qkv_rope_bf16(
         !h3_gpu_require_bf16(gpu, key, count, @"vision key") ||
         !h3_gpu_require_bf16(gpu, value, count, @"vision value") ||
         rope_half * 2 != head_dim) return 0;
-    qkv_args args = {sequence, heads, head_dim, rope_half, 0, 0.0f};
+    qkv_args args = {sequence, heads, head_dim, rope_half, 0, 0, 0.0f};
     return h3_gpu_dispatch_3d(gpu, @"h3_vision_qkv_rope_bf16",
         MTLSizeMake(head_dim, heads, sequence),
         ^(id<MTLComputeCommandEncoder> encoder) {
@@ -4690,7 +4792,9 @@ static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
                                        const h3_gpu_tensor *rope_sin,
                                        uint32_t sequence, uint32_t heads,
                                        uint32_t head_dim, uint32_t rope_half,
-                                       uint32_t grouped, float epsilon) {
+                                       uint32_t grouped,
+                                       uint32_t pairwise_permute,
+                                       float epsilon) {
     H3GPU *gpu = GPU(opaque);
     size_t inner = (size_t)heads * head_dim;
     size_t count = (size_t)sequence * inner;
@@ -4703,8 +4807,10 @@ static int h3_gpu_qkv_rope_bf16_layout(h3_gpu *opaque, h3_gpu_tensor *query,
         !h3_gpu_require_bf16(gpu, query, count, @"query") ||
         !h3_gpu_require_bf16(gpu, key, count, @"key") ||
         !h3_gpu_require_bf16(gpu, value, count, @"value") ||
-        rope_half * 2 > head_dim) return 0;
-    qkv_args args = {sequence, heads, head_dim, rope_half, grouped, epsilon};
+        rope_half * 2 > head_dim ||
+        (pairwise_permute && rope_half * 2 != head_dim)) return 0;
+    qkv_args args = {sequence, heads, head_dim, rope_half, grouped,
+                     pairwise_permute, epsilon};
     if (head_dim == 128 && !(heads % 4) &&
         !getenv("H3_DISABLE_COOP_QKV")) {
         if (!h3_gpu_require_command(gpu)) return 0;
@@ -4766,7 +4872,22 @@ int h3_gpu_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
                          uint32_t rope_half, float epsilon) {
     return h3_gpu_qkv_rope_bf16_layout(
         opaque, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
-        sequence, heads, head_dim, rope_half, 0, epsilon);
+        sequence, heads, head_dim, rope_half, 0, 0, epsilon);
+}
+
+int h3_gpu_zimage_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
+                                h3_gpu_tensor *key, h3_gpu_tensor *value,
+                                const h3_gpu_tensor *qkv,
+                                const h3_gpu_tensor *q_norm,
+                                const h3_gpu_tensor *k_norm,
+                                const h3_gpu_tensor *rope_cos,
+                                const h3_gpu_tensor *rope_sin,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t rope_half,
+                                float epsilon) {
+    return h3_gpu_qkv_rope_bf16_layout(
+        opaque, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
+        sequence, heads, head_dim, rope_half, 0, 1, epsilon);
 }
 
 int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
@@ -4781,7 +4902,7 @@ int h3_gpu_grouped_qkv_rope_bf16(h3_gpu *opaque, h3_gpu_tensor *query,
                                  float epsilon) {
     return h3_gpu_qkv_rope_bf16_layout(
         opaque, query, key, value, qkv, q_norm, k_norm, rope_cos, rope_sin,
-        sequence, heads, head_dim, rope_half, 1, epsilon);
+        sequence, heads, head_dim, rope_half, 1, 0, epsilon);
 }
 
 int h3_gpu_grouped_qkv_linear_rope_bf16(
