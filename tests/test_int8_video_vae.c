@@ -56,9 +56,94 @@ static double decode(const char *path, const float *latent,
     return elapsed;
 }
 
+static void test_layer_major(const char *path, const float *latent) {
+    h3_video_frames legacy, layer_major;
+    memset(&legacy, 0, sizeof(legacy));
+    memset(&layer_major, 0, sizeof(layer_major));
+
+    /* Force both sides through the low-memory path, while retaining the
+     * production auto-tile plan. The only difference between the runs is the
+     * traversal order under test. */
+    setenv("H3_VAE_RESIDENT", "0", 1);
+    unsetenv("H3_VAE_TILE_PIXELS");
+    setenv("H3_VAE_LAYER_MAJOR", "0", 1);
+    double legacy_seconds = decode(path, latent, &legacy);
+    double legacy_load = last_load_seconds;
+    setenv("H3_VAE_LAYER_MAJOR", "1", 1);
+    double layer_major_seconds = decode(path, latent, &layer_major);
+    double layer_major_load = last_load_seconds;
+
+    if (legacy.frames != layer_major.frames ||
+        legacy.height != layer_major.height ||
+        legacy.width != layer_major.width)
+        fail("layer-major decoder returned a different shape");
+    size_t elements = (size_t)legacy.frames * (size_t)legacy.height *
+                      (size_t)legacy.width * 3;
+    if (memcmp(legacy.rgb, layer_major.rgb, elements * sizeof(*legacy.rgb)))
+        fail("layer-major decoder is not byte-identical to tile-major");
+
+    printf("shape %dx%dx%d\n", legacy.frames, legacy.height, legacy.width);
+    printf("tile-major  load %.2f s + decode %.2f s = %.2f s\n",
+           legacy_load, legacy_seconds, legacy_load + legacy_seconds);
+    printf("layer-major load %.2f s + decode %.2f s = %.2f s\n",
+           layer_major_load, layer_major_seconds,
+           layer_major_load + layer_major_seconds);
+    printf("streaming decode speed %.2fx\n",
+           layer_major_seconds > 0.0 ?
+               legacy_seconds / layer_major_seconds : 0.0);
+    h3_video_frames_free(&legacy);
+    h3_video_frames_free(&layer_major);
+    puts("ok: layer-major streaming is byte-identical to tile-major");
+}
+
+static void test_native_f16(const char *path, const float *latent) {
+    h3_video_frames expanded, native;
+    memset(&expanded, 0, sizeof(expanded));
+    memset(&native, 0, sizeof(native));
+
+    setenv("H3_VAE_RESIDENT", "1", 1);
+    unsetenv("H3_VAE_TILE_PIXELS");
+    setenv("H3_VAE_NATIVE_F16", "0", 1);
+    double expanded_seconds = decode(path, latent, &expanded);
+    double expanded_load = last_load_seconds;
+    setenv("H3_VAE_NATIVE_F16", "1", 1);
+    double native_seconds = decode(path, latent, &native);
+    double native_load = last_load_seconds;
+
+    if (expanded.frames != native.frames ||
+        expanded.height != native.height || expanded.width != native.width)
+        fail("native F16 decoder returned a different shape");
+    size_t elements = (size_t)expanded.frames * (size_t)expanded.height *
+                      (size_t)expanded.width * 3;
+    if (memcmp(expanded.rgb, native.rgb, elements * sizeof(*expanded.rgb)))
+        fail("native F16 decoder is not byte-identical to expanded F32");
+
+    printf("shape %dx%dx%d\n", expanded.frames, expanded.height,
+           expanded.width);
+    printf("expanded F32 load %.2f s + decode %.2f s = %.2f s, "
+           "peak %.3f GiB\n",
+           expanded_load, expanded_seconds, expanded_load + expanded_seconds,
+           (double)expanded.gpu_stats.peak_live_bytes /
+               (1024.0 * 1024.0 * 1024.0));
+    printf("native F16   load %.2f s + decode %.2f s = %.2f s, "
+           "peak %.3f GiB\n",
+           native_load, native_seconds, native_load + native_seconds,
+           (double)native.gpu_stats.peak_live_bytes /
+               (1024.0 * 1024.0 * 1024.0));
+    h3_video_frames_free(&expanded);
+    h3_video_frames_free(&native);
+    puts("ok: native F16 video VAE is byte-identical to expanded F32");
+}
+
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s FP16_VAE INT8_VAE\n", argv[0]);
+    int layer_major_test = argc == 3 && !strcmp(argv[1], "--layer-major");
+    int native_f16_test = argc == 3 && !strcmp(argv[1], "--native-f16");
+    if ((!layer_major_test && !native_f16_test && argc != 3) ||
+        ((layer_major_test || native_f16_test) && !argv[2][0])) {
+        fprintf(stderr,
+                "usage: %s FP16_VAE INT8_VAE\n"
+                "       %s --layer-major VAE\n"
+                "       %s --native-f16 VAE\n", argv[0], argv[0], argv[0]);
         return 2;
     }
     float *latent = malloc(LATENT_ELEMENTS * sizeof(*latent));
@@ -75,6 +160,16 @@ int main(int argc, char **argv) {
         latent[index] = (float)((sum - 3.0) * 1.4142);
     }
 
+    if (layer_major_test) {
+        test_layer_major(argv[2], latent);
+        free(latent);
+        return 0;
+    }
+    if (native_f16_test) {
+        test_native_f16(argv[2], latent);
+        free(latent);
+        return 0;
+    }
     h3_video_frames reference, quantized;
     memset(&reference, 0, sizeof(reference));
     memset(&quantized, 0, sizeof(quantized));

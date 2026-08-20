@@ -9,6 +9,7 @@ typedef struct h3_gpu_tensor h3_gpu_tensor;
 
 typedef enum {
     H3_GPU_F32 = 0,
+    H3_GPU_F16,
     H3_GPU_BF16,
     H3_GPU_I8,
     H3_GPU_U32
@@ -45,10 +46,13 @@ int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_new_f16(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_bf16(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_i8(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_u32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_f32(h3_gpu *gpu, const float *values,
+                                      size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_from_f16(h3_gpu *gpu, const uint16_t *values,
                                       size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
@@ -56,7 +60,9 @@ h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
                                      size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
-/* Allocate shared Metal storage and pread BF16 payload directly into it. */
+/* Allocate shared Metal storage and pread a 16-bit payload directly into it. */
+h3_gpu_tensor *h3_gpu_tensor_load_f16(h3_gpu *gpu, const char *path,
+                                      uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
@@ -105,6 +111,8 @@ int h3_gpu_tensor_read_f32(const h3_gpu_tensor *tensor, float *values,
 int h3_gpu_tensor_read_f32_range(const h3_gpu_tensor *tensor,
                                  size_t source_offset, float *values,
                                  size_t elements);
+int h3_gpu_tensor_read_f16(const h3_gpu_tensor *tensor, uint16_t *values,
+                           size_t elements);
 int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
                             size_t elements);
 int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
@@ -135,6 +143,13 @@ void h3_gpu_profile_set_label(h3_gpu *gpu, const char *label);
 void h3_gpu_profile_mark(h3_gpu *gpu, const char *phase);
 
 int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                      const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
+                      const h3_gpu_tensor *bias, uint32_t rows,
+                      uint32_t input_dim, uint32_t output_dim);
+/* Preserve F32 linear arithmetic while retaining exact IEEE F16 checkpoint
+ * bits in memory. The graph widens the weight to F32 before multiplication. */
+int h3_gpu_linear_f32_f16_weight(
+                      h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t rows,
                       uint32_t input_dim, uint32_t output_dim);

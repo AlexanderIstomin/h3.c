@@ -539,11 +539,18 @@ static int text_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                        const text_linear_weights *weight,
                        uint32_t rows, uint32_t input_dim,
                        uint32_t output_dim) {
-    return weight->scales ? h3_gpu_linear_i8_weight_bf16(
-        gpu, output, input, weight->weight, weight->scales, NULL,
-        rows, input_dim, output_dim) : h3_gpu_linear_bf16(
+    if (!weight->scales)
+        return h3_gpu_linear_bf16(
             gpu, output, input, weight->weight, NULL,
             rows, input_dim, output_dim);
+    const char *tile = getenv("H3_QWEN_TILE");
+    if (rows >= 24 && !(tile && !strcmp(tile, "0")))
+        return h3_gpu_linear_i8_weight_bf16_square_output_major(
+            gpu, output, input, weight->weight, weight->scales, NULL,
+            rows, input_dim, output_dim);
+    return h3_gpu_linear_i8_weight_bf16(
+        gpu, output, input, weight->weight, weight->scales, NULL,
+        rows, input_dim, output_dim);
 }
 
 static int encode_layer(h3_gpu *gpu, const text_layer_weights *weight,

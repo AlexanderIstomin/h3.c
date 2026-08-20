@@ -50,11 +50,16 @@ static uint64_t hash_bytes(const void *data, size_t bytes) {
 }
 
 static uint16_t *load_text(const char *path) {
+    size_t elements = TEXT_ROWS * TEXT_WIDTH;
+    if (getenv("H3_BENCH_SYNTHETIC_TEXT")) {
+        uint16_t *values = calloc(elements, sizeof(*values));
+        if (!values) die("out of memory allocating synthetic prompt");
+        return values;
+    }
     char error[512];
     h3_st_header header;
     if (!h3_st_read_header(path, &header, error, sizeof(error))) die(error);
     const h3_st_tensor *tensor = h3_st_find(&header, "x.output");
-    size_t elements = TEXT_ROWS * TEXT_WIDTH;
     if (!tensor || tensor->dtype != H3_DTYPE_BF16 ||
         h3_st_tensor_elements(tensor) != elements)
         die("prompt fixture has the wrong schema");
@@ -1587,8 +1592,14 @@ int main(int argc, char **argv) {
               : h3_schedule_build(20, &sigmas)))
         die("cannot build benchmark layout");
     char weights[1024];
-    snprintf(weights, sizeof(weights), "%s/%s/transformer", model_root,
-             ref_layout ? "Ref2VA" : "FL2VA");
+    if (getenv("H3_BENCH_OPTIMIZED_WEIGHTS"))
+        snprintf(weights, sizeof(weights),
+                 "%s/diffusion_models/minimax_h3_%s_"
+                 "pruned_int8_convrot.safetensors",
+                 model_root, ref_layout ? "ref2va" : "fl2va");
+    else
+        snprintf(weights, sizeof(weights), "%s/%s/transformer", model_root,
+                 ref_layout ? "Ref2VA" : "FL2VA");
     unsigned active_blocks = 50;
     int reuse_interval = 1;
     const char *layers = getenv("H3_BENCH_LAYERS");
@@ -1639,6 +1650,7 @@ int main(int argc, char **argv) {
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
+            NULL, 0.0f,
             video_condition,
             video_condition_elements, audio_condition,
             audio_condition_elements, NULL, NULL, error, sizeof(error));
@@ -1650,6 +1662,7 @@ int main(int argc, char **argv) {
             active_blocks, 1, enable_token_reduction, ssd_streaming, 1.0f,
             all_bf16, all_bf16, all_bf16, 0, 0, 0, 0, 0, 0,
             use_slower_grouped_quantizer, use_int8_row_fc2,
+            NULL, 0.0f,
             NULL, NULL, error,
             sizeof(error));
     }

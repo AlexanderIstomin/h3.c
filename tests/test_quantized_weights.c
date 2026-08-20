@@ -15,7 +15,7 @@ enum {
     ROWS = 128,
     COLUMNS = 128,
     WEIGHT_ELEMENTS = ROWS * COLUMNS,
-    ACTIVATION_ROWS = 17,
+    ACTIVATION_ROWS = 24,
     INPUT_ELEMENTS = ACTIVATION_ROWS * COLUMNS,
     OUTPUT_ELEMENTS = ACTIVATION_ROWS * ROWS,
     CONVROT_GROUP = 256,
@@ -175,6 +175,78 @@ static void test_convrot_bf16(h3_gpu *gpu) {
     h3_gpu_tensor_free(tensor);
 }
 
+static void test_native_f16_linear_parity(h3_gpu *gpu) {
+    enum { TEST_ROWS = 32, TEST_INPUT = 256, TEST_OUTPUT = 256 };
+    const size_t input_count = (size_t)TEST_ROWS * TEST_INPUT;
+    const size_t weight_count = (size_t)TEST_OUTPUT * TEST_INPUT;
+    const size_t output_count = (size_t)TEST_ROWS * TEST_OUTPUT;
+    float *input = malloc(input_count * sizeof(*input));
+    uint16_t *weight_f16 = malloc(weight_count * sizeof(*weight_f16));
+    float *weight_f32 = malloc(weight_count * sizeof(*weight_f32));
+    float *bias = malloc(TEST_OUTPUT * sizeof(*bias));
+    float *expanded_output = malloc(output_count * sizeof(*expanded_output));
+    float *native_output = malloc(output_count * sizeof(*native_output));
+    require(input && weight_f16 && weight_f32 && bias && expanded_output &&
+                native_output,
+            "cannot allocate native F16 linear fixture");
+    static const uint16_t bits[] = {0x0000u, 0x3800u, 0xb800u, 0x3c00u};
+    static const float values[] = {0.0f, 0.5f, -0.5f, 1.0f};
+    for (size_t index = 0; index < input_count; index++)
+        input[index] = (float)((int)(index % 9u) - 4) * 0.125f;
+    for (size_t index = 0; index < weight_count; index++) {
+        size_t choice = index % (sizeof(bits) / sizeof(*bits));
+        weight_f16[index] = bits[choice];
+        weight_f32[index] = values[choice];
+    }
+    for (size_t index = 0; index < TEST_OUTPUT; index++)
+        bias[index] = (float)((int)(index % 5u) - 2) * 0.25f;
+
+    h3_gpu_tensor *input_tensor = h3_gpu_tensor_from_f32(
+        gpu, input, input_count);
+    h3_gpu_tensor *f16_tensor = h3_gpu_tensor_from_f16(
+        gpu, weight_f16, weight_count);
+    h3_gpu_tensor *f32_tensor = h3_gpu_tensor_from_f32(
+        gpu, weight_f32, weight_count);
+    h3_gpu_tensor *bias_tensor = h3_gpu_tensor_from_f32(
+        gpu, bias, TEST_OUTPUT);
+    h3_gpu_tensor *expanded_tensor = h3_gpu_tensor_new_f32(gpu, output_count);
+    h3_gpu_tensor *native_tensor = h3_gpu_tensor_new_f32(gpu, output_count);
+    require(input_tensor && f16_tensor && f32_tensor && bias_tensor &&
+                expanded_tensor && native_tensor,
+            "cannot allocate native F16 linear tensors");
+    require(h3_gpu_begin(gpu), "cannot begin native F16 linear parity");
+    require(h3_gpu_linear_f32(
+                gpu, expanded_tensor, input_tensor, f32_tensor, bias_tensor,
+                TEST_ROWS, TEST_INPUT, TEST_OUTPUT),
+            "expanded F32 linear failed");
+    require(h3_gpu_linear_f32_f16_weight(
+                gpu, native_tensor, input_tensor, f16_tensor, bias_tensor,
+                TEST_ROWS, TEST_INPUT, TEST_OUTPUT),
+            "native F16 weight linear failed");
+    require(h3_gpu_submit(gpu), "native F16 linear submit failed");
+    require(h3_gpu_tensor_read_f32(
+                expanded_tensor, expanded_output, output_count) &&
+                h3_gpu_tensor_read_f32(
+                    native_tensor, native_output, output_count),
+            "cannot read native F16 linear output");
+    require(memcmp(expanded_output, native_output,
+                   output_count * sizeof(*native_output)) == 0,
+            "native F16 weight changed F32 linear output");
+
+    h3_gpu_tensor_free(input_tensor);
+    h3_gpu_tensor_free(f16_tensor);
+    h3_gpu_tensor_free(f32_tensor);
+    h3_gpu_tensor_free(bias_tensor);
+    h3_gpu_tensor_free(expanded_tensor);
+    h3_gpu_tensor_free(native_tensor);
+    free(input);
+    free(weight_f16);
+    free(weight_f32);
+    free(bias);
+    free(expanded_output);
+    free(native_output);
+}
+
 static double monotonic_seconds(void) {
     struct timespec value;
     require(clock_gettime(CLOCK_MONOTONIC, &value) == 0,
@@ -251,6 +323,66 @@ static void test_portable_int8_linear(h3_gpu *gpu,
     }
     h3_gpu_tensor_free(input);
     h3_gpu_tensor_free(output);
+}
+
+static void test_output_major_tile_parity(h3_gpu *gpu,
+                                          const h3_gpu_tensor *weight,
+                                          const h3_gpu_tensor *scales,
+                                          const int8_t *weight_values) {
+    uint16_t input_values[INPUT_ELEMENTS];
+    for (size_t index = 0; index < INPUT_ELEMENTS; index++)
+        input_values[index] = bf16(
+            (float)((int)(index % 29u) - 14) / 32.0f);
+    h3_gpu_tensor *input = h3_gpu_tensor_from_bf16(
+        gpu, input_values, INPUT_ELEMENTS);
+    h3_gpu_tensor *portable = h3_gpu_tensor_new_bf16(
+        gpu, OUTPUT_ELEMENTS);
+    h3_gpu_tensor *retuned = h3_gpu_tensor_new_bf16(
+        gpu, OUTPUT_ELEMENTS);
+    int8_t transposed[WEIGHT_ELEMENTS];
+    for (size_t output = 0; output < ROWS; output++)
+        for (size_t input_column = 0; input_column < COLUMNS; input_column++)
+            transposed[input_column * ROWS + output] =
+                weight_values[output * COLUMNS + input_column];
+    h3_gpu_tensor *input_major_weight = h3_gpu_tensor_from_i8(
+        gpu, transposed, WEIGHT_ELEMENTS);
+    h3_gpu_tensor *input_major = h3_gpu_tensor_new_bf16(
+        gpu, OUTPUT_ELEMENTS);
+    require(input && portable && retuned && input_major_weight && input_major,
+            "cannot allocate output-major tile parity tensors");
+    require(h3_gpu_begin(gpu) &&
+                h3_gpu_linear_i8_weight_bf16(
+                    gpu, portable, input, weight, scales, NULL,
+                    ACTIVATION_ROWS, COLUMNS, ROWS) &&
+                h3_gpu_linear_i8_weight_bf16_square_output_major(
+                    gpu, retuned, input, weight, scales, NULL,
+                    ACTIVATION_ROWS, COLUMNS, ROWS) &&
+                h3_gpu_linear_i8_weight_bf16_square(
+                    gpu, input_major, input, input_major_weight, scales, NULL,
+                    ACTIVATION_ROWS, COLUMNS, ROWS) &&
+                h3_gpu_submit(gpu),
+            "cannot run INT8 layout parity check");
+    uint16_t portable_values[OUTPUT_ELEMENTS];
+    uint16_t retuned_values[OUTPUT_ELEMENTS];
+    uint16_t input_major_values[OUTPUT_ELEMENTS];
+    require(h3_gpu_tensor_read_bf16(
+                portable, portable_values, OUTPUT_ELEMENTS) &&
+                h3_gpu_tensor_read_bf16(
+                    retuned, retuned_values, OUTPUT_ELEMENTS) &&
+                h3_gpu_tensor_read_bf16(
+                    input_major, input_major_values, OUTPUT_ELEMENTS),
+            "cannot read INT8 layout parity results");
+    require(memcmp(portable_values, retuned_values,
+                   sizeof(portable_values)) == 0,
+            "output-major tile changed BF16 output bytes");
+    require(memcmp(portable_values, input_major_values,
+                   sizeof(portable_values)) == 0,
+            "input-major tile changed BF16 output bytes");
+    h3_gpu_tensor_free(input);
+    h3_gpu_tensor_free(portable);
+    h3_gpu_tensor_free(retuned);
+    h3_gpu_tensor_free(input_major_weight);
+    h3_gpu_tensor_free(input_major);
 }
 
 static void submit_portable_int8(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -482,6 +614,20 @@ int main(void) {
     const uint64_t f16_shape[] = {
         sizeof(FIXTURE_F16) / sizeof(*FIXTURE_F16)
     };
+    h3_gpu_tensor *native_f16 = h3_weight_load_f16(
+        store, gpu, "compact.weight", 1, f16_shape, error, sizeof(error));
+    require(native_f16 != NULL &&
+                h3_gpu_tensor_dtype(native_f16) == H3_GPU_F16,
+            "cannot retain native F16 weight");
+    uint16_t actual_f16_bits[
+        sizeof(FIXTURE_F16) / sizeof(*FIXTURE_F16)];
+    require(h3_gpu_tensor_read_f16(
+                native_f16, actual_f16_bits,
+                sizeof(actual_f16_bits) / sizeof(*actual_f16_bits)),
+            "cannot read native F16 weight");
+    require(memcmp(actual_f16_bits, FIXTURE_F16, sizeof(FIXTURE_F16)) == 0,
+            "native F16 checkpoint bits changed during reload");
+    h3_gpu_tensor_free(native_f16);
     h3_gpu_tensor *converted_f16 = h3_weight_load_f16_as_f32(
         store, gpu, "compact.weight", 1, f16_shape, error, sizeof(error));
     require(converted_f16 != NULL, "cannot load F16 weight as F32");
@@ -505,10 +651,12 @@ int main(void) {
             "cannot read F16 checkpoint vector on the host");
     require(memcmp(actual_f16, expected_f16, sizeof(expected_f16)) == 0,
             "host F16 vector conversion changed values");
-
     test_portable_int8_linear(gpu, loaded_weight, loaded_scale,
                               expected_weights, expected_scales);
+    test_output_major_tile_parity(
+        gpu, loaded_weight, loaded_scale, expected_weights);
     test_convrot_bf16(gpu);
+    test_native_f16_linear_parity(gpu);
     benchmark_portable_int8(gpu);
 
     h3_gpu_tensor *wrong_dtype = h3_weight_load_i8(

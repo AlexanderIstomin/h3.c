@@ -34,10 +34,13 @@ h3_gpu_tensor *h3_weight_load_f32(const h3_weight_store *store, h3_gpu *gpu,
                                   const char *name, int ndim,
                                   const uint64_t *shape,
                                   char *error, size_t error_size);
+h3_gpu_tensor *h3_weight_load_f16(const h3_weight_store *store, h3_gpu *gpu,
+                                  const char *name, int ndim,
+                                  const uint64_t *shape,
+                                  char *error, size_t error_size);
 
-/* Compact checkpoints store their small AdaLN projections as IEEE F16. Load
- * those tensors into F32 GPU storage so the existing portable F32 linear path
- * can consume them without introducing a second 16-bit GPU dtype. */
+/* Load IEEE F16 checkpoint tensors into F32 GPU storage when the consumer
+ * needs the portable all-F32 path. */
 h3_gpu_tensor *h3_weight_load_f16_as_f32(
     const h3_weight_store *store, h3_gpu *gpu, const char *name, int ndim,
     const uint64_t *shape, char *error, size_t error_size);

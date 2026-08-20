@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -808,6 +809,68 @@ static void h3_dit_progress_bridge(const char *phase, int completed, int total,
     h3_progress_emit(opaque, phase, completed, total);
 }
 
+typedef struct {
+    const char *weight_directory;
+    int latent_height;
+    int latent_width;
+    int enabled;
+    int attempted;
+    int started;
+    pthread_t thread;
+    h3_video_vae_decoder *decoder;
+    char error[512];
+} h3_video_decoder_prefetch;
+
+static void *h3_video_decoder_prefetch_main(void *opaque) {
+    h3_video_decoder_prefetch *prefetch = opaque;
+    prefetch->decoder = h3_video_vae_decoder_load(
+        prefetch->weight_directory, "h3_shaders.metal",
+        prefetch->latent_height, prefetch->latent_width,
+        NULL, NULL, prefetch->error, sizeof(prefetch->error));
+    return NULL;
+}
+
+static void h3_video_decoder_prefetch_start(
+        h3_video_decoder_prefetch *prefetch) {
+    if (!prefetch || !prefetch->enabled || prefetch->attempted) return;
+    prefetch->attempted = 1;
+    int status = pthread_create(
+        &prefetch->thread, NULL, h3_video_decoder_prefetch_main, prefetch);
+    if (!status) {
+        prefetch->started = 1;
+    } else {
+        snprintf(prefetch->error, sizeof(prefetch->error),
+                 "cannot start video VAE prefetch: %s", strerror(status));
+    }
+}
+
+static void h3_video_decoder_prefetch_join(
+        h3_video_decoder_prefetch *prefetch) {
+    if (!prefetch || !prefetch->started) return;
+    pthread_join(prefetch->thread, NULL);
+    prefetch->started = 0;
+}
+
+static int h3_video_decoder_prefetch_configured(const h3_ctx *ctx) {
+    const char *setting = getenv("H3_VAE_PREFETCH");
+    if (setting && *setting) return !strcmp(setting, "1");
+    return ctx && ctx->device.physical_memory >=
+        UINT64_C(32) * 1024u * 1024u * 1024u;
+}
+
+typedef struct {
+    h3_generation_progress *generation;
+    h3_video_decoder_prefetch *prefetch;
+} h3_denoise_progress;
+
+static void h3_denoise_progress_bridge(const char *phase, int completed,
+                                        int total, void *opaque) {
+    h3_denoise_progress *progress = opaque;
+    if (!strcmp(phase, "denoise") && total > 0 && completed == total - 1)
+        h3_video_decoder_prefetch_start(progress->prefetch);
+    h3_progress_emit(progress->generation, phase, completed, total);
+}
+
 /* Reference media goes through the system frameworks first, so no external
  * tool is needed for the formats a macOS user is likely to supply, and falls
  * back to FFmpeg for the containers they decline, such as Matroska. The
@@ -1145,6 +1208,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     h3_generation_progress progress = {ctx, params, 0};
+    h3_video_decoder_prefetch decoder_prefetch;
+    memset(&decoder_prefetch, 0, sizeof(decoder_prefetch));
     h3_temporal_shape temporal = h3_temporal(params->frames);
     int latent_w, latent_h;
     h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
@@ -1276,6 +1341,15 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
+    decoder_prefetch.enabled = h3_video_decoder_prefetch_configured(ctx) &&
+        !params->preview_denoise &&
+        !params->audio_only && (ctx->cache_enabled || params->still_frame_only) &&
+        !(ctx->cache_enabled && ctx->video_decoder &&
+          ctx->video_decoder_key &&
+          !strcmp(ctx->video_decoder_key, decoder_key));
+    decoder_prefetch.weight_directory = vae_path;
+    decoder_prefetch.latent_height = latent_h;
+    decoder_prefetch.latent_width = latent_w;
     char detail[512];
     if (conditioning_hit) {
         size_t cached_reference_count = 0;
@@ -1923,9 +1997,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    h3_denoise_progress denoise_progress = {
+        .generation = &progress,
+        .prefetch = &decoder_prefetch
+    };
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
-            h3_dit_progress_bridge, &progress,
+            h3_denoise_progress_bridge, &denoise_progress,
             preview_decoder || preview_tae ? h3_deliver_denoise_preview : NULL,
             preview_decoder || preview_tae ? &live_preview : NULL,
             detail, sizeof(detail))) {
@@ -1941,6 +2019,33 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     if (!dit_is_cached) h3_dit_free(dit);
     dit = NULL;
     if (progress.cancelled) goto cleanup;
+    if (decoder_prefetch.attempted) {
+        h3_progress_emit(&progress, "video VAE load", 0, 36);
+        h3_video_decoder_prefetch_join(&decoder_prefetch);
+        if (decoder_prefetch.decoder) {
+            preview_decoder = decoder_prefetch.decoder;
+            decoder_prefetch.decoder = NULL;
+            if (ctx->cache_enabled) {
+                char *key_copy = strdup(decoder_key);
+                if (key_copy) {
+                    ctx->video_decoder = preview_decoder;
+                    ctx->video_decoder_key = key_copy;
+                    decoder_is_cached = 1;
+                    fprintf(stderr,
+                            "h3: prefetched video VAE decoder retained\n");
+                } else {
+                    fprintf(stderr,
+                            "h3: warning: could not retain prefetched video "
+                            "VAE cache key\n");
+                }
+            }
+            h3_progress_emit(&progress, "video VAE load", 36, 36);
+        } else if (decoder_prefetch.error[0]) {
+            fprintf(stderr, "h3: video VAE prefetch unavailable (%s); "
+                    "falling back to synchronous load\n",
+                    decoder_prefetch.error);
+        }
+    }
     if (params->still_frame_only) {
         free(audio);
         audio = NULL;
@@ -2089,6 +2194,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    h3_video_decoder_prefetch_join(&decoder_prefetch);
+    h3_video_vae_decoder_free(decoder_prefetch.decoder);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);
