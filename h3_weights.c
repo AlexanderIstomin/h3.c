@@ -376,15 +376,15 @@ int h3_weight_read_f32_vector(const h3_weight_store *store, const char *name,
     return ok;
 }
 
-int h3_weight_load_i8_linear(const h3_weight_store *store, h3_gpu *gpu,
-                             const char *weight_name, uint64_t rows,
-                             uint64_t columns, h3_gpu_tensor **weight,
-                             h3_gpu_tensor **scales,
-                             char *error, size_t error_size) {
+static int load_i8_linear(const h3_weight_store *store, h3_gpu *gpu,
+                          const char *weight_name, uint64_t stored_rows,
+                          uint64_t stored_columns, uint64_t output_rows,
+                          h3_gpu_tensor **weight, h3_gpu_tensor **scales,
+                          char *error, size_t error_size) {
     if (weight) *weight = NULL;
     if (scales) *scales = NULL;
-    if (!store || !gpu || !weight_name || !*weight_name || !rows ||
-        !columns || !weight || !scales) {
+    if (!store || !gpu || !weight_name || !*weight_name || !stored_rows ||
+        !stored_columns || !output_rows || !weight || !scales) {
         fail(error, error_size, "invalid pre-quantized linear arguments");
         return 0;
     }
@@ -398,17 +398,18 @@ int h3_weight_load_i8_linear(const h3_weight_store *store, h3_gpu *gpu,
     const h3_st_tensor *scale_tensor = h3_weight_find(
         store, scale_name, NULL);
     if (!scale_tensor || scale_tensor->dtype != H3_DTYPE_F32 ||
-        !((scale_tensor->ndim == 1 && scale_tensor->shape[0] == rows) ||
-          (scale_tensor->ndim == 2 && scale_tensor->shape[0] == rows &&
+        !((scale_tensor->ndim == 1 && scale_tensor->shape[0] == output_rows) ||
+          (scale_tensor->ndim == 2 &&
+           scale_tensor->shape[0] == output_rows &&
            scale_tensor->shape[1] == 1))) {
         fail(error, error_size,
              "linear scale has the wrong schema: %s", scale_name);
         free(scale_name);
         return 0;
     }
-    const uint64_t weight_shape[] = {rows, columns};
-    const uint64_t scale_shape_1d[] = {rows};
-    const uint64_t scale_shape_2d[] = {rows, 1};
+    const uint64_t weight_shape[] = {stored_rows, stored_columns};
+    const uint64_t scale_shape_1d[] = {output_rows};
+    const uint64_t scale_shape_2d[] = {output_rows, 1};
     h3_gpu_tensor *loaded_weight = h3_weight_load_i8(
         store, gpu, weight_name, 2, weight_shape, error, error_size);
     h3_gpu_tensor *loaded_scales = NULL;
@@ -427,6 +428,23 @@ int h3_weight_load_i8_linear(const h3_weight_store *store, h3_gpu *gpu,
     *weight = loaded_weight;
     *scales = loaded_scales;
     return 1;
+}
+
+int h3_weight_load_i8_linear(const h3_weight_store *store, h3_gpu *gpu,
+                             const char *weight_name, uint64_t rows,
+                             uint64_t columns, h3_gpu_tensor **weight,
+                             h3_gpu_tensor **scales,
+                             char *error, size_t error_size) {
+    return load_i8_linear(store, gpu, weight_name, rows, columns, rows,
+                          weight, scales, error, error_size);
+}
+
+int h3_weight_load_i8_linear_input_major(
+    const h3_weight_store *store, h3_gpu *gpu, const char *weight_name,
+    uint64_t input_columns, uint64_t output_rows, h3_gpu_tensor **weight,
+    h3_gpu_tensor **scales, char *error, size_t error_size) {
+    return load_i8_linear(store, gpu, weight_name, input_columns, output_rows,
+                          output_rows, weight, scales, error, error_size);
 }
 
 static const char *json_value(const char *json, const char *key) {

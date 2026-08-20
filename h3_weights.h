@@ -61,6 +61,13 @@ int h3_weight_load_i8_linear(const h3_weight_store *store, h3_gpu *gpu,
                              h3_gpu_tensor **scales,
                              char *error, size_t error_size);
 
+/* Load the same quantized linear with its matrix stored as [input, output].
+ * Scales remain per output channel, exactly as in the output-major format. */
+int h3_weight_load_i8_linear_input_major(
+    const h3_weight_store *store, h3_gpu *gpu, const char *weight_name,
+    uint64_t input_columns, uint64_t output_rows, h3_gpu_tensor **weight,
+    h3_gpu_tensor **scales, char *error, size_t error_size);
+
 /* Read the optional Comfy quantization marker next to a linear weight. A
  * result of zero means the stored matrix is not ConvRot; a positive result is
  * the normalized regular-Hadamard group size required on the activation. */

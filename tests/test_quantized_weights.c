@@ -18,6 +18,9 @@ enum {
     ACTIVATION_ROWS = 24,
     INPUT_ELEMENTS = ACTIVATION_ROWS * COLUMNS,
     OUTPUT_ELEMENTS = ACTIVATION_ROWS * ROWS,
+    LOADER_INPUT = 3,
+    LOADER_OUTPUT = 2,
+    LOADER_ELEMENTS = LOADER_INPUT * LOADER_OUTPUT,
     CONVROT_GROUP = 256,
     CONVROT_ROWS = 3,
     CONVROT_ELEMENTS = CONVROT_GROUP * CONVROT_ROWS
@@ -26,6 +29,9 @@ enum {
 static const uint16_t FIXTURE_F16[] = {
     0x0000u, 0x3c00u, 0xc000u, 0x7bffu, 0x0400u, 0x0001u
 };
+
+static const int8_t FIXTURE_INPUT_MAJOR[] = {1, 4, 2, 5, 3, 6};
+static const float FIXTURE_INPUT_MAJOR_SCALES[] = {0.25f, 0.5f};
 
 static void fail(const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
@@ -56,7 +62,10 @@ static void write_quantized_fixture(const char *path, const int8_t *weights,
     size_t weight_bytes = sizeof(int8_t) * WEIGHT_ELEMENTS;
     size_t second_scale = scale_bytes + weight_bytes;
     size_t second_weight = second_scale + scale_bytes;
-    size_t marker_offset = second_weight + weight_bytes;
+    size_t input_major_scale = second_weight + weight_bytes;
+    size_t input_major_weight =
+        input_major_scale + sizeof(FIXTURE_INPUT_MAJOR_SCALES);
+    size_t marker_offset = input_major_weight + sizeof(FIXTURE_INPUT_MAJOR);
     size_t f16_offset = marker_offset + sizeof(quant_marker) - 1;
     int header_bytes = snprintf(
         header, sizeof(header),
@@ -67,6 +76,10 @@ static void write_quantized_fixture(const char *path, const int8_t *weights,
         "\"shape\":[%d,1],\"data_offsets\":[%zu,%zu]},"
         "\"block_2d.weight\":{\"dtype\":\"I8\","
         "\"shape\":[%d,%d],\"data_offsets\":[%zu,%zu]},"
+        "\"compact_input_major.weight_scale\":{\"dtype\":\"F32\","
+        "\"shape\":[%d],\"data_offsets\":[%zu,%zu]},"
+        "\"compact_input_major.weight\":{\"dtype\":\"I8\","
+        "\"shape\":[%d,%d],\"data_offsets\":[%zu,%zu]},"
         "\"block_2d.comfy_quant\":{\"dtype\":\"U8\"," 
         "\"shape\":[%zu],\"data_offsets\":[%zu,%zu]},"
         "\"compact.weight\":{\"dtype\":\"F16\",\"shape\":[%zu],"
@@ -74,7 +87,9 @@ static void write_quantized_fixture(const char *path, const int8_t *weights,
         ROWS, scale_bytes, ROWS, COLUMNS, scale_bytes,
         scale_bytes + weight_bytes, ROWS, second_scale,
         second_scale + scale_bytes, ROWS, COLUMNS, second_weight,
-        second_weight + weight_bytes, sizeof(quant_marker) - 1,
+        second_weight + weight_bytes, LOADER_OUTPUT, input_major_scale,
+        input_major_weight, LOADER_INPUT, LOADER_OUTPUT,
+        input_major_weight, marker_offset, sizeof(quant_marker) - 1,
         marker_offset, marker_offset + sizeof(quant_marker) - 1,
         sizeof(FIXTURE_F16) / sizeof(*FIXTURE_F16), f16_offset,
         f16_offset + sizeof(FIXTURE_F16));
@@ -93,6 +108,9 @@ static void write_quantized_fixture(const char *path, const int8_t *weights,
     write_all(descriptor, weights, weight_bytes);
     write_all(descriptor, scales, scale_bytes);
     write_all(descriptor, weights, weight_bytes);
+    write_all(descriptor, FIXTURE_INPUT_MAJOR_SCALES,
+              sizeof(FIXTURE_INPUT_MAJOR_SCALES));
+    write_all(descriptor, FIXTURE_INPUT_MAJOR, sizeof(FIXTURE_INPUT_MAJOR));
     write_all(descriptor, quant_marker, sizeof(quant_marker) - 1);
     write_all(descriptor, FIXTURE_F16, sizeof(FIXTURE_F16));
     require(close(descriptor) == 0, "cannot close quantized fixture");
@@ -586,6 +604,38 @@ int main(void) {
     require(memcmp(expected_scales, actual_scales,
                    sizeof(expected_scales)) == 0,
             "serialized F32 scales changed during reload");
+
+    h3_gpu_tensor *loaded_input_major_weight = NULL;
+    h3_gpu_tensor *loaded_input_major_scale = NULL;
+    require(!h3_weight_load_i8_linear(
+                store, gpu, "compact_input_major.weight",
+                LOADER_OUTPUT, LOADER_INPUT,
+                &loaded_input_major_weight, &loaded_input_major_scale,
+                error, sizeof(error)),
+            "output-major loader accepted an input-major matrix schema");
+    require(h3_weight_load_i8_linear_input_major(
+                store, gpu, "compact_input_major.weight",
+                LOADER_INPUT, LOADER_OUTPUT,
+                &loaded_input_major_weight, &loaded_input_major_scale,
+                error, sizeof(error)),
+            "input-major linear loader rejected matching weights and scales");
+    int8_t actual_input_major[LOADER_ELEMENTS];
+    float actual_input_major_scales[LOADER_OUTPUT];
+    require(h3_gpu_tensor_read_i8(
+                loaded_input_major_weight, actual_input_major,
+                LOADER_ELEMENTS) &&
+                h3_gpu_tensor_read_f32(
+                    loaded_input_major_scale, actual_input_major_scales,
+                    LOADER_OUTPUT),
+            "cannot read input-major serialized linear");
+    require(memcmp(FIXTURE_INPUT_MAJOR, actual_input_major,
+                   sizeof(FIXTURE_INPUT_MAJOR)) == 0 &&
+                memcmp(FIXTURE_INPUT_MAJOR_SCALES,
+                       actual_input_major_scales,
+                       sizeof(FIXTURE_INPUT_MAJOR_SCALES)) == 0,
+            "input-major serialized linear changed during reload");
+    h3_gpu_tensor_free(loaded_input_major_weight);
+    h3_gpu_tensor_free(loaded_input_major_scale);
 
     h3_gpu_tensor *loaded_weight_2d = NULL;
     h3_gpu_tensor *loaded_scale_2d = NULL;

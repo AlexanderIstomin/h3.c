@@ -648,25 +648,22 @@ interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
 
-Optimized INT8 transformers can optionally use a sibling file containing only
-the 50 FC2 matrices in input-major order. Build it from the H3ddle repository
-root without modifying the original checkpoint:
+Optimized MiniMax H3 INT8 transformers can store all 200 core projections in
+input-major order. Build a separate checkpoint from the H3ddle repository root
+without modifying the original:
 
 ```sh
-python3 -B Scripts/optimize-h3-fc2-sidecar.py /path/to/transformer.safetensors
+python3 -B Scripts/repack-h3-input-major.py /path/to/transformer.safetensors
 ```
 
-The resulting `_fc2_input_major.safetensors` file occupies 3.589 GiB for each
-FL2VA or Ref2VA transformer prepared. It is selected automatically after its
-source size, header fingerprint, format version, and tensor schemas validate.
-H3ddle's managed Turbo packages ship the matching, hash-verified sidecars, so
-their users do not need to run the converter. The script remains useful for
-other compatible optimized checkpoints.
-`H3_DIT_FC2_INPUT_MAJOR=0` restores the original output-major stream; `=1`
-requires the sidecar and is useful for controlled A/B tests. On an M1 Pro, an
-A/B/B/A run of the real 512-class, 50-block forward averaged 34.244 seconds
-without the sidecar and 31.796 seconds with it, a 7.15% reduction. Output hashes
-and tracked 1.487 GiB peak Metal residency were identical.
+The resulting `_input_major.safetensors` file transposes QKV, attention output,
+FC1, and FC2 without dequantizing or changing values. The engine selects the
+layout only after validating its versioned marker and every projection shape.
+On a 32 GiB M1 Pro, a matched FL2VA Turbo 512x512, eight-pass generation cut
+transformer time from 253.9 to 231.4 seconds (8.9%) and total time from 278.7
+to 256.5 seconds. The generated images were identical. The matching Ref2VA
+Turbo 512x896 run cut transformer time from 541.2 to 515.3 seconds (4.8%) and
+total time from 631.4 to 595.9 seconds with good reference output.
 
 ### Metal 4 and TensorOps paths
 
