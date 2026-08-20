@@ -3,6 +3,8 @@
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -11,7 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 /* Casting three operands up and the result back costs time linear in the
  * rows; attention itself is quadratic in them, so the trade turns over as the
@@ -95,6 +99,7 @@ typedef struct {
 struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
+    h3_weight_store *fc2_sidecar;
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
@@ -113,6 +118,7 @@ struct h3_dit {
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
     int ssd_streaming;
+    int input_major_fc2;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -293,7 +299,12 @@ static int dit_int8_linear(h3_gpu *gpu, h3_gpu_tensor *output,
                            const h3_gpu_tensor *weight,
                            const h3_gpu_tensor *scales,
                            const h3_gpu_tensor *bias, uint32_t rows,
-                           uint32_t input_dim, uint32_t output_dim) {
+                           uint32_t input_dim, uint32_t output_dim,
+                           int input_major) {
+    if (input_major)
+        return h3_gpu_linear_i8_weight_bf16_square(
+            gpu, output, input, weight, scales, bias, rows, input_dim,
+            output_dim);
     return use_retuned_tile()
         ? h3_gpu_linear_i8_weight_bf16_square_output_major(
               gpu, output, input, weight, scales, bias, rows, input_dim,
@@ -925,14 +936,179 @@ static int compare_stream_sources(const void *left, const void *right) {
     return a->file_offset > b->file_offset;
 }
 
-static int prepare_stream_source(h3_dit *dit,
+enum { H3_FC2_SIDECAR_VERSION = 1 };
+
+static uint64_t little_u64(const unsigned char bytes[8]) {
+    uint64_t value = 0;
+    for (unsigned index = 0; index < 8; index++)
+        value |= (uint64_t)bytes[index] << (index * 8u);
+    return value;
+}
+
+static uint32_t little_u32(const unsigned char bytes[4]) {
+    uint32_t value = 0;
+    for (unsigned index = 0; index < 4; index++)
+        value |= (uint32_t)bytes[index] << (index * 8u);
+    return value;
+}
+
+static int read_sidecar_marker(const h3_weight_store *store,
+                               const char *name, h3_dtype dtype,
+                               unsigned char *bytes, size_t byte_count,
+                               char *error, size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (!tensor || !header || tensor->dtype != dtype || tensor->ndim != 1 ||
+        tensor->shape[0] != 1 || h3_dtype_size(dtype) != byte_count ||
+        !h3_st_read_data(header, tensor, bytes, byte_count,
+                         error, error_size)) {
+        if (!error || !error[0])
+            fail(error, error_size, "FC2 sidecar marker is invalid: %s", name);
+        return 0;
+    }
+    return 1;
+}
+
+static int safetensors_header_fingerprint(const h3_st_header *header,
+                                          uint64_t *fingerprint,
+                                          char *error, size_t error_size) {
+    if (!header || !header->path || !fingerprint ||
+        header->header_size > SIZE_MAX - 8) {
+        fail(error, error_size, "cannot fingerprint the DiT checkpoint header");
+        return 0;
+    }
+    size_t count = (size_t)header->header_size + 8;
+    unsigned char *bytes = malloc(count);
+    int descriptor = open(header->path, O_RDONLY);
+    if (!bytes || descriptor < 0 ||
+        pread(descriptor, bytes, count, 0) != (ssize_t)count) {
+        fail(error, error_size, "cannot read the DiT checkpoint header: %s",
+             descriptor < 0 ? strerror(errno) : "short read");
+        if (descriptor >= 0) close(descriptor);
+        free(bytes);
+        return 0;
+    }
+    close(descriptor);
+    uint64_t value = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < count; index++) {
+        value ^= bytes[index];
+        value *= UINT64_C(1099511628211);
+    }
+    free(bytes);
+    *fingerprint = value;
+    return 1;
+}
+
+static char *default_fc2_sidecar_path(const char *checkpoint) {
+    static const char suffix[] = ".safetensors";
+    static const char addition[] = "_fc2_input_major.safetensors";
+    if (!checkpoint) return NULL;
+    size_t length = strlen(checkpoint);
+    size_t suffix_length = sizeof(suffix) - 1;
+    if (length <= suffix_length ||
+        strcmp(checkpoint + length - suffix_length, suffix)) return NULL;
+    size_t prefix = length - suffix_length;
+    char *path = malloc(prefix + sizeof(addition));
+    if (!path) return NULL;
+    memcpy(path, checkpoint, prefix);
+    memcpy(path + prefix, addition, sizeof(addition));
+    return path;
+}
+
+static int validate_fc2_sidecar(h3_dit *dit,
+                                const h3_st_header *checkpoint_header,
+                                char *error, size_t error_size) {
+    unsigned char version_bytes[4], size_bytes[8], fingerprint_bytes[8];
+    if (!read_sidecar_marker(
+            dit->fc2_sidecar, "h3.fc2_input_major.version", H3_DTYPE_U32,
+            version_bytes, sizeof(version_bytes), error, error_size) ||
+        !read_sidecar_marker(
+            dit->fc2_sidecar, "h3.fc2_input_major.source_file_size",
+            H3_DTYPE_U64, size_bytes, sizeof(size_bytes), error, error_size) ||
+        !read_sidecar_marker(
+            dit->fc2_sidecar, "h3.fc2_input_major.source_header_fnv1a64",
+            H3_DTYPE_U64, fingerprint_bytes, sizeof(fingerprint_bytes),
+            error, error_size)) return 0;
+    uint64_t checkpoint_fingerprint = 0;
+    if (little_u32(version_bytes) != H3_FC2_SIDECAR_VERSION ||
+        little_u64(size_bytes) != checkpoint_header->file_size ||
+        !safetensors_header_fingerprint(
+            checkpoint_header, &checkpoint_fingerprint, error, error_size) ||
+        little_u64(fingerprint_bytes) != checkpoint_fingerprint) {
+        if (!error || !error[0])
+            fail(error, error_size,
+                 "FC2 sidecar was made for a different DiT checkpoint");
+        return 0;
+    }
+    for (unsigned layer = 0; layer < H3_DIT_BLOCKS; layer++) {
+        char name[128];
+        snprintf(name, sizeof(name), "blocks.%u.mlp.fc2.weight", layer);
+        const h3_st_tensor *tensor = h3_weight_find(
+            dit->fc2_sidecar, name, NULL);
+        if (!tensor || tensor->dtype != H3_DTYPE_I8 || tensor->ndim != 2 ||
+            tensor->shape[0] != FFN || tensor->shape[1] != HIDDEN) {
+            fail(error, error_size,
+                 "FC2 sidecar tensor has the wrong schema: %s", name);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int configure_fc2_sidecar(h3_dit *dit,
+                                 const h3_st_header *checkpoint_header,
+                                 char *error, size_t error_size) {
+    const char *selection = getenv("H3_DIT_FC2_INPUT_MAJOR");
+    const char *override = getenv("H3_DIT_FC2_SIDECAR");
+    int disabled = selection && !strcmp(selection, "0");
+    int required = (selection && *selection && !disabled) ||
+                   (override && *override);
+    if (disabled) return 1;
+    if (!dit->prequantized_int8 || !dit->ssd_streaming) {
+        if (required) {
+            fail(error, error_size,
+                 "FC2 sidecars require an SSD-streamed INT8 DiT");
+            return 0;
+        }
+        return 1;
+    }
+    char *automatic = NULL;
+    const char *path = override && *override ? override :
+        (automatic = default_fc2_sidecar_path(checkpoint_header->path));
+    if (!path) {
+        if (required)
+            fail(error, error_size, "cannot resolve the FC2 sidecar path");
+        free(automatic);
+        return !required;
+    }
+    struct stat status;
+    if (stat(path, &status) != 0) {
+        int missing = errno == ENOENT;
+        if (required || !missing)
+            fail(error, error_size, "cannot inspect FC2 sidecar %s: %s",
+                 path, strerror(errno));
+        free(automatic);
+        return !required && missing;
+    }
+    dit->fc2_sidecar = h3_weight_store_open(path, error, error_size);
+    free(automatic);
+    if (!dit->fc2_sidecar ||
+        !validate_fc2_sidecar(dit, checkpoint_header, error, error_size))
+        return 0;
+    dit->input_major_fc2 = 1;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: input-major FC2 sidecar enabled\n");
+    return 1;
+}
+
+static int prepare_stream_source_from_store(const h3_weight_store *store,
                                  h3_dit_stream_source *source,
                                  const char *name, h3_dtype dtype,
                                  int ndim, const uint64_t *shape,
                                  unsigned field,
                                  char *error, size_t error_size) {
     const h3_st_header *header = NULL;
-    const h3_st_tensor *tensor = h3_weight_find(dit->weights, name, &header);
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
     if (!tensor) {
         fail(error, error_size, "required streaming weight is absent: %s",
              name);
@@ -965,10 +1141,23 @@ static int prepare_stream_source(h3_dit *dit,
     return 1;
 }
 
+static int prepare_stream_source(h3_dit *dit,
+                                 h3_dit_stream_source *source,
+                                 const char *name, h3_dtype dtype,
+                                 int ndim, const uint64_t *shape,
+                                 unsigned field,
+                                 char *error, size_t error_size) {
+    return prepare_stream_source_from_store(
+        dit->weights, source, name, dtype, ndim, shape, field,
+        error, error_size);
+}
+
 static int prepare_prequantized_stream_linear(
                                  h3_dit *dit, h3_dit_stream_layer *stream,
+                                 const h3_weight_store *weight_store,
                                  const char *weight_name,
-                                 uint64_t rows, uint64_t columns,
+                                 uint64_t stored_rows, uint64_t stored_columns,
+                                 uint64_t output_rows,
                                  unsigned weight_field, unsigned scale_field,
                                  uint32_t *convrot_group,
                                  char *error, size_t error_size) {
@@ -976,9 +1165,9 @@ static int prepare_prequantized_stream_linear(
         fail(error, error_size, "too many tensors in DiT stream layer");
         return 0;
     }
-    const uint64_t weight_shape[] = {rows, columns};
-    if (!prepare_stream_source(
-            dit, &stream->sources[stream->count++], weight_name,
+    const uint64_t weight_shape[] = {stored_rows, stored_columns};
+    if (!prepare_stream_source_from_store(
+            weight_store, &stream->sources[stream->count++], weight_name,
             H3_DTYPE_I8, 2, weight_shape, weight_field,
             error, error_size)) return 0;
     char scale_name[192];
@@ -990,11 +1179,11 @@ static int prepare_prequantized_stream_linear(
     }
     const h3_st_tensor *scale = h3_weight_find(
         dit->weights, scale_name, NULL);
-    const uint64_t scale_shape_1d[] = {rows};
-    const uint64_t scale_shape_2d[] = {rows, 1};
+    const uint64_t scale_shape_1d[] = {output_rows};
+    const uint64_t scale_shape_2d[] = {output_rows, 1};
     if (!scale || scale->dtype != H3_DTYPE_F32 ||
-        !((scale->ndim == 1 && scale->shape[0] == rows) ||
-          (scale->ndim == 2 && scale->shape[0] == rows &&
+        !((scale->ndim == 1 && scale->shape[0] == output_rows) ||
+          (scale->ndim == 2 && scale->shape[0] == output_rows &&
            scale->shape[1] == 1)) ||
         !prepare_stream_source(
             dit, &stream->sources[stream->count++], scale_name,
@@ -1019,7 +1208,8 @@ static int prepare_stream_layer(h3_dit *dit, unsigned layer,
 #define I8_SOURCE(suffix, rows, columns, weight_field, scale_field, group) do { \
     snprintf(name, sizeof(name), "blocks.%u.%s", layer, suffix);              \
     if (!prepare_prequantized_stream_linear(                                  \
-            dit, stream, name, rows, columns, weight_field, scale_field,      \
+            dit, stream, dit->weights, name, rows, columns, rows,              \
+            weight_field, scale_field,                                         \
             &dit->blocks[layer].group, error, error_size)) return 0;           \
 } while (0)
         I8_SOURCE("attn.qkv_proj.weight", INNER * 3, HIDDEN,
@@ -1028,8 +1218,16 @@ static int prepare_stream_layer(h3_dit *dit, unsigned layer,
                   STREAM_OUT, STREAM_OUT_SCALES, out_convrot_group);
         I8_SOURCE("mlp.fc1.weight", FFN * 2, HIDDEN,
                   STREAM_FC1, STREAM_FC1_SCALES, fc1_convrot_group);
-        I8_SOURCE("mlp.fc2.weight", HIDDEN, FFN,
-                  STREAM_FC2, STREAM_FC2_SCALES, fc2_convrot_group);
+        snprintf(name, sizeof(name), "blocks.%u.mlp.fc2.weight", layer);
+        if (!prepare_prequantized_stream_linear(
+                dit, stream,
+                dit->input_major_fc2 ? dit->fc2_sidecar : dit->weights,
+                name,
+                dit->input_major_fc2 ? FFN : HIDDEN,
+                dit->input_major_fc2 ? HIDDEN : FFN,
+                HIDDEN, STREAM_FC2, STREAM_FC2_SCALES,
+                &dit->blocks[layer].fc2_convrot_group,
+                error, error_size)) return 0;
 #undef I8_SOURCE
     } else {
 #define SOURCE(suffix, rows, columns, field) do {                               \
@@ -2236,8 +2434,9 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->sigmas = *sigmas;
     dit->weights = h3_weight_store_open(weight_directory, error, error_size);
     if (!dit->weights) goto failed;
+    const h3_st_header *checkpoint_header = NULL;
     const h3_st_tensor *core_qkv = h3_weight_find(
-        dit->weights, "blocks.0.attn.qkv_proj.weight", NULL);
+        dit->weights, "blocks.0.attn.qkv_proj.weight", &checkpoint_header);
     if (!core_qkv || (core_qkv->dtype != H3_DTYPE_BF16 &&
                       core_qkv->dtype != H3_DTYPE_I8)) {
         fail(error, error_size,
@@ -2245,6 +2444,8 @@ static h3_dit *load_dit(const char *weight_directory,
         goto failed;
     }
     dit->prequantized_int8 = core_qkv->dtype == H3_DTYPE_I8;
+    if (!configure_fc2_sidecar(
+            dit, checkpoint_header, error, error_size)) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
@@ -2540,7 +2741,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(dit_int8_linear(
             dit->gpu, dit->qkv, dit->mod_attention,
             weight->qkv_int8, weight->qkv_scales, NULL,
-            rows, HIDDEN, INNER * 3), "DiT pre-quantized QKV projection");
+            rows, HIDDEN, INNER * 3, 0),
+           "DiT pre-quantized QKV projection");
         if (!apply_lora(dit, dit->qkv, dit->mod_attention,
                         weight->qkv_lora_a, weight->qkv_lora_b,
                         rows, HIDDEN, INNER * 3, error, error_size)) return 0;
@@ -2622,7 +2824,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(dit_int8_linear(
             dit->gpu, dit->attention_output, dit->attention_heads,
             weight->out_int8, weight->out_scales, NULL,
-            rows, INNER, HIDDEN),
+            rows, INNER, HIDDEN, 0),
            "DiT pre-quantized attention output");
         if (!apply_lora(dit, dit->attention_output, dit->attention_heads,
                         weight->out_lora_a, weight->out_lora_b,
@@ -2685,7 +2887,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(dit_int8_linear(
             dit->gpu, dit->fc1, dit->mod_mlp,
             weight->fc1_int8, weight->fc1_scales, NULL,
-            rows, HIDDEN, FFN * 2), "DiT pre-quantized MLP input");
+            rows, HIDDEN, FFN * 2, 0),
+           "DiT pre-quantized MLP input");
         if (!apply_lora(dit, dit->fc1, dit->mod_mlp,
                         weight->fc1_lora_a, weight->fc1_lora_b,
                         rows, HIDDEN, FFN * 2, error, error_size)) return 0;
@@ -2700,7 +2903,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(dit_int8_linear(
             dit->gpu, mlp_output, dit->activated,
             weight->fc2_int8, weight->fc2_scales, NULL,
-            rows, FFN, HIDDEN), "DiT pre-quantized MLP output");
+            rows, FFN, HIDDEN, dit->input_major_fc2),
+           "DiT pre-quantized MLP output");
         if (!apply_lora(dit, mlp_output, dit->activated,
                         weight->fc2_lora_a, weight->fc2_lora_b,
                         rows, FFN, HIDDEN, error, error_size)) return 0;
@@ -3865,15 +4069,17 @@ void h3_dit_free(h3_dit *dit) {
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
-                "h3: %s SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
+                "h3: %s%s SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
                 "unhidden wait %.3fs\n",
                 dit->prequantized_int8 ? "I8/F32" : "BF16",
+                dit->input_major_fc2 ? "+FC2-IM" : "",
                 gib, dit->stream_read_seconds,
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
     }
     h3_gpu_free(dit->gpu);
+    h3_weight_store_free(dit->fc2_sidecar);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
     free(dit);

@@ -77,13 +77,21 @@ int main(int argc, char **argv) {
         UINT64_C(1536) * 1024 * 1024)
         fail("optimized VideoVAE retained more than one expanded block");
 
+    uint64_t hash = UINT64_C(1469598103934665603);
+    const unsigned char *bytes = (const unsigned char *)frames.rgb;
+    for (size_t index = 0; index < elements * sizeof(*frames.rgb); index++) {
+        hash ^= bytes[index];
+        hash *= UINT64_C(1099511628211);
+    }
     printf("ok: optimized VideoVAE decoded %d %dx%d frames, %.3f GiB peak "
-           "Metal residency, %.3f GiB cumulative allocations\n",
+           "Metal residency, %.3f GiB cumulative allocations, "
+           "RGB hash %016llx\n",
            frames.frames, frames.width, frames.height,
            (double)frames.gpu_stats.peak_live_bytes /
                (1024.0 * 1024.0 * 1024.0),
            (double)frames.gpu_stats.allocated_bytes /
-               (1024.0 * 1024.0 * 1024.0));
+               (1024.0 * 1024.0 * 1024.0),
+           (unsigned long long)hash);
     h3_video_frames_free(&frames);
     return 0;
 }

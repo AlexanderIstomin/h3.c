@@ -555,6 +555,26 @@ requested canvas geometry, minimizing repeated overlap work while keeping peak
 storage bounded. `H3_VAE_TILE_PIXELS=256` restores the original conservative
 tile plan for close-reference diagnosis.
 
+On machines where the fp16 video VAE cannot safely remain resident, streamed
+decoding is layer-major across spatial tiles: one decoder block is loaded and
+run over every retained tile state before the next block is read. The math and
+tile stitching are unchanged. A production-auto-tile 512x512x22 M1 Pro oracle
+used four 288-pixel tiles, reduced block loads from 144 to 36 and decode wall
+time from 63.44 to 29.48 seconds (2.15x), with byte-identical RGB. It used
+53.3 MiB of additional live state; extra tile states are capped at 256 MiB and
+larger canvases are processed in batches. Resident decoding is unaffected.
+`H3_VAE_LAYER_MAJOR=0` restores the tile-major streaming order for exact A/B
+diagnosis.
+
+Large IEEE-F16 video-VAE projection matrices remain in their checkpoint dtype
+and are widened explicitly to F32 inside MPSGraph before multiplication. Inputs,
+biases, accumulation and outputs remain F32, and small shapes retain the legacy
+direct Metal dispatch. A cold 512x512x22 M1 Pro app A/B reduced VAE load from
+10.9 to 2.5 seconds while decode stayed at 23.0/23.1 seconds; the images were
+visually identical, and a local full-frame oracle was byte-identical. Peak
+Metal residency in that oracle fell from 9.454 to 4.942 GiB.
+`H3_VAE_NATIVE_F16=0` restores expanded F32 projection storage.
+
 ### Weight residency and streamed prompt encoding
 
 On M5-class GPUs, persistent transformer weights are mapped directly from their
@@ -570,6 +590,13 @@ layer on pre-M5 and two on M5, read large matrices uncached, and gather only
 the prompt's rows from the BF16 embedding table. `H3_QWEN_PREFETCH=0` restores
 the single-layer synchronous reference path; values 1-8 select the worker
 count, and `H3_QWEN_PREFETCH_DEPTH=1` through `6` overrides the ring depth.
+Optimized prompts of at least 24 tokens also use the existing 64x40
+output-major INT8 tile for Qwen projections; shorter prompts retain the 8x8
+tile that wins at very small row counts. Both kernels preserve the same BF16
+bytes. On M1 Pro, an order-balanced complete 50-layer run at 32 tokens fell
+from 6.67 to 5.76 seconds (13.7%) with identical final embedding hashes and
+unchanged 0.914 GiB peak residency. `H3_QWEN_TILE=0` restores the 8x8 path for
+exact A/B diagnosis.
 
 ### Prequantized checkpoint compatibility
 
@@ -605,10 +632,9 @@ layers, two full denoiser evaluations, both VAEs, and FFmpeg muxing into a
 generation. Visual-reference conditioning is still rejected because this
 package has no adapted Ref2VA/vision path.
 
-The VideoVAE's bounded path rereads the transformer for every spatial or
-temporal tile, which trades throughput for compatibility on 16/32 GB Macs.
-Native F16 execution or a layer-major cross-tile schedule can remove that
-traffic later.
+The VideoVAE remains bounded for compatibility on 16/32 GB Macs. Its streamed
+layer-major schedule removes repeated transformer reads across spatial tiles
+without requiring full decoder residency.
 
 `--ssd-streaming` is a separate, more aggressive residency mode for a released
 BF16 DiT and is automatic for optimized I8/F32 packages. Only small per-block
@@ -621,6 +647,26 @@ The first active block is prefetched again during the final block, so a cached
 interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
+
+Optimized INT8 transformers can optionally use a sibling file containing only
+the 50 FC2 matrices in input-major order. Build it from the H3ddle repository
+root without modifying the original checkpoint:
+
+```sh
+python3 -B Scripts/optimize-h3-fc2-sidecar.py /path/to/transformer.safetensors
+```
+
+The resulting `_fc2_input_major.safetensors` file occupies 3.589 GiB for each
+FL2VA or Ref2VA transformer prepared. It is selected automatically after its
+source size, header fingerprint, format version, and tensor schemas validate.
+H3ddle's managed Turbo packages ship the matching, hash-verified sidecars, so
+their users do not need to run the converter. The script remains useful for
+other compatible optimized checkpoints.
+`H3_DIT_FC2_INPUT_MAJOR=0` restores the original output-major stream; `=1`
+requires the sidecar and is useful for controlled A/B tests. On an M1 Pro, an
+A/B/B/A run of the real 512-class, 50-block forward averaged 34.244 seconds
+without the sidecar and 31.796 seconds with it, a 7.15% reduction. Output hashes
+and tracked 1.487 GiB peak Metal residency were identical.
 
 ### Metal 4 and TensorOps paths
 

@@ -28,13 +28,16 @@ static float bf16_to_f32(uint16_t value) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2 || argc > 3) {
-        fprintf(stderr, "usage: %s MODEL_ROOT [LAYERS]\n", argv[0]);
+    if (argc < 2 || argc > 4) {
+        fprintf(stderr, "usage: %s MODEL_ROOT [LAYERS [TOKENS]]\n", argv[0]);
         return 2;
     }
-    int layers = argc == 3 ? atoi(argv[2]) : 1;
+    int layers = argc >= 3 ? atoi(argv[2]) : 1;
     if (layers < 1 || layers > QWEN_LAYERS)
         fail("layer count must be in [1, 50]");
+    int token_count = argc == 4 ? atoi(argv[3]) : 2;
+    if (token_count < 1 || token_count > 512)
+        fail("token count must be in [1, 512]");
     size_t path_size = strlen(argv[1]) + 128;
     char *path = malloc(path_size);
     if (!path) fail("cannot allocate optimized Qwen path");
@@ -44,42 +47,59 @@ int main(int argc, char **argv) {
     if (length < 0 || (size_t)length >= path_size)
         fail("optimized Qwen path is too long");
 
-    /* Two ordinary vocabulary rows exercise causal attention while keeping the
-     * full 50-layer residency probe quick enough for local development. */
-    const uint32_t ids[] = {0, 1};
+    /* Ordinary vocabulary rows exercise causal attention. Two rows keep the
+     * default 50-layer residency probe quick; an explicit count also covers
+     * production-size prompt projection paths. */
+    uint32_t *ids = malloc((size_t)token_count * sizeof(*ids));
+    if (!ids) fail("cannot allocate token IDs");
+    for (int index = 0; index < token_count; index++)
+        ids[index] = (uint32_t)(index % 151936);
     char error[512];
     h3_text_embedding embedding;
     if (!h3_text_encode_layers_bf16(
-            path, "h3_shaders.metal", ids, sizeof(ids) / sizeof(*ids), layers,
+            path, "h3_shaders.metal", ids, (size_t)token_count, layers,
             progress, NULL, &embedding, error, sizeof(error))) {
         fprintf(stderr, "FAIL: optimized Qwen encoding failed: %s\n", error);
         return 1;
     }
-    if (embedding.tokens != sizeof(ids) / sizeof(*ids) ||
+    if (embedding.tokens != (size_t)token_count ||
         embedding.width != QWEN_WIDTH || !embedding.values)
         fail("optimized Qwen output has the wrong shape");
     size_t count = embedding.tokens * embedding.width;
     double square_sum = 0.0;
+    uint64_t hash = UINT64_C(1469598103934665603);
     for (size_t index = 0; index < count; index++) {
         float value = bf16_to_f32(embedding.values[index]);
         if (!isfinite(value)) fail("optimized Qwen output is not finite");
         square_sum += (double)value * (double)value;
+        hash ^= embedding.values[index] & UINT16_C(0xff);
+        hash *= UINT64_C(1099511628211);
+        hash ^= embedding.values[index] >> 8;
+        hash *= UINT64_C(1099511628211);
     }
     if (!(square_sum > 0.0)) fail("optimized Qwen output is all zero");
 
-    uint64_t peak_limit = layers == 1 ?
-        UINT64_C(650) * 1024 * 1024 :
-        UINT64_C(1300) * 1024 * 1024;
+    int prefetch_depth = 1;
+    const char *depth_value = getenv("H3_QWEN_PREFETCH_DEPTH");
+    if (depth_value && *depth_value) {
+        prefetch_depth = atoi(depth_value);
+        if (prefetch_depth < 1) prefetch_depth = 1;
+        if (prefetch_depth > 6) prefetch_depth = 6;
+    }
+    uint64_t peak_limit = (uint64_t)(layers == 1 ? 1 : prefetch_depth + 1) *
+        UINT64_C(650) * 1024 * 1024;
     if (embedding.gpu_stats.peak_live_bytes >= peak_limit)
         fail("optimized Qwen retained more than the bounded layer ring");
     printf("ok: %d optimized Qwen layer%s, %.3f GiB peak Metal residency, "
-           "%.3f GiB cumulative allocations\n",
+           "%.3f GiB cumulative allocations, output hash %016llx\n",
            layers, layers == 1 ? "" : "s",
            (double)embedding.gpu_stats.peak_live_bytes /
                (1024.0 * 1024.0 * 1024.0),
            (double)embedding.gpu_stats.allocated_bytes /
-               (1024.0 * 1024.0 * 1024.0));
+               (1024.0 * 1024.0 * 1024.0),
+           (unsigned long long)hash);
     h3_text_embedding_free(&embedding);
+    free(ids);
     free(path);
     return 0;
 }

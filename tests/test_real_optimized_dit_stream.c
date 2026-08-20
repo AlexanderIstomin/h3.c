@@ -32,6 +32,16 @@ static uint16_t bf16(float value) {
     return (uint16_t)(bits >> 16);
 }
 
+static uint64_t hash_bytes(const void *data, size_t bytes) {
+    const uint8_t *values = data;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (size_t index = 0; index < bytes; index++) {
+        hash ^= values[index];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 static void progress(const char *phase, int completed, int total,
                      void *opaque) {
     (void)opaque;
@@ -114,10 +124,15 @@ int main(int argc, char **argv) {
         fail("cannot read optimized DiT GPU statistics");
     if (stats.peak_live_bytes >= UINT64_C(4) * 1024 * 1024 * 1024)
         fail("optimized DiT exceeded the bounded two-layer stream");
+    uint64_t video_hash = hash_bytes(video_velocity, sizeof(video_velocity));
+    uint64_t audio_hash = hash_bytes(audio_velocity, sizeof(audio_velocity));
     printf("ok: optimized 50-layer DiT forward, %.3f GiB peak Metal "
-           "residency, %.3f GiB cumulative allocations\n",
+           "residency, %.3f GiB cumulative allocations, hashes video "
+           "%016llx audio %016llx\n",
            (double)stats.peak_live_bytes / (1024.0 * 1024.0 * 1024.0),
-           (double)stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0));
+           (double)stats.allocated_bytes / (1024.0 * 1024.0 * 1024.0),
+           (unsigned long long)video_hash,
+           (unsigned long long)audio_hash);
 
     h3_dit_free(dit);
     h3_layout_free(&layout);
