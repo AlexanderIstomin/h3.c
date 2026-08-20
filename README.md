@@ -665,6 +665,16 @@ to 256.5 seconds. The generated images were identical. The matching Ref2VA
 Turbo 512x896 run cut transformer time from 541.2 to 515.3 seconds (4.8%) and
 total time from 631.4 to 595.9 seconds with good reference output.
 
+For compact Ref2VA experiments, the loader also accepts a versioned overlay at
+`diffusion_models/minimax_h3_ref2va_pruned_int8_convrot_hybrid_adaln_25_49.safetensors`.
+It keeps the FL2VA checkpoint as the base and reads Ref2VA's compact AdaLN
+weight and bias only for blocks 25 through 49. If the full Ref2VA checkpoint is
+present, set `H3_REF2VA_HYBRID=1` to select the overlay; if the full checkpoint
+is absent, the overlay is selected automatically. Markers and every tensor
+shape are checked before Metal initialization. The 41.53 MiB Turbo overlay
+replaces a 20.97 GB reference transformer, but intentionally changes the image
+and does not make the transformer core faster.
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and

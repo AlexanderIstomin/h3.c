@@ -99,6 +99,7 @@ typedef struct {
 struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
+    h3_weight_store *late_adaln_overlay;
     h3_dit_schedule *schedule;
     int fused_mlp;
     int nax_mlp;
@@ -118,6 +119,7 @@ struct h3_dit {
     int use_int8_row_fc2;
     int ssd_streaming;
     int input_major_transformer;
+    int hybrid_adaln;
     int keep_bf16_mlp;
     int activation_aliases;
     int fused_patch_projection;
@@ -1034,6 +1036,105 @@ static int configure_input_major_transformer(h3_dit *dit,
     dit->input_major_transformer = 1;
     if (getenv("H3_PROFILE"))
         fprintf(stderr, "h3: full input-major DiT checkpoint enabled\n");
+    return 1;
+}
+
+enum {
+    H3_HYBRID_ADALN_VERSION = 1,
+    H3_HYBRID_ADALN_FIRST_BLOCK = 25,
+    H3_HYBRID_ADALN_BLOCK_COUNT = 25,
+    H3_HYBRID_ADALN_TIME_DIM = 8
+};
+
+static int read_u32_marker(const h3_weight_store *store, const char *name,
+                           uint32_t *value, char *error,
+                           size_t error_size) {
+    unsigned char bytes[4];
+    if (!read_singleton_marker(store, name, H3_DTYPE_U32, bytes,
+                               sizeof(bytes), error, error_size)) return 0;
+    *value = little_u32(bytes);
+    return 1;
+}
+
+static int validate_hybrid_adaln_tensor(const h3_weight_store *store,
+                                        unsigned block, const char *suffix,
+                                        int ndim, const uint64_t *shape,
+                                        char *error, size_t error_size) {
+    char name[160];
+    int length = snprintf(name, sizeof(name),
+                          "blocks.%u.adaln_proj.linear.%s", block, suffix);
+    if (length < 0 || (size_t)length >= sizeof(name)) {
+        fail(error, error_size, "hybrid AdaLN tensor name is too long");
+        return 0;
+    }
+    const h3_st_tensor *tensor = h3_weight_find(store, name, NULL);
+    if (!tensor || tensor->dtype != H3_DTYPE_F16 || tensor->ndim != ndim) {
+        fail(error, error_size,
+             "hybrid AdaLN tensor has the wrong schema: %s", name);
+        return 0;
+    }
+    for (int dimension = 0; dimension < ndim; dimension++) {
+        if (tensor->shape[dimension] != shape[dimension]) {
+            fail(error, error_size,
+                 "hybrid AdaLN tensor has the wrong schema: %s", name);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int configure_hybrid_adaln(h3_dit *dit, const char *overlay_path,
+                                  char *error, size_t error_size) {
+    if (!overlay_path || !*overlay_path) return 1;
+    const h3_st_tensor *table = h3_weight_find(
+        dit->weights, "adaln_t_table", NULL);
+    if (!table || table->dtype != H3_DTYPE_F32 || table->ndim != 2 ||
+        table->shape[0] < 2 || table->shape[1] != H3_HYBRID_ADALN_TIME_DIM) {
+        fail(error, error_size,
+             "hybrid AdaLN requires a compact FL2VA base checkpoint");
+        return 0;
+    }
+    dit->late_adaln_overlay = h3_weight_store_open(
+        overlay_path, error, error_size);
+    if (!dit->late_adaln_overlay) return 0;
+    uint32_t version = 0, first_block = 0, block_count = 0;
+    if (!read_u32_marker(
+            dit->late_adaln_overlay, "h3.hybrid_adaln.version", &version,
+            error, error_size) ||
+        !read_u32_marker(
+            dit->late_adaln_overlay, "h3.hybrid_adaln.first_block",
+            &first_block, error, error_size) ||
+        !read_u32_marker(
+            dit->late_adaln_overlay, "h3.hybrid_adaln.block_count",
+            &block_count, error, error_size) ||
+        version != H3_HYBRID_ADALN_VERSION ||
+        first_block != H3_HYBRID_ADALN_FIRST_BLOCK ||
+        block_count != H3_HYBRID_ADALN_BLOCK_COUNT) {
+        if (!error || !error[0])
+            fail(error, error_size,
+                 "hybrid AdaLN checkpoint has an unsupported recipe");
+        return 0;
+    }
+    const uint64_t weight_shape[] = {
+        H3_DIT_MODALITIES * H3_DIT_ADALN_SLOTS * H3_DIT_HIDDEN,
+        H3_HYBRID_ADALN_TIME_DIM
+    };
+    const uint64_t bias_shape[] = {
+        H3_DIT_MODALITIES * H3_DIT_ADALN_SLOTS * H3_DIT_HIDDEN
+    };
+    for (unsigned block = first_block;
+         block < first_block + block_count; block++) {
+        if (!validate_hybrid_adaln_tensor(
+                dit->late_adaln_overlay, block, "weight", 2, weight_shape,
+                error, error_size) ||
+            !validate_hybrid_adaln_tensor(
+                dit->late_adaln_overlay, block, "bias", 1, bias_shape,
+                error, error_size)) return 0;
+    }
+    dit->hybrid_adaln = 1;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr,
+                "h3: FL2VA core + Ref2VA AdaLN blocks 25-49 enabled\n");
     return 1;
 }
 
@@ -2298,6 +2399,7 @@ static void schedule_report(int completed, int total, void *opaque) {
 }
 
 static h3_dit *load_dit(const char *weight_directory,
+                        const char *adaln_overlay_path,
                         const char *shader_source_path,
                         const h3_text_embedding *text,
                         const h3_layout *layout,
@@ -2381,6 +2483,8 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->prequantized_int8 = core_qkv->dtype == H3_DTYPE_I8;
     if (!configure_input_major_transformer(dit, error, error_size))
         goto failed;
+    if (!configure_hybrid_adaln(
+            dit, adaln_overlay_path, error, error_size)) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
@@ -2428,9 +2532,12 @@ static h3_dit *load_dit(const char *weight_directory,
     report(progress, progress_opaque, "refine text", 1, 1);
     schedule_progress schedule_state = {progress, progress_opaque};
     dit->schedule = h3_dit_schedule_precompute(
-        dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
+        dit->weights, dit->late_adaln_overlay, dit->gpu, sigmas,
+        dit->video_condition_rows != 0,
         dit->audio_condition_rows != 0, schedule_report, &schedule_state,
         error, error_size);
+    h3_weight_store_free(dit->late_adaln_overlay);
+    dit->late_adaln_overlay = NULL;
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
@@ -2486,8 +2593,8 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          float lora_strength,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
-                    active_blocks, core_reuse_interval, token_reduction,
+    return load_dit(weight_directory, NULL, shader_source_path, text, layout,
+                    sigmas, active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
                     use_slower_bf16_mlp, use_slower_bf16_qkv,
@@ -2507,6 +2614,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
 
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
+                         const char *adaln_overlay_path,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
@@ -2535,7 +2643,8 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_audio_elements,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
-    return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+    return load_dit(weight_directory, adaln_overlay_path, shader_source_path,
+                    text, layout, sigmas,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -4004,16 +4113,18 @@ void h3_dit_free(h3_dit *dit) {
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
-                "h3: %s%s SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
+                "h3: %s%s%s SSD stream %.3f GiB read in %.3fs (%.3f GiB/s), "
                 "unhidden wait %.3fs\n",
                 dit->prequantized_int8 ? "I8/F32" : "BF16",
                 dit->input_major_transformer ? "+IM" : "",
+                dit->hybrid_adaln ? "+HYBRID" : "",
                 gib, dit->stream_read_seconds,
                 dit->stream_read_seconds > 0.0
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
     }
     h3_gpu_free(dit->gpu);
+    h3_weight_store_free(dit->late_adaln_overlay);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
     free(dit);

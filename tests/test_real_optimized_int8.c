@@ -124,7 +124,7 @@ static void validate_compact_schedule(h3_weight_store *store, h3_gpu *gpu,
     require(h3_schedule_build(2, &sigmas),
             "cannot build compact AdaLN test schedule");
     h3_dit_schedule *schedule = h3_dit_schedule_precompute(
-        store, gpu, &sigmas, 0, 0, NULL, NULL, error, error_size);
+        store, NULL, gpu, &sigmas, 0, 0, NULL, NULL, error, error_size);
     if (!schedule) {
         fprintf(stderr, "FAIL: compact AdaLN precompute failed: %s\n", error);
         exit(1);

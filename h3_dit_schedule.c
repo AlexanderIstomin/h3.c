@@ -353,7 +353,8 @@ static int compact_projection(
 }
 
 h3_dit_schedule *h3_dit_schedule_precompute(
-    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_weight_store *weights,
+    const h3_weight_store *late_adaln_overlay, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
     int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
@@ -384,6 +385,8 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     if (!time) goto failed;
 
     for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        const h3_weight_store *block_weights =
+            late_adaln_overlay && block >= 25 ? late_adaln_overlay : weights;
         char weight_name[128], bias_name[128], operation[128];
         snprintf(weight_name, sizeof(weight_name),
                  "blocks.%u.adaln_proj.linear.weight", block);
@@ -394,7 +397,7 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
         if (compact) {
             if (!schedule->blocks[block] || !compact_projection(
-                    weights, gpu, time, schedule->time_rows, weight_name,
+                    block_weights, gpu, time, schedule->time_rows, weight_name,
                     bias_name, BLOCK_OUTPUT, schedule->blocks[block],
                     operation, error, error_size)) {
                 if ((!error || !*error) && !schedule->blocks[block])
@@ -409,10 +412,10 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             continue;
         }
         h3_gpu_tensor *weight = weight_bf16_2d(
-            weights, gpu, weight_name, BLOCK_OUTPUT, H3_DIT_TIME_DIM,
+            block_weights, gpu, weight_name, BLOCK_OUTPUT, H3_DIT_TIME_DIM,
             error, error_size);
         h3_gpu_tensor *bias = weight_bf16_1d(
-            weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
+            block_weights, gpu, bias_name, BLOCK_OUTPUT, error, error_size);
         if (!weight || !bias || !schedule->blocks[block]) {
             if (!error || !*error)
                 fail(error, error_size, "cannot allocate AdaLN block %u: %s",

@@ -47,9 +47,11 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 
-/* Load FL2VA/Ref2VA packing. Condition inputs are already patchified F32 row
- * sources: visual rows have width 96 and audio rows width 32. Their element
- * counts must exactly match layout.img_cond_rows/audio_cond_rows. */
+/* Load FL2VA/Ref2VA packing. adaln_overlay_path may point at the validated
+ * compact Ref2VA blocks-25-through-49 overlay while weight_directory remains
+ * the FL2VA base. Condition inputs are already patchified F32 row sources:
+ * visual rows have width 96 and audio rows width 32. Their element counts must
+ * exactly match layout.img_cond_rows/audio_cond_rows. */
 /* Enables TE-Speed style block caching: gated denoising steps run only a
  * warm prefix of the transformer blocks and replay the cached tail residual.
  * Call after load; refuses core reuse and token reduction combinations. */
@@ -58,6 +60,7 @@ int h3_dit_set_block_cache(h3_dit *dit, int enabled,
 
 h3_dit *h3_dit_load_conditioned(
                          const char *weight_directory,
+                         const char *adaln_overlay_path,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,

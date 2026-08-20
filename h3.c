@@ -26,6 +26,14 @@
 
 static char h3_global_error[512];
 
+static const char h3_optimized_fl_transformer[] =
+    "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+static const char h3_optimized_ref_transformer[] =
+    "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors";
+static const char h3_optimized_hybrid_adaln[] =
+    "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot_"
+    "hybrid_adaln_25_49.safetensors";
+
 typedef struct {
     char *text;
     size_t length;
@@ -168,7 +176,8 @@ failed:
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
                              int render_width, int render_height,
-                             int ssd_streaming) {
+                             int ssd_streaming,
+                             const char *hybrid_overlay_path) {
     h3_key key = {0};
     if (!h3_key_append(
             &key,
@@ -193,7 +202,8 @@ static char *h3_prepared_key(const char *conditioning,
             params->use_slower_scalar_qkv_rms,
             params->use_slower_uncached_int8_scales,
             params->use_slower_dynamic_fc1_k,
-            params->use_slower_grouped_quantizer)) {
+            params->use_slower_grouped_quantizer) ||
+        !h3_key_file(&key, "hybrid-adaln", hybrid_overlay_path)) {
         free(key.text);
         return NULL;
     }
@@ -453,8 +463,6 @@ static int h3_probe_released(const char *root, h3_model_info *model,
 
 static int h3_probe_optimized_int8(const char *root, h3_model_info *model,
                                    char *error, size_t error_size) {
-    static const char transformer[] =
-        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
     static const char text_encoder[] =
         "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
     /* Either video decoder satisfies the package: the int8 ConvRot file is a
@@ -469,11 +477,12 @@ static int h3_probe_optimized_int8(const char *root, h3_model_info *model,
     const char *video_vae = has_int8 ? video_vae_int8 : video_vae_fp16;
     static const char audio_vae[] =
         "vae/minimax_h3_audio_vae_fp32.safetensors";
-    if (!h3_require_root_file(root, transformer, error, error_size) ||
+    if (!h3_require_root_file(root, h3_optimized_fl_transformer,
+                              error, error_size) ||
         !h3_require_root_file(root, text_encoder, error, error_size) ||
         !h3_require_root_file(root, video_vae, error, error_size) ||
         !h3_require_root_file(root, audio_vae, error, error_size) ||
-        !h3_inventory_root(root, transformer, 1,
+        !h3_inventory_root(root, h3_optimized_fl_transformer, 1,
                            &model->fl2va_transformer, error, error_size) ||
         !h3_inventory_root(root, text_encoder, 1,
                            &model->text_encoder, error, error_size) ||
@@ -484,14 +493,19 @@ static int h3_probe_optimized_int8(const char *root, h3_model_info *model,
     /* Ordered references need the companion Ref2VA checkpoint. A package
      * without it is still complete for every other mode, so its absence rules
      * out that one mode rather than the package. */
-    static const char ref_transformer[] =
-        "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors";
-    char *ref_path = h3_path(root, ref_transformer);
+    char *ref_path = h3_path(root, h3_optimized_ref_transformer);
+    char *hybrid_path = h3_path(root, h3_optimized_hybrid_adaln);
     int has_ref2va = ref_path && h3_is_file(ref_path);
+    int has_hybrid = hybrid_path && h3_is_file(hybrid_path);
     free(ref_path);
-    if (has_ref2va && !h3_inventory_root(root, ref_transformer, 1,
-                                         &model->ref2va_transformer,
-                                         error, error_size)) return 0;
+    free(hybrid_path);
+    const char *reference_component = has_ref2va ?
+        h3_optimized_ref_transformer :
+        (has_hybrid ? h3_optimized_hybrid_adaln : NULL);
+    if (reference_component &&
+        !h3_inventory_root(root, reference_component, 1,
+                           &model->ref2va_transformer,
+                           error, error_size)) return 0;
     model->layout = H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE;
     model->generation_supported = 1;
     return 1;
@@ -509,8 +523,7 @@ int h3_probe_model_dir(const char *model_dir, h3_model_info *model,
     char *released_marker = h3_path(
         model_dir, "FL2VA/transformer/config.json");
     char *optimized_marker = h3_path(
-        model_dir,
-        "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors");
+        model_dir, h3_optimized_fl_transformer);
     if (!released_marker || !optimized_marker) {
         free(released_marker);
         free(optimized_marker);
@@ -1267,10 +1280,21 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *text_path = h3_path(ctx->model_dir, optimized ?
         "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors" :
         (ref2va ? "Ref2VA/text_encoder" : "FL2VA/text_encoder"));
+    char *full_ref_path = optimized && ref2va ?
+        h3_path(ctx->model_dir, h3_optimized_ref_transformer) : NULL;
+    char *hybrid_overlay_path = optimized && ref2va ?
+        h3_path(ctx->model_dir, h3_optimized_hybrid_adaln) : NULL;
+    int full_ref_available = full_ref_path && h3_is_file(full_ref_path);
+    int hybrid_available = hybrid_overlay_path &&
+                           h3_is_file(hybrid_overlay_path);
+    const char *hybrid_setting = getenv("H3_REF2VA_HYBRID");
+    int hybrid_requested = hybrid_setting && *hybrid_setting &&
+                           strcmp(hybrid_setting, "0");
+    int use_hybrid = optimized && ref2va && hybrid_available &&
+                     (hybrid_requested || !full_ref_available);
     char *dit_path = h3_path(ctx->model_dir, optimized ?
-        (ref2va
-            ? "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
-            : "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors") :
+        (use_hybrid || !ref2va ? h3_optimized_fl_transformer :
+                                 h3_optimized_ref_transformer) :
         (ref2va ? "Ref2VA/transformer" : "FL2VA/transformer"));
     /* Decoder choice when a package carries both. The int8 ConvRot file is a
      * drop-in replacement and an early 256-square measurement suggested it was
@@ -1301,10 +1325,19 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         "vae/minimax_h3_audio_vae_fp32.safetensors" :
         (ref2va ? "Ref2VA/audio_vae" : "FL2VA/audio_vae"));
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
-        !audio_vae_path) {
+        !audio_vae_path || (optimized && ref2va &&
+                            (!full_ref_path || !hybrid_overlay_path))) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
     }
+    if (optimized && ref2va && hybrid_requested && !hybrid_available) {
+        h3_set_error(ctx,
+            "H3_REF2VA_HYBRID requested, but the hybrid AdaLN overlay is missing");
+        goto cleanup;
+    }
+    if (use_hybrid && getenv("H3_PROFILE"))
+        fprintf(stderr,
+                "h3: hybrid Ref2VA uses the FL2VA transformer core\n");
     conditioning_key = h3_conditioning_key(
         prompt, params, render_width, render_height, ref2va);
     if (!conditioning_key) {
@@ -1313,7 +1346,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     prepared_key = h3_prepared_key(
         conditioning_key, params, render_width, render_height,
-        dit_ssd_streaming);
+        dit_ssd_streaming, use_hybrid ? hybrid_overlay_path : NULL);
     if (!prepared_key) {
         h3_set_error(ctx, "out of memory constructing prepared-model cache key");
         goto cleanup;
@@ -1860,7 +1893,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         fprintf(stderr, "h3: prepared DiT cache hit\n");
     } else if (conditioned) {
         dit = h3_dit_load_conditioned(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, use_hybrid ? hybrid_overlay_path : NULL,
+            "h3_shaders.metal", &text, &layout, &sigmas,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             dit_ssd_streaming,
@@ -2200,6 +2234,7 @@ cleanup:
     free(prepared_key);
     free(decoder_key);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
+    free(full_ref_path); free(hybrid_overlay_path);
     free(audio_vae_path);
     h3_tokenizer_free(tokenizer);
     h3_tokenizer_ids_free(ids);

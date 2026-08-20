@@ -386,12 +386,20 @@ static void test_optimized_model_probe(void) {
 
     h3_ctx *context = h3_load_dir(root);
     CHECK(context != NULL);
-    h3_params params = H3_PARAMS_DEFAULT;
-    params.first_frame = "/tmp/h3-unused-reference.ppm";
-    CHECK(h3_generate(context, "test prompt", &params) == NULL);
-    CHECK(strstr(h3_last_error(context),
-                 "currently supports prompt-only FL2VA generation") != NULL);
+    CHECK(h3_model(context)->layout ==
+          H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE);
     h3_free(context);
+
+    char hybrid[768];
+    CHECK(snprintf(
+        hybrid, sizeof(hybrid), "%s/diffusion_models/"
+        "minimax_h3_ref2va_pruned_int8_convrot_"
+        "hybrid_adaln_25_49.safetensors", root) > 0);
+    write_probe_fixture(hybrid, "h3.hybrid_adaln.version");
+    CHECK(h3_probe_model_dir(root, &model, error, sizeof(error)));
+    CHECK(model.ref2va_transformer.files == 1 &&
+          model.ref2va_transformer.tensors == 1);
+    CHECK(unlink(hybrid) == 0);
 
     CHECK(unlink(paths[3]) == 0);
     CHECK(!h3_probe_model_dir(root, &model, error, sizeof(error)));

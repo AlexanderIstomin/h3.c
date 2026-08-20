@@ -23,7 +23,8 @@ typedef void (*h3_dit_schedule_progress)(int completed_blocks,
  * projection at a time, so a 498 MiB block projection is released before the
  * next is loaded. */
 h3_dit_schedule *h3_dit_schedule_precompute(
-    const h3_weight_store *weights, h3_gpu *gpu,
+    const h3_weight_store *weights,
+    const h3_weight_store *late_adaln_overlay, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
     int audio_condition,
     h3_dit_schedule_progress progress, void *progress_opaque,
