@@ -32,6 +32,34 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
                               const float *video_latent,
                               size_t video_elements, void *opaque);
 
+typedef struct {
+    int next_step;
+    int last_evaluated;
+    int previous_evaluated;
+    const float *last_video_velocity;
+    const float *last_audio_velocity;
+    const float *previous_video_velocity;
+    const float *previous_audio_velocity;
+} h3_dit_euler_resume;
+
+typedef struct {
+    int total_steps;
+    int next_step;
+    int last_evaluated;
+    int previous_evaluated;
+    size_t video_count;
+    size_t audio_count;
+    const float *video;
+    const float *audio;
+    const float *last_video_velocity;
+    const float *last_audio_velocity;
+    const float *previous_video_velocity;
+    const float *previous_audio_velocity;
+} h3_dit_euler_checkpoint_state;
+
+typedef int (*h3_dit_checkpoint)(
+    const h3_dit_euler_checkpoint_state *state, void *opaque);
+
 /* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
  * happen before the persistent core is loaded. SSD streaming retains only the
  * small block norms and two alternating matrix slots (BF16, or I8 plus F32
@@ -144,6 +172,19 @@ int h3_dit_denoise_euler(h3_dit *dit, float *video_latent,
 int h3_dit_denoise_euler_preview(
                          h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
+                         h3_dit_progress progress, void *progress_opaque,
+                         h3_dit_preview preview, void *preview_opaque,
+                         char *error, size_t error_size);
+
+/* Crash-recovery variant. `resume` restores a completed Euler boundary and
+ * `checkpoint` observes later completed boundaries. The ordinary API above
+ * remains the zero-state wrapper. */
+int h3_dit_denoise_euler_resume(
+                         h3_dit *dit, float *video_latent,
+                         float *audio_latent, int reuse_interval,
+                         const h3_dit_euler_resume *resume,
+                         h3_dit_checkpoint checkpoint,
+                         void *checkpoint_opaque,
                          h3_dit_progress progress, void *progress_opaque,
                          h3_dit_preview preview, void *preview_opaque,
                          char *error, size_t error_size);

@@ -161,6 +161,11 @@ typedef struct {
     /* Encode the source soundtrack as clean target-row conditioning and mux
      * its original PCM into the result. */
     int preserve_source_audio;
+    /* Optional crash-safe denoiser recovery. The caller owns both strings for
+     * the duration of h3_generate. fingerprint must be a lowercase SHA-256 of
+     * every immutable generation input; stale or corrupt files are ignored. */
+    const char *checkpoint_path;
+    const char *checkpoint_fingerprint;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;

@@ -1,4 +1,5 @@
 #include "h3_host.h"
+#include "h3_checkpoint.h"
 #include "h3_dit.h"
 #include "h3_metal.h"
 #include "h3_safetensors.h"
@@ -535,6 +536,74 @@ static void test_terminal_zoom(void) {
     CHECK(!h3_terminal_display_dimensions(INT32_MAX, 1, &width, &height));
 }
 
+static void test_checkpoint_round_trip(void) {
+    char path[] = "/tmp/h3-checkpoint-test-XXXXXX";
+    int placeholder = mkstemp(path);
+    CHECK(placeholder >= 0);
+    CHECK(close(placeholder) == 0);
+    CHECK(unlink(path) == 0);
+    const char fingerprint[] =
+        "0123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef";
+    const char other_fingerprint[] =
+        "1123456789abcdef0123456789abcdef"
+        "0123456789abcdef0123456789abcdef";
+    float video[] = {1.0f, 2.0f, 3.0f};
+    float audio[] = {4.0f, 5.0f};
+    float last_video[] = {6.0f, 7.0f, 8.0f};
+    float last_audio[] = {9.0f, 10.0f};
+    float previous_video[] = {11.0f, 12.0f, 13.0f};
+    float previous_audio[] = {14.0f, 15.0f};
+    h3_checkpoint_state source = {
+        .total_steps = 8,
+        .next_step = 4,
+        .reuse_interval = 2,
+        .last_evaluated = 3,
+        .previous_evaluated = 1,
+        .video_count = 3,
+        .audio_count = 2,
+        .video = video,
+        .audio = audio,
+        .last_video_velocity = last_video,
+        .last_audio_velocity = last_audio,
+        .previous_video_velocity = previous_video,
+        .previous_audio_velocity = previous_audio
+    };
+    char detail[256];
+    CHECK(h3_checkpoint_save(path, fingerprint, &source,
+                             detail, sizeof(detail)));
+    struct stat status;
+    CHECK(stat(path, &status) == 0);
+    CHECK((status.st_mode & 0777) == 0600);
+
+    h3_checkpoint_state loaded = {0};
+    CHECK(!h3_checkpoint_load(path, other_fingerprint, 8, 2, 3, 2,
+                              &loaded, detail, sizeof(detail)));
+    CHECK(!loaded.video && !loaded.audio);
+    CHECK(h3_checkpoint_load(path, fingerprint, 8, 2, 3, 2,
+                             &loaded, detail, sizeof(detail)));
+    CHECK(loaded.next_step == 4);
+    CHECK(!memcmp(loaded.video, video, sizeof(video)));
+    CHECK(!memcmp(loaded.audio, audio, sizeof(audio)));
+    CHECK(!memcmp(loaded.last_video_velocity, last_video,
+                  sizeof(last_video)));
+    CHECK(!memcmp(loaded.previous_audio_velocity, previous_audio,
+                  sizeof(previous_audio)));
+    h3_checkpoint_state_free(&loaded);
+
+    int corrupt = open(path, O_WRONLY);
+    CHECK(corrupt >= 0);
+    CHECK(lseek(corrupt, -1, SEEK_END) >= 0);
+    unsigned char byte = 0xff;
+    CHECK(write(corrupt, &byte, 1) == 1);
+    CHECK(close(corrupt) == 0);
+    CHECK(!h3_checkpoint_load(path, fingerprint, 8, 2, 3, 2,
+                              &loaded, detail, sizeof(detail)));
+    CHECK(!loaded.video && !loaded.audio);
+    h3_checkpoint_remove(path);
+    CHECK(access(path, F_OK) != 0);
+}
+
 int main(void) {
     test_temporal_and_canvas();
     test_schedule();
@@ -549,6 +618,7 @@ int main(void) {
     test_dit_row_conversions();
     test_metal_probe();
     test_terminal_zoom();
+    test_checkpoint_round_trip();
     printf("ok: %d checks\n", tests_run);
     return 0;
 }

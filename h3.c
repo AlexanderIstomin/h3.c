@@ -1,5 +1,6 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
+#include "h3_checkpoint.h"
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_inpaint.h"
@@ -797,6 +798,26 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
             "reuse, or token reduction");
         return 0;
     }
+    int has_checkpoint_path = params->checkpoint_path &&
+                              *params->checkpoint_path;
+    int has_checkpoint_fingerprint = params->checkpoint_fingerprint &&
+                                     *params->checkpoint_fingerprint;
+    if (has_checkpoint_path != has_checkpoint_fingerprint ||
+        (params->checkpoint_path && !*params->checkpoint_path) ||
+        (params->checkpoint_fingerprint &&
+         !*params->checkpoint_fingerprint)) {
+        h3_set_error(ctx,
+            "checkpoint recovery requires both a path and a fingerprint");
+        return 0;
+    }
+    if (has_checkpoint_path &&
+        (params->core_reuse > 1 || params->block_cache ||
+         params->token_reduction || has_source_video)) {
+        h3_set_error(ctx,
+            "checkpoint recovery requires exact core execution without "
+            "token reduction, block caching, or video inpainting");
+        return 0;
+    }
     if (params->reference_count && !params->references) {
         h3_set_error(ctx, "reference_count is nonzero but references is NULL");
         return 0;
@@ -948,6 +969,46 @@ typedef struct {
     const char *phase_prefix;
     int prefetch_on_final_step;
 } h3_denoise_progress;
+
+typedef struct {
+    const char *path;
+    const char *fingerprint;
+    int reuse_interval;
+    int warned;
+} h3_denoise_checkpoint;
+
+static int h3_denoise_checkpoint_write(
+        const h3_dit_euler_checkpoint_state *source, void *opaque) {
+    h3_denoise_checkpoint *checkpoint = opaque;
+    h3_checkpoint_state state = {
+        .total_steps = source->total_steps,
+        .next_step = source->next_step,
+        .reuse_interval = checkpoint->reuse_interval,
+        .last_evaluated = source->last_evaluated,
+        .previous_evaluated = source->previous_evaluated,
+        .video_count = source->video_count,
+        .audio_count = source->audio_count,
+        .video = (float *)source->video,
+        .audio = (float *)source->audio,
+        .last_video_velocity = (float *)source->last_video_velocity,
+        .last_audio_velocity = (float *)source->last_audio_velocity,
+        .previous_video_velocity = (float *)source->previous_video_velocity,
+        .previous_audio_velocity = (float *)source->previous_audio_velocity
+    };
+    char detail[512];
+    if (!h3_checkpoint_save(checkpoint->path, checkpoint->fingerprint,
+                            &state, detail, sizeof(detail))) {
+        /* Recovery is insurance, not part of image arithmetic. A transient
+         * disk failure must not throw away a render already in progress; the
+         * previous atomically committed boundary remains usable. */
+        if (!checkpoint->warned) {
+            fprintf(stderr, "h3: warning: checkpoint disabled (%s)\n",
+                    detail[0] ? detail : "unknown write error");
+            checkpoint->warned = 1;
+        }
+    }
+    return 0;
+}
 
 static void h3_denoise_progress_bridge(const char *phase, int completed,
                                         int total, void *opaque) {
@@ -1350,6 +1411,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_tae *preview_tae = NULL;
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
+    h3_checkpoint_state checkpoint_state;
+    memset(&checkpoint_state, 0, sizeof(checkpoint_state));
     float *video = NULL, *audio = NULL;
     float *audio_refine_noise = NULL;
     float *audio_refine_frozen_video = NULL;
@@ -2299,14 +2362,60 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_seed(&audio_rng, params->seed);
     h3_rng_fill_normal(&video_rng, video, video_count);
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
+    h3_dit_euler_resume resume_state;
+    memset(&resume_state, 0, sizeof(resume_state));
+    const h3_dit_euler_resume *resume = NULL;
+    h3_denoise_checkpoint checkpoint_writer = {
+        .path = params->checkpoint_path,
+        .fingerprint = params->checkpoint_fingerprint,
+        .reuse_interval = params->denoise_reuse,
+        .warned = 0
+    };
+    h3_dit_checkpoint checkpoint_callback = NULL;
+    if (params->checkpoint_path) {
+        char checkpoint_detail[512];
+        checkpoint_callback = h3_denoise_checkpoint_write;
+        if (h3_checkpoint_load(
+                params->checkpoint_path, params->checkpoint_fingerprint,
+                params->steps, params->denoise_reuse,
+                video_count, audio_count, &checkpoint_state,
+                checkpoint_detail, sizeof(checkpoint_detail))) {
+            memcpy(video, checkpoint_state.video,
+                   video_count * sizeof(*video));
+            memcpy(audio, checkpoint_state.audio,
+                   audio_count * sizeof(*audio));
+            resume_state.next_step = checkpoint_state.next_step;
+            resume_state.last_evaluated = checkpoint_state.last_evaluated;
+            resume_state.previous_evaluated =
+                checkpoint_state.previous_evaluated;
+            resume_state.last_video_velocity =
+                checkpoint_state.last_video_velocity;
+            resume_state.last_audio_velocity =
+                checkpoint_state.last_audio_velocity;
+            resume_state.previous_video_velocity =
+                checkpoint_state.previous_video_velocity;
+            resume_state.previous_audio_velocity =
+                checkpoint_state.previous_audio_velocity;
+            resume = &resume_state;
+            fprintf(stderr, "h3: resumed checkpoint at denoise step %d/%d\n",
+                    resume_state.next_step, params->steps);
+            h3_progress_emit(&progress, "resume checkpoint",
+                             resume_state.next_step, params->steps);
+        } else if (checkpoint_detail[0]) {
+            fprintf(stderr, "h3: ignoring checkpoint (%s)\n",
+                    checkpoint_detail);
+        }
+    }
     h3_denoise_progress denoise_progress = {
         .generation = &progress,
         .prefetch = &decoder_prefetch,
         .phase_prefix = NULL,
         .prefetch_on_final_step = !params->audio_refine_steps
     };
-    if (!h3_dit_denoise_euler_preview(
+    if (!h3_dit_denoise_euler_resume(
             dit, video, audio, params->denoise_reuse,
+            resume, checkpoint_callback,
+            params->checkpoint_path ? &checkpoint_writer : NULL,
             h3_denoise_progress_bridge, &denoise_progress,
             preview_decoder || preview_tae ? h3_deliver_denoise_preview : NULL,
             preview_decoder || preview_tae ? &live_preview : NULL,
@@ -2610,6 +2719,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->fps = H3_FPS;
     result->sample_rate = waveform.sample_rate;
     result->seed = params->seed;
+    if (params->checkpoint_path)
+        h3_checkpoint_remove(params->checkpoint_path);
 
 cleanup:
     h3_video_decoder_prefetch_join(&decoder_prefetch);
@@ -2656,6 +2767,7 @@ cleanup:
     free(audio_refine_noise);
     free(audio_refine_frozen_video);
     free(audio_refine_video_rows);
+    h3_checkpoint_state_free(&checkpoint_state);
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);
