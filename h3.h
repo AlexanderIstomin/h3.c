@@ -147,16 +147,37 @@ typedef struct {
      * released linear serving grid. Step-distilled turbo checkpoints are
      * trained against this spacing. */
     int use_beta_schedule;
+    /* Optional exact audio-only refinement after joint video/audio denoising.
+     * The finished video latent is frozen, audio is re-noised to the 0.5
+     * denoise tail, and this many uncached full transformer passes run. */
+    int audio_refine_steps;
+    /* Ref2VA masked video inpainting. Both paths are required together. The
+     * source is decoded on H3's 24 fps clock; a still mask is held for the
+     * whole clip and a video mask follows that same clock. White regenerates,
+     * black preserves. Ordered references remain the semantic conditioning. */
+    const char *source_video;
+    const char *inpaint_mask;
+    int inpaint_mask_is_video;
+    /* Encode the source soundtrack as clean target-row conditioning and mux
+     * its original PCM into the result. */
+    int preserve_source_audio;
     h3_frame_callback on_frame;
     h3_progress_callback on_progress;
     void *callback_opaque;
 } h3_params;
 
 #define H3_PARAMS_DEFAULT { \
-    H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
-    UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, \
-    NULL, 1.0f, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    .width = H3_DEFAULT_WIDTH, \
+    .height = H3_DEFAULT_HEIGHT, \
+    .frames = H3_DEFAULT_FRAMES, \
+    .steps = H3_DEFAULT_STEPS, \
+    .seed = UINT64_C(42), \
+    .reference_image_size = H3_REFERENCE_IMAGE_MATCH, \
+    .denoise_reuse = 1, \
+    .dit_layers = H3_DEFAULT_DIT_LAYERS, \
+    .core_reuse = 1, \
+    .lora_strength = 1.0f, \
+    .preserve_source_audio = 1 \
 }
 
 typedef struct {

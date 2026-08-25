@@ -1653,7 +1653,7 @@ int main(int argc, char **argv) {
             NULL, 0.0f,
             video_condition,
             video_condition_elements, audio_condition,
-            audio_condition_elements, NULL, NULL, error, sizeof(error));
+            audio_condition_elements, NULL, NULL, NULL, error, sizeof(error));
         free(video_condition);
         free(audio_condition);
     } else {

@@ -134,6 +134,7 @@
 @interface H3GPUShared : NSObject
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLLibrary> library;
+@property(nonatomic, strong) id<MTLLibrary> solLibrary;
 @property(nonatomic, strong) NSDictionary<NSString *, id<MTLComputePipelineState>> *pipelines;
 @property(nonatomic) BOOL tensorOpsEnabled;
 @property(nonatomic) NSUInteger tensorOpsMode;
@@ -270,6 +271,57 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
         return nil;
     }
 
+    /* Sol-Attn is kept in a separate source/library: its template-heavy Metal
+     * compiles slowly, and ordinary image workloads never need it. Release
+     * builds may provide a sibling metallib; source remains the portable
+     * fallback used by local engine builds. */
+    const char *solFlag = getenv("H3_SOL_ATTN");
+    BOOL wantsSol = solFlag && *solFlag && strcmp(solFlag, "0");
+    NSString *shader_directory = [source_path stringByDeletingLastPathComponent];
+    NSString *sol_source_path = [shader_directory
+        stringByAppendingPathComponent:@"h3_sol_attention.metal"];
+    NSString *sol_metallib_path = h3_gpu_metallib_path(sol_source_path);
+    NSError *solError = nil;
+    if (wantsSol && [files isReadableFileAtPath:sol_metallib_path]) {
+        shared.solLibrary = [shared.device
+            newLibraryWithURL:[NSURL fileURLWithPath:sol_metallib_path]
+                        error:&solError];
+    }
+    if (wantsSol && !shared.solLibrary &&
+        [files isReadableFileAtPath:sol_source_path]) {
+        NSString *solSource = [NSString stringWithContentsOfFile:sol_source_path
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:&solError];
+        if (solSource) {
+            MTLCompileOptions *solOptions = [[MTLCompileOptions alloc] init];
+            solOptions.mathMode = MTLMathModeSafe;
+            shared.solLibrary = [shared.device newLibraryWithSource:solSource
+                                                             options:solOptions
+                                                               error:&solError];
+        }
+    }
+    if (wantsSol && !shared.solLibrary &&
+        ([files isReadableFileAtPath:sol_source_path] ||
+         [files isReadableFileAtPath:sol_metallib_path])) {
+        const char *strict = getenv("H3_SOL_ATTN_STRICT");
+        if (strict && *strict && strcmp(strict, "0")) {
+            if (error && error_size) {
+                const char *description =
+                    solError.localizedDescription.UTF8String;
+                snprintf(error, error_size, "cannot compile %s: %s",
+                         sol_source_path.UTF8String,
+                         description ? description : "unknown error");
+            }
+            return nil;
+        }
+        if (getenv("H3_PROFILE")) {
+            const char *description = solError.localizedDescription.UTF8String;
+            fprintf(stderr,
+                    "h3: Sol-Attn unavailable (%s); using dense attention\n",
+                    description ? description : "compile failed");
+        }
+    }
+
     NSMutableArray<NSString *> *names = [@[
         @"h3_linear_f32", @"h3_linear_f32_tiled",
         @"h3_linear_f32_tiled_bf16", @"h3_silu_f32",
@@ -387,6 +439,48 @@ static H3GPUShared *h3_gpu_load_shared(NSString *source_path, char *error,
             return nil;
         }
         pipelines[name] = pipeline;
+    }
+    if (shared.solLibrary) {
+        const char *strictFlag = getenv("H3_SOL_ATTN_STRICT");
+        BOOL strictSol = strictFlag && *strictFlag && strcmp(strictFlag, "0");
+        NSArray<NSString *> *solNames = @[
+            @"h3_sol_reduce_summaries_bf16_d128",
+            @"h3_sol_k_stats_bf16",
+            @"h3_sol_thresholds_bf16",
+            @"h3_sol_route_mask_debug_bf16_d128",
+            @"h3_sol_attn_tiled_bf16_d128_bq64"
+        ];
+        for (NSString *name in solNames) {
+            id<MTLFunction> function =
+                [shared.solLibrary newFunctionWithName:name];
+            NSError *pipelineError = nil;
+            id<MTLComputePipelineState> pipeline = function ?
+                [shared.device newComputePipelineStateWithFunction:function
+                                                              error:&pipelineError] : nil;
+            if (!pipeline) {
+                if (strictSol) {
+                    if (error && error_size) {
+                        const char *description =
+                            pipelineError.localizedDescription.UTF8String;
+                        snprintf(error, error_size, "cannot build %s: %s",
+                                 name.UTF8String,
+                                 description ? description : "function missing");
+                    }
+                    return nil;
+                }
+                if (getenv("H3_PROFILE")) {
+                    const char *description =
+                        pipelineError.localizedDescription.UTF8String;
+                    fprintf(stderr,
+                            "h3: Sol-Attn pipeline %s unavailable (%s); "
+                            "using dense attention\n",
+                            name.UTF8String,
+                            description ? description : "function missing");
+                }
+                break;
+            }
+            pipelines[name] = pipeline;
+        }
     }
     shared.pipelines = pipelines;
     return shared;
@@ -696,6 +790,12 @@ int h3_gpu_has_int8_mlp(const h3_gpu *opaque) {
     if (!opaque) return 0;
     H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
     return gpu.tensorOpsEnabled;
+}
+
+int h3_gpu_has_sol_attention(const h3_gpu *opaque) {
+    if (!opaque) return 0;
+    H3GPU *gpu = GPU((h3_gpu *)(void *)opaque);
+    return gpu.pipelines[@"h3_sol_attn_tiled_bf16_d128_bq64"] != nil;
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_new(h3_gpu *opaque, const void *values,
@@ -3383,6 +3483,219 @@ int h3_gpu_flash_attention_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     h3_gpu_stats stats = gpu.stats;
     stats.direct_dispatches++;
     gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_sol_attention_bf16(
+                                h3_gpu *opaque, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value,
+                                h3_gpu_tensor *query_centroids,
+                                h3_gpu_tensor *key_centroids,
+                                h3_gpu_tensor *value_sums,
+                                h3_gpu_tensor *key_means,
+                                h3_gpu_tensor *key_variances,
+                                h3_gpu_tensor *thresholds,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t sink_tokens,
+                                float scale, float tau,
+                                int head_major_output) {
+    H3GPU *gpu = GPU(opaque);
+    if (head_dim != 128 || !sequence || !heads) return 0;
+    uint32_t blocks = (sequence + 63u) / 64u;
+    uint32_t sink_end = (sink_tokens + 63u) / 64u;
+    if (sink_end < 8u) sink_end = 8u;
+    if (sink_end > blocks) sink_end = blocks;
+    size_t values_count = (size_t)sequence * heads * head_dim;
+    size_t summary_count = (size_t)heads * blocks * head_dim;
+    size_t stats_count = (size_t)heads * head_dim;
+    size_t threshold_count = (size_t)heads * blocks;
+    if (!h3_gpu_require_bf16(gpu, query, values_count, @"Sol query") ||
+        !h3_gpu_require_bf16(gpu, key, values_count, @"Sol key") ||
+        !h3_gpu_require_bf16(gpu, value, values_count, @"Sol value") ||
+        !h3_gpu_require_bf16(gpu, output, values_count, @"Sol output") ||
+        !h3_gpu_require_f32(gpu, query_centroids, summary_count,
+                            @"Sol query centroids") ||
+        !h3_gpu_require_bf16(gpu, key_centroids, summary_count,
+                             @"Sol key centroids") ||
+        !h3_gpu_require_bf16(gpu, value_sums, summary_count,
+                             @"Sol value sums") ||
+        !h3_gpu_require_f32(gpu, key_means, stats_count, @"Sol key means") ||
+        !h3_gpu_require_f32(gpu, key_variances, stats_count,
+                            @"Sol key variances") ||
+        !h3_gpu_require_f32(gpu, thresholds, threshold_count,
+                            @"Sol thresholds") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> summaries = h3_gpu_pipeline(
+        gpu, @"h3_sol_reduce_summaries_bf16_d128");
+    id<MTLComputePipelineState> stats = h3_gpu_pipeline(
+        gpu, @"h3_sol_k_stats_bf16");
+    id<MTLComputePipelineState> threshold = h3_gpu_pipeline(
+        gpu, @"h3_sol_thresholds_bf16");
+    id<MTLComputePipelineState> attention = h3_gpu_pipeline(
+        gpu, @"h3_sol_attn_tiled_bf16_d128_bq64");
+    if (!summaries || !stats || !threshold || !attention ||
+        summaries.maxTotalThreadsPerThreadgroup < 128 ||
+        stats.maxTotalThreadsPerThreadgroup < 128 ||
+        threshold.maxTotalThreadsPerThreadgroup < 128 ||
+        attention.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch Sol attention");
+        return 0;
+    }
+    uint64_t batch_stride = (uint64_t)sequence * heads * head_dim;
+    uint64_t token_stride = (uint64_t)heads * head_dim;
+    uint64_t head_stride = head_dim;
+    uint64_t output_token_stride = head_major_output ?
+        head_dim : token_stride;
+    uint64_t output_head_stride = head_major_output ?
+        (uint64_t)sequence * head_dim : head_stride;
+    uint32_t sink_start = 0;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:summaries];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(query_centroids).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(key_centroids).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(value_sums).buffer offset:0 atIndex:5];
+        [encoder setBytes:&sequence length:sizeof(sequence) atIndex:6];
+        [encoder setBytes:&heads length:sizeof(heads) atIndex:7];
+        [encoder setBytes:&blocks length:sizeof(blocks) atIndex:8];
+        [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:9];
+        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:10];
+        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:11];
+        [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:12];
+        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:13];
+        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:14];
+        [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:15];
+        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:16];
+        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:17];
+        [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * blocks, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:stats];
+        [encoder setBuffer:TENSOR(key_centroids).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key_means).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(key_variances).buffer offset:0 atIndex:2];
+        [encoder setBytes:&blocks length:sizeof(blocks) atIndex:3];
+        [encoder setBytes:&heads length:sizeof(heads) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(heads, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:threshold];
+        [encoder setBuffer:TENSOR(query_centroids).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key_means).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(key_variances).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(thresholds).buffer offset:0 atIndex:3];
+        [encoder setBytes:&blocks length:sizeof(blocks) atIndex:4];
+        [encoder setBytes:&heads length:sizeof(heads) atIndex:5];
+        [encoder setBytes:&scale length:sizeof(scale) atIndex:6];
+        [encoder setBytes:&tau length:sizeof(tau) atIndex:7];
+        [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * blocks, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:attention];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(query_centroids).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(key_centroids).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(value_sums).buffer offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(thresholds).buffer offset:0 atIndex:6];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:7];
+        [encoder setBytes:&scale length:sizeof(scale) atIndex:8];
+        [encoder setBytes:&sequence length:sizeof(sequence) atIndex:9];
+        [encoder setBytes:&heads length:sizeof(heads) atIndex:10];
+        [encoder setBytes:&blocks length:sizeof(blocks) atIndex:11];
+        [encoder setBytes:&sink_start length:sizeof(sink_start) atIndex:12];
+        [encoder setBytes:&sink_end length:sizeof(sink_end) atIndex:13];
+        [encoder setBytes:&sink_start length:sizeof(sink_start) atIndex:14];
+        [encoder setBytes:&sink_end length:sizeof(sink_end) atIndex:15];
+        [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:16];
+        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:17];
+        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:18];
+        [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:19];
+        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:20];
+        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:21];
+        [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:22];
+        [encoder setBytes:&token_stride length:sizeof(token_stride) atIndex:23];
+        [encoder setBytes:&head_stride length:sizeof(head_stride) atIndex:24];
+        [encoder setBytes:&batch_stride length:sizeof(batch_stride) atIndex:25];
+        [encoder setBytes:&output_token_stride
+                   length:sizeof(output_token_stride) atIndex:26];
+        [encoder setBytes:&output_head_stride
+                   length:sizeof(output_head_stride) atIndex:27];
+        uint32_t query_tiles = (sequence + 63u) / 64u;
+        [encoder dispatchThreadgroups:
+            MTLSizeMake((size_t)heads * query_tiles, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats gpuStats = gpu.stats;
+    gpuStats.direct_dispatches += 4;
+    gpu.stats = gpuStats;
+    return 1;
+}
+
+int h3_gpu_sol_attention_routes_bf16(
+                                h3_gpu *opaque, h3_gpu_tensor *routes,
+                                const h3_gpu_tensor *query_centroids,
+                                const h3_gpu_tensor *key_centroids,
+                                const h3_gpu_tensor *thresholds,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t sink_tokens,
+                                float scale) {
+    H3GPU *gpu = GPU(opaque);
+    if (head_dim != 128 || !sequence || !heads) return 0;
+    uint32_t blocks = (sequence + 63u) / 64u;
+    uint32_t sink_end = (sink_tokens + 63u) / 64u;
+    if (sink_end < 8u) sink_end = 8u;
+    if (sink_end > blocks) sink_end = blocks;
+    size_t summary_count = (size_t)heads * blocks * head_dim;
+    size_t threshold_count = (size_t)heads * blocks;
+    if ((size_t)heads > SIZE_MAX / blocks / blocks) return 0;
+    size_t route_count = (size_t)heads * blocks * blocks;
+    if (!h3_gpu_require_f32(gpu, query_centroids, summary_count,
+                            @"Sol route query centroids") ||
+        !h3_gpu_require_bf16(gpu, key_centroids, summary_count,
+                             @"Sol route key centroids") ||
+        !h3_gpu_require_f32(gpu, thresholds, threshold_count,
+                            @"Sol route thresholds") ||
+        !h3_gpu_require_i8(gpu, routes, route_count, @"Sol route mask") ||
+        !h3_gpu_require_command(gpu)) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_sol_route_mask_debug_bf16_d128");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch Sol route diagnostics");
+        return 0;
+    }
+    uint32_t sink_start = 0;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder = [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query_centroids).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key_centroids).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(thresholds).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(routes).buffer offset:0 atIndex:3];
+        [encoder setBytes:&scale length:sizeof(scale) atIndex:4];
+        [encoder setBytes:&heads length:sizeof(heads) atIndex:5];
+        [encoder setBytes:&blocks length:sizeof(blocks) atIndex:6];
+        [encoder setBytes:&sink_start length:sizeof(sink_start) atIndex:7];
+        [encoder setBytes:&sink_end length:sizeof(sink_end) atIndex:8];
+        [encoder setBytes:&sink_start length:sizeof(sink_start) atIndex:9];
+        [encoder setBytes:&sink_end length:sizeof(sink_end) atIndex:10];
+        [encoder dispatchThreadgroups:MTLSizeMake((size_t)heads * blocks, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats gpuStats = gpu.stats;
+    gpuStats.direct_dispatches++;
+    gpu.stats = gpuStats;
     return 1;
 }
 

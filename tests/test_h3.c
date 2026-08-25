@@ -75,6 +75,7 @@ static void test_schedule(void) {
     h3_params defaults = H3_PARAMS_DEFAULT;
     CHECK(defaults.steps == 20);
     CHECK(defaults.use_reference_rope == 0);
+    CHECK(defaults.audio_refine_steps == 0);
 
     h3_sigma_schedule schedule;
     CHECK(h3_schedule_build(20, &schedule));
@@ -120,6 +121,17 @@ static void test_schedule(void) {
     }
     CHECK(!h3_serving_schedule_build(1, &schedule));
     CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
+
+    CHECK(h3_audio_refine_schedule_build(2, &schedule));
+    CHECK(schedule.steps == 2);
+    CHECK(close_enough(schedule.video[0], 12.0 / 13.0, 1e-7));
+    CHECK(close_enough(schedule.audio[0], 3.0 / 4.0, 1e-7));
+    CHECK(close_enough(schedule.video[1], 3.0 / 3.75, 1e-7));
+    CHECK(close_enough(schedule.audio[1], 0.75 / 1.5, 1e-7));
+    CHECK(schedule.video[2] == 0.0f && schedule.audio[2] == 0.0f);
+    CHECK(!h3_audio_refine_schedule_build(0, &schedule));
+    CHECK(!h3_audio_refine_schedule_build(H3_MAX_STEPS / 2 + 1,
+                                          &schedule));
 }
 
 static void test_dit_reuse_schedule(void) {
@@ -443,6 +455,13 @@ static void test_rng_and_solver(void) {
     CHECK(h3_euler_velocity_step(euler, velocity, 2, 0.75f, 0.25f));
     CHECK(euler[0] == 2.0f && euler[1] == 1.0f);
     CHECK(!h3_euler_velocity_step(euler, velocity, 2, 0.25f, 0.25f));
+
+    float clean[] = {4.0f, -2.0f};
+    const float noise[] = {0.0f, 6.0f};
+    CHECK(h3_flow_renoise(clean, noise, 2, 0.75f));
+    CHECK(clean[0] == 1.0f && clean[1] == 4.0f);
+    CHECK(!h3_flow_renoise(clean, noise, 2, -0.1f));
+    CHECK(!h3_flow_renoise(clean, noise, 0, 0.5f));
 }
 
 static void test_rgb_resize(void) {

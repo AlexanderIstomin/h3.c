@@ -53,6 +53,10 @@ const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule);
 int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
                             const h3_layout *layout,
                             const uint8_t *text_tags, size_t text_tag_count,
+                            const uint8_t *video_generate_rows,
+                            size_t video_generate_count,
+                            const uint8_t *audio_generate_rows,
+                            size_t audio_generate_count,
                             uint32_t *rows, size_t row_count);
 
 #endif

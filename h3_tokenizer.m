@@ -351,8 +351,9 @@ static int h3_added_match(H3Tokenizer *tokenizer, NSString *text,
 }
 
 /* The parse, once the bytes are in hand from wherever they came. */
-static h3_tokenizer *h3_tokenizer_from_data(NSData *data, char *error,
-                                            size_t error_size) {
+static h3_tokenizer *h3_tokenizer_from_data(
+        NSData *data, NSDictionary<NSString *, NSNumber *> *extra_tokens,
+        char *error, size_t error_size) {
     @autoreleasepool {
         NSError *json_error = nil;
         NSDictionary *config = [NSJSONSerialization JSONObjectWithData:data
@@ -400,6 +401,9 @@ static h3_tokenizer *h3_tokenizer_from_data(NSData *data, char *error,
         for (NSDictionary *token in added) {
             maximum_id = MAX(maximum_id, [token[@"id"] unsignedIntegerValue]);
         }
+        for (NSNumber *number in extra_tokens.allValues) {
+            maximum_id = MAX(maximum_id, number.unsignedIntegerValue);
+        }
         NSMutableArray *inverse_vocab = [NSMutableArray arrayWithCapacity:maximum_id + 1];
         NSMutableArray *inverse_added = [NSMutableArray arrayWithCapacity:maximum_id + 1];
         for (NSUInteger index = 0; index <= maximum_id; index++) {
@@ -445,6 +449,26 @@ static h3_tokenizer *h3_tokenizer_from_data(NSData *data, char *error,
             NSNumber *identifier = token[@"id"];
             added_tokens[content] = identifier;
             inverse_added[identifier.unsignedIntegerValue] = content;
+        }
+        for (NSString *content in extra_tokens) {
+            NSNumber *identifier = extra_tokens[content];
+            NSNumber *existing_id = added_tokens[content];
+            NSUInteger index = identifier.unsignedIntegerValue;
+            id existing_added = inverse_added[index];
+            id existing_vocab = inverse_vocab[index];
+            if ((existing_id && ![existing_id isEqual:identifier]) ||
+                (existing_added != NSNull.null &&
+                 ![existing_added isEqual:content]) ||
+                (existing_vocab != NSNull.null &&
+                 ![existing_vocab isEqual:content])) {
+                h3_tok_error(error, error_size,
+                    [NSString stringWithFormat:
+                        @"MiniMax H3 token %@ conflicts at ID %@",
+                        content, identifier]);
+                return NULL;
+            }
+            added_tokens[content] = identifier;
+            inverse_added[index] = content;
         }
         tokenizer.addedTokens = added_tokens;
         tokenizer.inverseAddedTokens = inverse_added;
@@ -510,7 +534,39 @@ h3_tokenizer *h3_tokenizer_load(const char *path, char *error,
                          @"cannot read tokenizer: %s", path]);
             return NULL;
         }
-        return h3_tokenizer_from_data(data, error, error_size);
+        return h3_tokenizer_from_data(data, nil, error, error_size);
+    }
+}
+
+h3_tokenizer *h3_tokenizer_load_minimax_h3(const char *path, char *error,
+                                           size_t error_size) {
+    @autoreleasepool {
+        if (error && error_size) error[0] = '\0';
+        if (!path) {
+            h3_tok_error(error, error_size, @"tokenizer path is required");
+            return NULL;
+        }
+        NSData *data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:path]];
+        if (!data) {
+            h3_tok_error(error, error_size, [NSString stringWithFormat:
+                         @"cannot read tokenizer: %s", path]);
+            return NULL;
+        }
+        /* These IDs are fixed by MiniMax-H3's released tokenizer_config.json.
+         * They intentionally are not applied by h3_tokenizer_load(): Z-Image,
+         * Qwen3-TTS and other users share this tokenizer implementation but do
+         * not share H3's added vocabulary. */
+        NSDictionary<NSString *, NSNumber *> *tokens = @{
+            @"<d>": @151669,
+            @"</d>": @151670,
+            @"<|cutoff|>": @151671,
+            @"<|lyrics_start|>": @151672,
+            @"<|lyrics_end|>": @151673,
+            @"<|caption_start|>": @151674,
+            @"<|caption_end|>": @151675,
+        };
+        return h3_tokenizer_from_data(data, tokens, error, error_size);
     }
 }
 
@@ -530,7 +586,7 @@ h3_tokenizer *h3_tokenizer_load_json(const void *bytes, size_t length,
         NSData *data = [NSData dataWithBytesNoCopy:(void *)bytes
                                             length:length
                                       freeWhenDone:NO];
-        return h3_tokenizer_from_data(data, error, error_size);
+        return h3_tokenizer_from_data(data, nil, error, error_size);
     }
 }
 

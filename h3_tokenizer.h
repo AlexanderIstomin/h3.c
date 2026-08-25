@@ -10,6 +10,11 @@ typedef struct h3_tokenizer h3_tokenizer;
 
 h3_tokenizer *h3_tokenizer_load(const char *tokenizer_json,
                                 char *error, size_t error_size);
+/* MiniMax H3 declares seven model-specific tokens in tokenizer_config.json
+ * rather than tokenizer.json. Load the shared Qwen vocabulary and overlay the
+ * fixed IDs from the released H3 tokenizer configuration. */
+h3_tokenizer *h3_tokenizer_load_minimax_h3(const char *tokenizer_json,
+                                           char *error, size_t error_size);
 /* The same, for a tokenizer that arrives as bytes rather than a file: LTX-2.5
  * ships Gemma's inside the text encoder checkpoint. The bytes are not copied
  * and need only outlive the call. */

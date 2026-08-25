@@ -234,6 +234,25 @@ int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule) {
     return 1;
 }
 
+int h3_audio_refine_schedule_build(int evaluations,
+                                   h3_sigma_schedule *schedule) {
+    if (!schedule || evaluations < 1 ||
+        evaluations > H3_MAX_STEPS / 2) return 0;
+    memset(schedule, 0, sizeof(*schedule));
+    schedule->steps = evaluations;
+    float denominator = 2.0f * (float)evaluations;
+    for (int index = 0; index <= evaluations; index++) {
+        float base = (float)(evaluations - index) / denominator;
+        schedule->video[index] = h3_shift_base(
+            base, H3_VIDEO_SIGMA_SHIFT);
+        schedule->audio[index] = h3_shift_base(
+            base, H3_AUDIO_SIGMA_SHIFT);
+    }
+    schedule->video[evaluations] = 0.0f;
+    schedule->audio[evaluations] = 0.0f;
+    return 1;
+}
+
 typedef struct {
     h3_layout *layout;
     size_t position_capacity;
@@ -595,6 +614,16 @@ void h3_rng_fill_normal(h3_rng *rng, float *values, size_t count) {
     for (size_t index = 0; index < count; index++) {
         values[index] = h3_rng_normal(rng);
     }
+}
+
+int h3_flow_renoise(float *sample, const float *noise, size_t count,
+                    float sigma) {
+    if (!sample || !noise || !count || !isfinite(sigma) ||
+        sigma < 0.0f || sigma > 1.0f) return 0;
+    float clean_scale = 1.0f - sigma;
+    for (size_t index = 0; index < count; index++)
+        sample[index] = clean_scale * sample[index] + sigma * noise[index];
+    return 1;
 }
 
 int h3_resize_rgb24_high_quality(const uint8_t *input, int frames,

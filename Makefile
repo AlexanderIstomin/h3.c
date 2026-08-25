@@ -12,7 +12,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+	h3_dit_schedule.c h3_dit.c h3_inpaint.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c h3_tae.c
@@ -37,6 +37,9 @@ h3_metal_tests: tests/test_metal.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_bf16_tests: tests/test_bf16.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_sol_attention_bench: tests/bench_sol_attention.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_tokenizer_tests: tests/test_tokenizer.o $(LIB_OBJ)
@@ -222,14 +225,16 @@ h3_real_video_vae_test: tests/test_real_video_vae.o $(LIB_OBJ)
 h3_semantic_vae_test: tests/test_semantic_vae.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
-test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
+test: h3_tests h3_metal_tests h3_bf16_tests h3_sol_attention_bench \
+	h3_tokenizer_tests h3_text_tests \
 	h3_audio_gpu_tests h3_quantized_weight_tests \
 	h3_real_audio_vae_test h3_real_audio_encoder_test \
-	h3_av_mux_test \
+	h3_av_mux_test h3_avwriter_test \
 	h3_real_video_encoder_test h3_real_qwen_vision_test \
 	h3_real_multimodal_text_test h3_real_ref_video_text_test
 
 	./h3_tests
+	./h3_sol_attention_bench h3_shaders.metal 976 1 1.3 976
 	@if test -f misc/fixtures/h3_dit.safetensors && \
 	         test -f misc/fixtures/h3_dit_bf16.safetensors; then \
 		./h3_metal_tests misc/fixtures/h3_dit.safetensors; \
@@ -266,6 +271,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 	else \
 		echo "skip: FFmpeg is not installed"; \
 	fi
+	./h3_avwriter_test
 	@if test -f MiniMax-H3/FL2VA/video_vae/source/model.safetensors && \
 	         test -f misc/fixtures/h3_real_video_encoder_256.safetensors; then \
 		./h3_real_video_encoder_test; \
@@ -361,7 +367,8 @@ linenoise.o: CFLAGS += -Wno-conversion -Wno-variadic-macro-arguments-omitted
 -include $(wildcard *.d tests/*.d)
 
 clean:
-	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests \
+	rm -f h3 h3_tests h3_metal_tests h3_bf16_tests h3_sol_attention_bench \
+		h3_tokenizer_tests \
 		h3_text_tests h3_real_prompt_test h3_real_dit_block_test \
 		h3_real_optimized_qwen_test \
 		h3_real_optimized_audio_vae_test h3_real_optimized_video_vae_test \

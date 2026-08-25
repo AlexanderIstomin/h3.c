@@ -6,6 +6,7 @@
 #include "h3_avwriter.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Muxes generated frames and audio with AVFoundation instead of spawning
@@ -81,6 +82,23 @@ static int append_video(AVAssetWriterInput *input,
 static int append_audio(AVAssetWriterInput *input, const float *pcm,
                         int samples, int channels, int sample_rate,
                         char *error, size_t error_size) {
+    if ((size_t)samples > SIZE_MAX / (size_t)channels ||
+        (size_t)samples * (size_t)channels > SIZE_MAX / sizeof(float)) {
+        fail(error, error_size, "audio sample size overflows");
+        return 0;
+    }
+    size_t elements = (size_t)samples * (size_t)channels;
+    float *interleaved = malloc(elements * sizeof(*interleaved));
+    if (!interleaved) {
+        fail(error, error_size, "out of memory interleaving generated PCM");
+        return 0;
+    }
+    for (int sample = 0; sample < samples; sample++)
+        for (int channel = 0; channel < channels; channel++)
+            interleaved[(size_t)sample * (size_t)channels +
+                        (size_t)channel] =
+                pcm[(size_t)channel * (size_t)samples + (size_t)sample];
+
     AudioStreamBasicDescription description = {0};
     description.mSampleRate = sample_rate;
     description.mFormatID = kAudioFormatLinearPCM;
@@ -96,17 +114,19 @@ static int append_audio(AVAssetWriterInput *input, const float *pcm,
     OSStatus status = CMAudioFormatDescriptionCreate(
         NULL, &description, 0, NULL, 0, NULL, NULL, &format);
     if (status != noErr || !format) {
+        free(interleaved);
         fail(error, error_size, "cannot describe the audio format (%d)",
              (int)status);
         return 0;
     }
 
-    size_t bytes = (size_t)samples * channels * sizeof(float);
+    size_t bytes = elements * sizeof(*interleaved);
     CMBlockBufferRef block = NULL;
     status = CMBlockBufferCreateWithMemoryBlock(
         NULL, NULL, bytes, kCFAllocatorDefault, NULL, 0, bytes, 0, &block);
     if (status == noErr)
-        status = CMBlockBufferReplaceDataBytes(pcm, block, 0, bytes);
+        status = CMBlockBufferReplaceDataBytes(interleaved, block, 0, bytes);
+    free(interleaved);
     if (status != noErr || !block) {
         if (block) CFRelease(block);
         CFRelease(format);

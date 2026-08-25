@@ -44,6 +44,7 @@ void h3_gpu_free(h3_gpu *gpu);
 int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
+int h3_gpu_has_sol_attention(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_f16(h3_gpu *gpu, size_t elements);
@@ -693,6 +694,36 @@ int h3_gpu_flash_attention_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                                 const h3_gpu_tensor *key,
                                 const h3_gpu_tensor *value, uint32_t sequence,
                                 uint32_t heads, uint32_t head_dim, float scale);
+/* Training-free 64-token block-sparse attention for long H3 sequences.
+ * Scratch tensors are caller-owned so 50 blocks reuse one allocation. */
+int h3_gpu_sol_attention_bf16(
+                                h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value,
+                                h3_gpu_tensor *query_centroids,
+                                h3_gpu_tensor *key_centroids,
+                                h3_gpu_tensor *value_sums,
+                                h3_gpu_tensor *key_means,
+                                h3_gpu_tensor *key_variances,
+                                h3_gpu_tensor *thresholds,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t sink_tokens,
+                                float scale, float tau,
+                                int head_major_output);
+/* Materialize Sol-Attn's block routing mask for calibration. This is kept
+ * separate from the production kernel so ordinary generations never allocate
+ * sequence-squared diagnostics or pay for readback. Call it after
+ * h3_gpu_sol_attention_bf16 has populated the supplied summaries and
+ * thresholds. `routes` contains one byte per [head, query block, key block]. */
+int h3_gpu_sol_attention_routes_bf16(
+                                h3_gpu *gpu, h3_gpu_tensor *routes,
+                                const h3_gpu_tensor *query_centroids,
+                                const h3_gpu_tensor *key_centroids,
+                                const h3_gpu_tensor *thresholds,
+                                uint32_t sequence, uint32_t heads,
+                                uint32_t head_dim, uint32_t sink_tokens,
+                                float scale);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

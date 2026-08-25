@@ -10,6 +10,21 @@
 
 typedef struct h3_dit h3_dit;
 
+/* Optional target rows that are partly supplied by source media. A generate
+ * mask value of one follows the normal denoising schedule; zero pins the row
+ * to clean conditioning and writes the encoded source back after every step.
+ * Video source layout is [24,T,H,W], audio [32,2,T]. */
+typedef struct {
+    const float *video_source;
+    size_t video_source_elements;
+    const uint8_t *video_generate_rows;
+    size_t video_generate_count;
+    const float *audio_source;
+    size_t audio_source_elements;
+    const uint8_t *audio_generate_rows;
+    size_t audio_generate_count;
+} h3_dit_inpaint;
+
 typedef void (*h3_dit_progress)(const char *phase, int completed, int total,
                                 void *opaque);
 
@@ -87,6 +102,7 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
                          size_t condition_audio_elements,
+                         const h3_dit_inpaint *inpaint,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size);
 void h3_dit_free(h3_dit *dit);

@@ -190,11 +190,12 @@ for evaluating adapters cheaply; merging an adapter into the checkpoint
 produces measurably different output, so the two paths are not
 interchangeable for final renders.
 
-Current limits: pre-quantized INT8 checkpoints only (BF16 weights are
-refused rather than silently ignored), a single uniform rank across all
-pairs, BF16 tensors, `alpha` ignored (the file's own scale is applied as
-written), and every active block must supply all four projection pairs.
-Adapters for the token refiner are applied when present.
+Current limits: pre-quantized INT8 base checkpoints only (BF16 base weights
+are refused rather than silently producing a bad result), BF16 adapter
+tensors, rank at most 512 per projection, and every active block must supply
+all four projection pairs. `alpha` is applied when present; otherwise the
+file's own scale is used. Adapters for the token refiner are applied when
+present.
 
 ### 4. Choose a speed/quality preset
 
@@ -378,6 +379,31 @@ For example:
   --layers 45 --reuse 2 --frames-dir outputs/hummingbird-frames \
   -o ''
 ```
+
+Experimental Sol sparse attention is available for calibration but remains
+off by default until complete image, video, and audio comparisons establish a
+quality-safe policy. Enable it with `H3_SOL_ATTN=1`. It applies only at 4,096
+or more DiT rows, keeps the opening and final denoising transitions dense, and
+uses the conservative `H3_SOL_ATTN_TAU=-1` threshold unless overridden.
+`H3_SOL_ATTN_MIN_ROWS` and `H3_SOL_ATTN_ALL_STEPS=1` override those guards for
+diagnostic runs. If the optional Metal library or its routing buffers are
+unavailable, generation falls back to exact dense attention;
+`H3_SOL_ATTN_STRICT=1` instead makes that condition an error.
+
+For one calibration run, `H3_PROFILE=1 H3_PROFILE_SOL_ROUTES=1` prints the
+selected routing-block density from the first sparse layer. The diagnostic
+materializes a heads-by-blocks-by-blocks byte mask, so do not leave it enabled
+for ordinary generation. The standalone exact-control benchmark is:
+
+```sh
+make h3_sol_attention_bench
+./h3_sol_attention_bench h3_shaders.metal 976 1 1.3 976
+```
+
+That test marks every token as an exact-attention sink, which routes every
+block regardless of the approximation threshold, and compares the result
+against dense attention. Synthetic speedups are not a substitute for a
+matched end-to-end quality comparison with real H3 activations.
 
 ### 8. Add image, video, and audio references
 

@@ -23,6 +23,7 @@
  * rows, 1.76x at 5095 and 1.72x at 8192. The threshold is where Z-Image put
  * it, below which the casts stop paying for themselves. */
 #define H3_DIT_F32_ATTENTION_ROWS 512u
+#define H3_DIT_SOL_ATTENTION_ROWS 4096u
 
 enum {
     TEXT_DIM = 5120,
@@ -69,6 +70,10 @@ typedef struct {
     h3_gpu_tensor *out_lora_a, *out_lora_b;
     h3_gpu_tensor *fc1_lora_a, *fc1_lora_b;
     h3_gpu_tensor *fc2_lora_a, *fc2_lora_b;
+    uint32_t qkv_lora_rank;
+    uint32_t out_lora_rank;
+    uint32_t fc1_lora_rank;
+    uint32_t fc2_lora_rank;
 } h3_dit_block;
 
 enum {
@@ -117,8 +122,11 @@ struct h3_dit {
     int use_slower_dynamic_fc1_k;
     int use_slower_grouped_quantizer;
     int use_int8_row_fc2;
+    int sol_attention;
+    float sol_attention_tau;
     int ssd_streaming;
     int input_major_transformer;
+    int conventional_core_qkv;
     int hybrid_adaln;
     int keep_bf16_mlp;
     int activation_aliases;
@@ -166,6 +174,14 @@ struct h3_dit {
     uint32_t reduced_sequence;
     uint32_t reduced_video_rows;
     uint32_t token_baseline_rows;
+    float *inpaint_video_source;
+    size_t inpaint_video_source_elements;
+    uint8_t *inpaint_video_generate_rows;
+    size_t inpaint_video_generate_count;
+    float *inpaint_audio_source;
+    size_t inpaint_audio_source_elements;
+    uint8_t *inpaint_audio_generate_rows;
+    size_t inpaint_audio_generate_count;
     h3_gpu_tensor *refined_text;
     h3_gpu_tensor *rope_cos;
     h3_gpu_tensor *rope_sin;
@@ -218,6 +234,15 @@ struct h3_dit {
     h3_gpu_tensor *key32;
     h3_gpu_tensor *value32;
     h3_gpu_tensor *heads32;
+    h3_gpu_tensor *sol_query_centroids;
+    h3_gpu_tensor *sol_key_centroids;
+    h3_gpu_tensor *sol_value_sums;
+    h3_gpu_tensor *sol_key_means;
+    h3_gpu_tensor *sol_key_variances;
+    h3_gpu_tensor *sol_thresholds;
+    h3_gpu_tensor *sol_routes;
+    size_t sol_route_count;
+    int sol_routes_reported;
     h3_gpu_tensor *attention_output;
     h3_gpu_tensor *token_pool_pairs;
     h3_gpu_tensor *token_baseline_indices;
@@ -234,7 +259,7 @@ struct h3_dit {
     h3_gpu_tensor *int8_activation_scales;
     const char *lora_path;
     float lora_strength;
-    uint32_t lora_rank;
+    uint32_t lora_capacity;
     h3_gpu_tensor *lora_hidden;
     h3_gpu_tensor *lora_delta;
     h3_gpu_tensor *final_audio_input;
@@ -492,6 +517,77 @@ static int validate_layout(h3_dit *dit, const h3_text_embedding *text,
     return 1;
 }
 
+static int configure_inpaint(h3_dit *dit, const h3_dit_inpaint *inpaint,
+                             char *error, size_t error_size) {
+    if (!inpaint) return 1;
+    size_t video_elements = h3_dit_video_elements(dit);
+    size_t audio_elements = h3_dit_audio_elements(dit);
+    if (!inpaint->video_source ||
+        inpaint->video_source_elements != video_elements ||
+        !inpaint->video_generate_rows ||
+        inpaint->video_generate_count != (size_t)dit->video_rows ||
+        (inpaint->audio_source
+             ? inpaint->audio_source_elements != audio_elements ||
+               !inpaint->audio_generate_rows ||
+               inpaint->audio_generate_count != (size_t)dit->audio_rows
+             : inpaint->audio_source_elements != 0 ||
+               inpaint->audio_generate_rows ||
+               inpaint->audio_generate_count != 0) ||
+        dit->token_reduction) {
+        fail(error, error_size,
+             dit->token_reduction
+                 ? "H3 inpainting cannot use token reduction"
+                 : "inpainting source rows do not match the target layout");
+        return 0;
+    }
+    for (size_t row = 0; row < inpaint->video_generate_count; row++)
+        if (inpaint->video_generate_rows[row] > 1) {
+            fail(error, error_size, "video inpainting mask is not hard");
+            return 0;
+        }
+    for (size_t row = 0; row < inpaint->audio_generate_count; row++)
+        if (inpaint->audio_generate_rows[row] > 1) {
+            fail(error, error_size, "audio inpainting mask is not hard");
+            return 0;
+        }
+
+    dit->inpaint_video_source = malloc(
+        video_elements * sizeof(*dit->inpaint_video_source));
+    dit->inpaint_video_generate_rows = malloc(
+        (size_t)dit->video_rows * sizeof(*dit->inpaint_video_generate_rows));
+    if (inpaint->audio_source) {
+        dit->inpaint_audio_source = malloc(
+            audio_elements * sizeof(*dit->inpaint_audio_source));
+        dit->inpaint_audio_generate_rows = malloc(
+            (size_t)dit->audio_rows *
+            sizeof(*dit->inpaint_audio_generate_rows));
+    }
+    if (!dit->inpaint_video_source || !dit->inpaint_video_generate_rows ||
+        (inpaint->audio_source &&
+         (!dit->inpaint_audio_source || !dit->inpaint_audio_generate_rows))) {
+        fail(error, error_size, "out of memory retaining inpainting sources");
+        return 0;
+    }
+    memcpy(dit->inpaint_video_source, inpaint->video_source,
+           video_elements * sizeof(*dit->inpaint_video_source));
+    memcpy(dit->inpaint_video_generate_rows, inpaint->video_generate_rows,
+           (size_t)dit->video_rows *
+           sizeof(*dit->inpaint_video_generate_rows));
+    dit->inpaint_video_source_elements = video_elements;
+    dit->inpaint_video_generate_count = (size_t)dit->video_rows;
+    if (inpaint->audio_source) {
+        memcpy(dit->inpaint_audio_source, inpaint->audio_source,
+               audio_elements * sizeof(*dit->inpaint_audio_source));
+        memcpy(dit->inpaint_audio_generate_rows,
+               inpaint->audio_generate_rows,
+               (size_t)dit->audio_rows *
+               sizeof(*dit->inpaint_audio_generate_rows));
+        dit->inpaint_audio_source_elements = audio_elements;
+        dit->inpaint_audio_generate_count = (size_t)dit->audio_rows;
+    }
+    return 1;
+}
+
 static int configure_token_reduction(h3_dit *dit, int requested,
                                      char *error, size_t error_size) {
     const char *enabled = getenv("H3_TOKEN_REDUCTION");
@@ -586,6 +682,62 @@ static int configure_token_reduction(h3_dit *dit, int requested,
     dit->token_baseline_rows = dit->video_rows - dit->reduced_video_rows;
     dit->reduced_sequence = dit->video_target_start +
                             dit->reduced_video_rows;
+    return 1;
+}
+
+static int configure_sol_attention(h3_dit *dit,
+                                   char *error, size_t error_size) {
+    const char *enabled = getenv("H3_SOL_ATTN");
+    dit->sol_attention_tau = -1.0f;
+    if (!enabled || !*enabled || !strcmp(enabled, "0")) return 1;
+    uint32_t minimum_rows = H3_DIT_SOL_ATTENTION_ROWS;
+    const char *minimum_text = getenv("H3_SOL_ATTN_MIN_ROWS");
+    if (minimum_text && *minimum_text) {
+        char *tail = NULL;
+        unsigned long parsed = strtoul(minimum_text, &tail, 10);
+        if (tail == minimum_text || *tail || parsed > UINT32_MAX) {
+            fail(error, error_size,
+                 "H3_SOL_ATTN_MIN_ROWS must be an unsigned 32-bit integer");
+            return 0;
+        }
+        minimum_rows = (uint32_t)parsed;
+    }
+    const char *tau_text = getenv("H3_SOL_ATTN_TAU");
+    if (tau_text && *tau_text) {
+        char *tail = NULL;
+        float tau = strtof(tau_text, &tail);
+        if (tail == tau_text || *tail || !isfinite(tau) ||
+            tau < -100.0f || tau > 10.0f) {
+            fail(error, error_size,
+                 "H3_SOL_ATTN_TAU must be finite and in [-100, 10]");
+            return 0;
+        }
+        dit->sol_attention_tau = tau;
+    }
+    if (dit->sequence < minimum_rows || dit->token_reduction) {
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr,
+                    "h3: Sol-Attn requested but inactive (%u rows, minimum %u%s)\n",
+                    dit->sequence, minimum_rows,
+                    dit->token_reduction ? ", token reduction enabled" : "");
+        return 1;
+    }
+    if (!h3_gpu_has_sol_attention(dit->gpu)) {
+        const char *strict = getenv("H3_SOL_ATTN_STRICT");
+        if (strict && *strict && strcmp(strict, "0")) {
+            fail(error, error_size,
+                 "H3_SOL_ATTN requested but the Sol-Attn Metal library is unavailable");
+            return 0;
+        }
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr,
+                    "h3: Sol-Attn requested but unavailable; using dense attention\n");
+        return 1;
+    }
+    dit->sol_attention = 1;
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: experimental Sol-Attn enabled (tau %.3f)\n",
+                dit->sol_attention_tau);
     return 1;
 }
 
@@ -736,6 +888,59 @@ static float bf16_to_f32_value(uint16_t value) {
     return result;
 }
 
+/* ComfyUI's generic LoRA format may fuse independently trained Q, K and V
+ * adapters into one projection. Its block-diagonal B and concatenated A then
+ * have rank three times the other projections, and an explicit alpha keeps
+ * alpha/rank equal to the training scale. Older H3 adapters have no alpha and
+ * already bake their scale into B, so absence deliberately means one. */
+static int lora_pair_schema(const h3_weight_store *store, const char *base,
+                            uint32_t input_dim, uint32_t output_dim,
+                            uint32_t *rank, float *scale,
+                            char *error, size_t error_size) {
+    char name[224];
+    snprintf(name, sizeof(name), "%s.lora_A.weight", base);
+    const h3_st_tensor *a = h3_weight_find(store, name, NULL);
+    if (!a || a->dtype != H3_DTYPE_BF16 || a->ndim != 2 ||
+        !a->shape[0] || a->shape[0] > 512 || a->shape[1] != input_dim) {
+        fail(error, error_size,
+             "adapter tensor %s must be BF16 [rank, %u] with rank in [1, 512]",
+             name, input_dim);
+        return 0;
+    }
+    uint32_t pair_rank = (uint32_t)a->shape[0];
+    snprintf(name, sizeof(name), "%s.lora_B.weight", base);
+    const h3_st_tensor *b = h3_weight_find(store, name, NULL);
+    if (!b || b->dtype != H3_DTYPE_BF16 || b->ndim != 2 ||
+        b->shape[0] != output_dim || b->shape[1] != pair_rank) {
+        fail(error, error_size,
+             "adapter tensor %s must be BF16 [%u, %u]",
+             name, output_dim, pair_rank);
+        return 0;
+    }
+
+    float pair_scale = 1.0f;
+    snprintf(name, sizeof(name), "%s.alpha", base);
+    const h3_st_header *alpha_header = NULL;
+    const h3_st_tensor *alpha = h3_weight_find(store, name, &alpha_header);
+    if (alpha) {
+        if (alpha->dtype != H3_DTYPE_F32 ||
+            !((alpha->ndim == 0) ||
+              (alpha->ndim == 1 && alpha->shape[0] == 1)) ||
+            !h3_st_read_data(alpha_header, alpha, &pair_scale,
+                             sizeof(pair_scale), error, error_size) ||
+            !isfinite(pair_scale)) {
+            if (!error || !*error)
+                fail(error, error_size,
+                     "adapter alpha %s must be one finite F32 value", name);
+            return 0;
+        }
+        pair_scale /= (float)pair_rank;
+    }
+    *rank = pair_rank;
+    *scale = pair_scale;
+    return 1;
+}
+
 /* Folding the strength into B keeps the forward pass to existing kernels. */
 static int scale_bf16_tensor(h3_gpu_tensor *tensor, size_t elements,
                              float strength) {
@@ -759,15 +964,20 @@ static int load_lora_pair(h3_dit *dit, const h3_weight_store *store,
                           uint32_t output_dim, uint32_t convrot_group,
                           float strength,
                           h3_gpu_tensor **down, h3_gpu_tensor **up,
+                          uint32_t *rank,
                           char *error, size_t error_size) {
+    float pair_scale = 1.0f;
+    if (!lora_pair_schema(store, base, input_dim, output_dim,
+                          rank, &pair_scale, error, error_size))
+        return 0;
     char name[224];
     snprintf(name, sizeof(name), "%s.lora_A.weight", base);
-    const uint64_t down_shape[] = {dit->lora_rank, input_dim};
+    const uint64_t down_shape[] = {*rank, input_dim};
     h3_gpu_tensor *a = h3_weight_load_bf16(store, dit->gpu, name, 2,
                                            down_shape, error, error_size);
     if (!a) return 0;
     snprintf(name, sizeof(name), "%s.lora_B.weight", base);
-    const uint64_t up_shape[] = {output_dim, dit->lora_rank};
+    const uint64_t up_shape[] = {output_dim, *rank};
     h3_gpu_tensor *b = h3_weight_load_bf16(store, dit->gpu, name, 2,
                                            up_shape, error, error_size);
     if (!b) {
@@ -779,12 +989,12 @@ static int load_lora_pair(h3_dit *dit, const h3_weight_store *store,
     int ok = 1;
     if (convrot_group)
         ok = h3_gpu_begin(dit->gpu) &&
-             h3_gpu_convrot_bf16(dit->gpu, a, a, dit->lora_rank, input_dim,
+             h3_gpu_convrot_bf16(dit->gpu, a, a, *rank, input_dim,
                                  convrot_group) &&
              h3_gpu_submit(dit->gpu);
     if (ok)
-        ok = scale_bf16_tensor(b, (size_t)output_dim * dit->lora_rank,
-                               strength);
+        ok = scale_bf16_tensor(b, (size_t)output_dim * *rank,
+                               strength * pair_scale);
     if (!ok) {
         fail(error, error_size, "cannot prepare the %s adapter: %s", base,
              h3_gpu_error(dit->gpu));
@@ -805,16 +1015,21 @@ static int load_lora_block(h3_dit *dit, const h3_weight_store *store,
                            uint32_t fc1_group, uint32_t fc2_group,
                            float strength, char *error, size_t error_size) {
     char name[192];
-#define PAIR(suffix, in_dim, out_dim, group, down, up) do {                     \
+#define PAIR(suffix, in_dim, out_dim, group, down, up, rank) do {               \
     snprintf(name, sizeof(name), "%s." suffix, base);                           \
     if (!load_lora_pair(dit, store, name, in_dim, out_dim, group, strength,     \
-                        &block->down, &block->up, error, error_size))           \
+                        &block->down, &block->up, &block->rank,                 \
+                        error, error_size))                                     \
         return 0;                                                               \
 } while (0)
-    PAIR("attn.qkv_proj", HIDDEN, INNER * 3, qkv_group, qkv_lora_a, qkv_lora_b);
-    PAIR("attn.out_proj", INNER, HIDDEN, out_group, out_lora_a, out_lora_b);
-    PAIR("mlp.fc1", HIDDEN, FFN * 2, fc1_group, fc1_lora_a, fc1_lora_b);
-    PAIR("mlp.fc2", FFN, HIDDEN, fc2_group, fc2_lora_a, fc2_lora_b);
+    PAIR("attn.qkv_proj", HIDDEN, INNER * 3, qkv_group,
+         qkv_lora_a, qkv_lora_b, qkv_lora_rank);
+    PAIR("attn.out_proj", INNER, HIDDEN, out_group,
+         out_lora_a, out_lora_b, out_lora_rank);
+    PAIR("mlp.fc1", HIDDEN, FFN * 2, fc1_group,
+         fc1_lora_a, fc1_lora_b, fc1_lora_rank);
+    PAIR("mlp.fc2", FFN, HIDDEN, fc2_group,
+         fc2_lora_a, fc2_lora_b, fc2_lora_rank);
 #undef PAIR
     return 1;
 }
@@ -868,12 +1083,16 @@ static int prepare_lora(h3_dit *dit, const char *path, float strength,
         h3_weight_store_free(store);
         return 0;
     }
-    dit->lora_rank = (uint32_t)probe->shape[0];
+    /* Individual projections may use different ranks (LightX2V's fused QKV
+     * is rank 384 while the other projections are rank 128). A fixed upper
+     * bound keeps one reusable scratch allocation without constraining every
+     * pair to the first tensor's shape. */
+    dit->lora_capacity = 512;
     h3_weight_store_free(store);
     dit->lora_path = path;
     dit->lora_strength = strength;
     dit->lora_hidden = h3_gpu_tensor_new_bf16(
-        dit->gpu, (size_t)dit->sequence * dit->lora_rank);
+        dit->gpu, (size_t)dit->sequence * dit->lora_capacity);
     dit->lora_delta = h3_gpu_tensor_new_bf16(
         dit->gpu, (size_t)dit->sequence * FFN * 2);
     if (!dit->lora_hidden || !dit->lora_delta) {
@@ -912,16 +1131,21 @@ static int load_lora_adapters(h3_dit *dit, const char *path, float strength,
 static int apply_lora(h3_dit *dit, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input,
                       const h3_gpu_tensor *down, const h3_gpu_tensor *up,
-                      uint32_t rows, uint32_t input_dim, uint32_t output_dim,
+                      uint32_t rank, uint32_t rows,
+                      uint32_t input_dim, uint32_t output_dim,
                       char *error, size_t error_size) {
     if (!down || !up) return 1;
+    if (!rank || rank > dit->lora_capacity) {
+        fail(error, error_size, "adapter rank exceeds its scratch capacity");
+        return 0;
+    }
     return gpu_op(dit, h3_gpu_linear_bf16(
                       dit->gpu, dit->lora_hidden, input, down, NULL, rows,
-                      input_dim, dit->lora_rank),
+                      input_dim, rank),
                   error, error_size, "DiT adapter down projection") &&
            gpu_op(dit, h3_gpu_linear_bf16(
                       dit->gpu, dit->lora_delta, dit->lora_hidden, up, NULL,
-                      rows, dit->lora_rank, output_dim),
+                      rows, rank, output_dim),
                   error, error_size, "DiT adapter up projection") &&
            gpu_op(dit, h3_gpu_add_bf16(
                       dit->gpu, output, output, dit->lora_delta,
@@ -1479,7 +1703,8 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
     OP(h3_gpu_linear_bf16(dit->gpu, qkv, norm, weight->qkv, NULL, rows,
                            HIDDEN, INNER * 3), "refiner QKV");
     if (!apply_lora(dit, qkv, norm, weight->qkv_lora_a, weight->qkv_lora_b,
-                    rows, HIDDEN, INNER * 3, error, error_size)) return 0;
+                    weight->qkv_lora_rank, rows, HIDDEN, INNER * 3,
+                    error, error_size)) return 0;
     OP(h3_gpu_grouped_qkv_rope_bf16(
                              dit->gpu, query, key, value, qkv, weight->q_norm,
                              weight->k_norm, weight->q_norm, weight->q_norm,
@@ -1491,7 +1716,8 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
     OP(h3_gpu_linear_bf16(dit->gpu, branch, heads, weight->out, NULL, rows,
                            INNER, HIDDEN), "refiner attention output");
     if (!apply_lora(dit, branch, heads, weight->out_lora_a, weight->out_lora_b,
-                    rows, INNER, HIDDEN, error, error_size)) return 0;
+                    weight->out_lora_rank, rows, INNER, HIDDEN,
+                    error, error_size)) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner attention residual");
     OP(h3_gpu_rms_norm_bf16(dit->gpu, norm, hidden, weight->norm2, rows,
@@ -1499,13 +1725,15 @@ static int run_refiner_block(h3_dit *dit, const h3_dit_block *weight,
     OP(h3_gpu_linear_bf16(dit->gpu, fc1, norm, weight->fc1, NULL, rows,
                            HIDDEN, FFN * 2), "refiner MLP input");
     if (!apply_lora(dit, fc1, norm, weight->fc1_lora_a, weight->fc1_lora_b,
-                    rows, HIDDEN, FFN * 2, error, error_size)) return 0;
+                    weight->fc1_lora_rank, rows, HIDDEN, FFN * 2,
+                    error, error_size)) return 0;
     OP(h3_gpu_swiglu_bf16(dit->gpu, activated, fc1, rows, FFN),
        "refiner SwiGLU");
     OP(h3_gpu_linear_bf16(dit->gpu, branch, activated, weight->fc2, NULL,
                            rows, FFN, HIDDEN), "refiner MLP output");
     if (!apply_lora(dit, branch, activated, weight->fc2_lora_a,
-                    weight->fc2_lora_b, rows, FFN, HIDDEN,
+                    weight->fc2_lora_b, weight->fc2_lora_rank,
+                    rows, FFN, HIDDEN,
                     error, error_size)) return 0;
     OP(h3_gpu_add_bf16(dit->gpu, hidden, hidden, branch, rows * HIDDEN),
        "refiner MLP residual");
@@ -1737,9 +1965,14 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
         return 0;
     }
     for (int step = 0; step < steps; step++) {
-        if (!h3_dit_schedule_row_map(dit->schedule, step, &dit->layout,
-                                     text->tags, text->tokens, rows,
-                                     dit->sequence)) {
+        if (!h3_dit_schedule_row_map(
+                dit->schedule, step, &dit->layout,
+                text->tags, text->tokens,
+                dit->inpaint_video_generate_rows,
+                dit->inpaint_video_generate_count,
+                dit->inpaint_audio_generate_rows,
+                dit->inpaint_audio_generate_count,
+                rows, dit->sequence)) {
             fail(error, error_size, "cannot construct modulation row map");
             free(rows); free(reduced); free(audio); free(video);
             return 0;
@@ -1756,10 +1989,18 @@ static int prepare_maps(h3_dit *dit, const h3_text_embedding *text,
         }
         uint32_t audio_row = h3_dit_schedule_audio_row(dit->schedule, step);
         uint32_t video_row = h3_dit_schedule_video_row(dit->schedule, step);
+        uint32_t audio_condition_row =
+            h3_dit_schedule_audio_condition_row(dit->schedule, step);
+        uint32_t video_condition_row =
+            h3_dit_schedule_visual_condition_row(dit->schedule, step);
         for (uint32_t index = 0; index < dit->audio_rows; index++)
-            audio[index] = audio_row;
+            audio[index] = dit->inpaint_audio_generate_rows &&
+                           !dit->inpaint_audio_generate_rows[index]
+                ? audio_condition_row : audio_row;
         for (uint32_t index = 0; index < dit->video_rows; index++)
-            video[index] = video_row;
+            video[index] = dit->inpaint_video_generate_rows &&
+                           !dit->inpaint_video_generate_rows[index]
+                ? video_condition_row : video_row;
         dit->row_maps[step] = h3_gpu_tensor_from_u32(
             dit->gpu, rows, dit->sequence);
         dit->final_audio_maps[step] = h3_gpu_tensor_from_u32(
@@ -2230,6 +2471,63 @@ static int allocate_activations(h3_dit *dit, char *error, size_t error_size) {
                 fprintf(stderr, "h3: no room for f32 attention; using bf16\n");
         }
     }
+    if (dit->sol_attention) {
+        size_t blocks = (sequence + 63u) / 64u;
+        size_t summaries = (size_t)HEADS * blocks * HEAD_DIM;
+        size_t statistics = (size_t)HEADS * HEAD_DIM;
+        size_t thresholds = (size_t)HEADS * blocks;
+        dit->sol_query_centroids = h3_gpu_tensor_new_f32(
+            dit->gpu, summaries);
+        dit->sol_key_centroids = h3_gpu_tensor_new_bf16(
+            dit->gpu, summaries);
+        dit->sol_value_sums = h3_gpu_tensor_new_bf16(
+            dit->gpu, summaries);
+        dit->sol_key_means = h3_gpu_tensor_new_f32(
+            dit->gpu, statistics);
+        dit->sol_key_variances = h3_gpu_tensor_new_f32(
+            dit->gpu, statistics);
+        dit->sol_thresholds = h3_gpu_tensor_new_f32(
+            dit->gpu, thresholds);
+        if (!dit->sol_query_centroids || !dit->sol_key_centroids ||
+            !dit->sol_value_sums || !dit->sol_key_means ||
+            !dit->sol_key_variances || !dit->sol_thresholds) {
+            const char *strict = getenv("H3_SOL_ATTN_STRICT");
+            if (strict && *strict && strcmp(strict, "0")) {
+                fail(error, error_size,
+                     "cannot allocate Sol-Attn routing buffers: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
+            free_tensor(&dit->sol_query_centroids);
+            free_tensor(&dit->sol_key_centroids);
+            free_tensor(&dit->sol_value_sums);
+            free_tensor(&dit->sol_key_means);
+            free_tensor(&dit->sol_key_variances);
+            free_tensor(&dit->sol_thresholds);
+            dit->sol_attention = 0;
+            if (getenv("H3_PROFILE"))
+                fprintf(stderr,
+                        "h3: no room for Sol-Attn routing; using dense attention\n");
+        }
+        const char *profile_routes = getenv("H3_PROFILE_SOL_ROUTES");
+        if (dit->sol_attention && profile_routes && *profile_routes &&
+            strcmp(profile_routes, "0")) {
+            if (blocks > SIZE_MAX / blocks / HEADS) {
+                fail(error, error_size,
+                     "Sol-Attn route diagnostic size overflows");
+                return 0;
+            }
+            dit->sol_route_count = (size_t)HEADS * blocks * blocks;
+            dit->sol_routes = h3_gpu_tensor_new_i8(
+                dit->gpu, dit->sol_route_count);
+            if (!dit->sol_routes) {
+                fail(error, error_size,
+                     "cannot allocate Sol-Attn route diagnostics: %s",
+                     h3_gpu_error(dit->gpu));
+                return 0;
+            }
+        }
+    }
     if (!dit->fused_patch_pack) {
         dit->video_projected = h3_gpu_tensor_new_bf16(
             dit->gpu, video_total * HIDDEN);
@@ -2426,6 +2724,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
                         size_t condition_audio_elements,
+                        const h3_dit_inpaint *inpaint,
                         h3_dit_progress progress, void *progress_opaque,
                         char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -2456,7 +2755,8 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!copy_layout(dit, layout, error, error_size) ||
         !validate_layout(dit, text, error, error_size) ||
         !configure_token_reduction(dit, token_reduction,
-                                   error, error_size)) goto failed;
+                                   error, error_size) ||
+        !configure_inpaint(dit, inpaint, error, error_size)) goto failed;
     size_t wanted_video_condition =
         (size_t)dit->video_condition_rows * VIDEO_PATCH;
     size_t wanted_audio_condition =
@@ -2481,18 +2781,28 @@ static h3_dit *load_dit(const char *weight_directory,
         goto failed;
     }
     dit->prequantized_int8 = core_qkv->dtype == H3_DTYPE_I8;
+    /* Comfy's compact/pruned curve keeps core QKV rows in the conventional
+     * [Q-all | K-all | V-all] order. The original released BF16 tree uses
+     * [head, Q/K/V, dimension] instead. Confusing the two still produces
+     * finite tensors, but every attention block mixes Q, K and V and the
+     * final video/audio decode as structured noise. The compact AdaLN marker
+     * is part of that checkpoint schema and avoids relying on a filename. */
+    dit->conventional_core_qkv = h3_weight_find(
+        dit->weights, "adaln_t_table", NULL) != NULL;
     if (!configure_input_major_transformer(dit, error, error_size))
         goto failed;
     if (!configure_hybrid_adaln(
             dit, adaln_overlay_path, error, error_size)) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    if (!configure_sol_attention(dit, error, error_size)) goto failed;
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->prequantized_int8 && !dit->ssd_streaming &&
                     dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
                     h3_gpu_has_int8_mlp(dit->gpu);
-    dit->int8_qkv = !dit->prequantized_int8 && !dit->ssd_streaming &&
+    dit->int8_qkv = !dit->prequantized_int8 &&
+                    !dit->conventional_core_qkv && !dit->ssd_streaming &&
                     !use_slower_bf16_qkv &&
                     dit->sequence >= 128 &&
                     h3_gpu_has_int8_mlp(dit->gpu);
@@ -2533,8 +2843,9 @@ static h3_dit *load_dit(const char *weight_directory,
     schedule_progress schedule_state = {progress, progress_opaque};
     dit->schedule = h3_dit_schedule_precompute(
         dit->weights, dit->late_adaln_overlay, dit->gpu, sigmas,
-        dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
+        dit->video_condition_rows != 0 || dit->inpaint_video_source != NULL,
+        dit->audio_condition_rows != 0 || dit->inpaint_audio_source != NULL,
+        schedule_report, &schedule_state,
         error, error_size);
     h3_weight_store_free(dit->late_adaln_overlay);
     dit->late_adaln_overlay = NULL;
@@ -2608,7 +2919,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_grouped_quantizer,
                     use_int8_row_fc2,
                     lora_path, lora_strength,
-                    NULL, 0, NULL, 0, progress, progress_opaque,
+                    NULL, 0, NULL, 0, NULL, progress, progress_opaque,
                     error, error_size);
 }
 
@@ -2641,6 +2952,7 @@ h3_dit *h3_dit_load_conditioned(
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
                          size_t condition_audio_elements,
+                         const h3_dit_inpaint *inpaint,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, adaln_overlay_path, shader_source_path,
@@ -2661,6 +2973,7 @@ h3_dit *h3_dit_load_conditioned(
                     lora_path, lora_strength,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
+                    inpaint,
                     progress, progress_opaque, error, error_size);
 }
 
@@ -2751,6 +3064,125 @@ static int leave_token_reduction_adaln(h3_dit *dit, unsigned block,
     return 1;
 }
 
+/* Development-only activation capture for calibrating an attention backend
+ * against real H3 Q/K/V rather than synthetic normals. The explicit prefix
+ * env var makes this unreachable in the shipped app. A capture intentionally
+ * stops the run after synchronizing the requested block, avoiding a complete
+ * generation whose decoded result would be discarded. */
+static int capture_sol_attention(h3_dit *dit, unsigned block, int step,
+                                 uint32_t rows,
+                                 char *error, size_t error_size) {
+    const char *prefix = getenv("H3_DUMP_SOL_ATTENTION");
+    if (!prefix || !*prefix) return 1;
+    unsigned wanted_block = 0;
+    int wanted_step = 0;
+    const char *block_value = getenv("H3_DUMP_SOL_BLOCK");
+    const char *step_value = getenv("H3_DUMP_SOL_STEP");
+    if (block_value && *block_value)
+        wanted_block = (unsigned)strtoul(block_value, NULL, 10);
+    if (step_value && *step_value)
+        wanted_step = (int)strtol(step_value, NULL, 10);
+    if (block != wanted_block || step != wanted_step) return 1;
+    if (!h3_gpu_submit(dit->gpu)) {
+        fail(error, error_size, "cannot synchronize Sol-Attn capture: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    size_t elements = (size_t)rows * INNER;
+    uint16_t *host = malloc(elements * sizeof(*host));
+    if (!host) {
+        fail(error, error_size, "out of memory capturing Sol-Attn inputs");
+        return 0;
+    }
+    const h3_gpu_tensor *tensors[3] = {dit->query, dit->key, dit->value};
+    const char *suffixes[3] = {"q.bf16", "k.bf16", "v.bf16"};
+    char path[4096];
+    int ok = 1;
+    for (size_t slot = 0; slot < 3 && ok; slot++) {
+        int length = snprintf(path, sizeof(path), "%s.%s", prefix,
+                              suffixes[slot]);
+        if (length < 0 || (size_t)length >= sizeof(path) ||
+            !h3_gpu_tensor_read_bf16(tensors[slot], host, elements)) {
+            ok = 0;
+            break;
+        }
+        FILE *file = fopen(path, "wb");
+        if (!file || fwrite(host, sizeof(*host), elements, file) != elements)
+            ok = 0;
+        if (file && fclose(file) != 0) ok = 0;
+    }
+    free(host);
+    int length = snprintf(path, sizeof(path), "%s.json", prefix);
+    if (ok && length > 0 && (size_t)length < sizeof(path)) {
+        FILE *file = fopen(path, "w");
+        if (!file || fprintf(file,
+                "{\"tokens\":%u,\"heads\":%u,\"head_dim\":%u,"
+                "\"sink_tokens\":%u,\"block\":%u,\"step\":%d}\n",
+                rows, HEADS, HEAD_DIM, dit->video_target_start, block, step) < 0)
+            ok = 0;
+        if (file && fclose(file) != 0) ok = 0;
+    } else {
+        ok = 0;
+    }
+    fail(error, error_size, ok ? "Sol-Attn capture complete at %s" :
+         "cannot write Sol-Attn capture at %s", prefix);
+    return 0;
+}
+
+static int use_sol_attention(const h3_dit *dit, int step) {
+    if (!dit->sol_attention || dit->token_reduction_active) return 0;
+    const char *all_steps = getenv("H3_SOL_ATTN_ALL_STEPS");
+    if (all_steps && *all_steps && strcmp(all_steps, "0")) return 1;
+    int steps = h3_dit_schedule_steps(dit->schedule);
+    if (steps < 3 || step < 0 || step >= steps) return 0;
+    /* Match the conservative 20%-90% window used by the published H3
+     * integration. The noisiest opening and final-detail pass remain dense. */
+    int denominator = steps - 1;
+    return step * 10 >= denominator * 2 &&
+           step * 10 <= denominator * 9;
+}
+
+static int report_sol_route_density(h3_dit *dit, unsigned block, int step,
+                                    uint32_t rows,
+                                    char *error, size_t error_size) {
+    if (!dit->sol_routes || dit->sol_routes_reported) return 1;
+    if (!h3_gpu_sol_attention_routes_bf16(
+            dit->gpu, dit->sol_routes,
+            dit->sol_query_centroids, dit->sol_key_centroids,
+            dit->sol_thresholds, rows, HEADS, HEAD_DIM,
+            dit->video_target_start, 1.0f / sqrtf((float)HEAD_DIM)) ||
+        !h3_gpu_submit(dit->gpu)) {
+        fail(error, error_size, "cannot profile Sol-Attn routes: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    int8_t *routes = malloc(dit->sol_route_count);
+    if (!routes) {
+        fail(error, error_size,
+             "out of memory reading Sol-Attn route diagnostics");
+        return 0;
+    }
+    int read = h3_gpu_tensor_read_i8(
+        dit->sol_routes, routes, dit->sol_route_count);
+    size_t selected = 0;
+    if (read)
+        for (size_t index = 0; index < dit->sol_route_count; index++)
+            selected += routes[index] != 0;
+    free(routes);
+    if (!read || !h3_gpu_begin(dit->gpu)) {
+        fail(error, error_size, "cannot read Sol-Attn route diagnostics: %s",
+             h3_gpu_error(dit->gpu));
+        return 0;
+    }
+    dit->sol_routes_reported = 1;
+    fprintf(stderr,
+            "h3: Sol-Attn routes block=%u step=%d selected=%zu/%zu "
+            "density=%.4f\n",
+            block, step + 1, selected, dit->sol_route_count,
+            (double)selected / (double)dit->sol_route_count);
+    return 1;
+}
+
 static int run_block(h3_dit *dit, unsigned index, int step,
                      h3_dit_block *weight,
                      int attention_adaln_ready,
@@ -2789,7 +3221,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
            "DiT pre-quantized QKV projection");
         if (!apply_lora(dit, dit->qkv, dit->mod_attention,
                         weight->qkv_lora_a, weight->qkv_lora_b,
-                        rows, HIDDEN, INNER * 3, error, error_size)) return 0;
+                        weight->qkv_lora_rank, rows, HIDDEN, INNER * 3,
+                        error, error_size)) return 0;
         /* Comfy's compact checkpoint preserves the projection's ordinary
          * [Q-all-heads | K-all-heads | V-all-heads] row order.  The released
          * MiniMax tree uses the per-head interleaved order handled by the
@@ -2812,6 +3245,15 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->use_slower_scalar_qkv_rms,
             dit->use_slower_uncached_int8_scales),
            "DiT int8 QKV projection/norm/RoPE");
+    } else if (dit->conventional_core_qkv) {
+        OP(h3_gpu_linear_bf16(
+            dit->gpu, dit->qkv, dit->mod_attention, weight->qkv, NULL,
+            rows, HIDDEN, INNER * 3), "DiT compact BF16 QKV projection");
+        OP(h3_gpu_qkv_rope_bf16(
+            dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
+            weight->q_norm, weight->k_norm, rope_cos, rope_sin,
+            rows, HEADS, HEAD_DIM, ROPE_HALF, 1e-5f),
+           "DiT compact BF16 QKV norm/RoPE");
     } else {
         OP(h3_gpu_grouped_qkv_linear_rope_bf16(
             dit->gpu, dit->query, dit->key, dit->value, dit->qkv,
@@ -2819,13 +3261,27 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
+    if (!capture_sol_attention(dit, index, step, rows, error, error_size))
+        return 0;
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int head_major_attention_output = int8_attention_output &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (head_major_attention_output)
+    int sol_active = use_sol_attention(dit, step);
+    if (sol_active)
+        OP(h3_gpu_sol_attention_bf16(
+            dit->gpu, dit->attention_heads,
+            dit->query, dit->key, dit->value,
+            dit->sol_query_centroids, dit->sol_key_centroids,
+            dit->sol_value_sums, dit->sol_key_means,
+            dit->sol_key_variances, dit->sol_thresholds,
+            rows, HEADS, HEAD_DIM, dit->video_target_start,
+            1.0f / sqrtf((float)HEAD_DIM), dit->sol_attention_tau,
+            head_major_attention_output),
+           "DiT Sol block-sparse attention");
+    else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
@@ -2859,6 +3315,9 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
            "DiT full attention");
+    if (sol_active &&
+        !report_sol_route_density(dit, index, step, rows,
+                                  error, error_size)) return 0;
     if (dit->prequantized_int8) {
         if (weight->out_convrot_group)
             OP(h3_gpu_convrot_bf16(
@@ -2872,7 +3331,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
            "DiT pre-quantized attention output");
         if (!apply_lora(dit, dit->attention_output, dit->attention_heads,
                         weight->out_lora_a, weight->out_lora_b,
-                        rows, INNER, HIDDEN, error, error_size)) return 0;
+                        weight->out_lora_rank, rows, INNER, HIDDEN,
+                        error, error_size)) return 0;
     } else if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -2935,7 +3395,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
            "DiT pre-quantized MLP input");
         if (!apply_lora(dit, dit->fc1, dit->mod_mlp,
                         weight->fc1_lora_a, weight->fc1_lora_b,
-                        rows, HIDDEN, FFN * 2, error, error_size)) return 0;
+                        weight->fc1_lora_rank, rows, HIDDEN, FFN * 2,
+                        error, error_size)) return 0;
         OP(h3_gpu_swiglu_bf16(
             dit->gpu, dit->activated, dit->fc1, rows, FFN),
            "DiT pre-quantized SwiGLU");
@@ -2951,7 +3412,8 @@ static int run_block(h3_dit *dit, unsigned index, int step,
            "DiT pre-quantized MLP output");
         if (!apply_lora(dit, mlp_output, dit->activated,
                         weight->fc2_lora_a, weight->fc2_lora_b,
-                        rows, FFN, HIDDEN, error, error_size)) return 0;
+                        weight->fc2_lora_rank, rows, FFN, HIDDEN,
+                        error, error_size)) return 0;
     } else if (dit->int8_mlp &&
         (!getenv("H3_DISABLE_INT8_MLP") ||
          !weight->fc1 || !weight->fc2)) {
@@ -3605,6 +4067,10 @@ static int parse_reuse_steps(int steps, uint8_t *selected) {
 }
 
 static int gpu_sampler_requested(const h3_dit *dit) {
+    /* Source rows have to be written back after every Euler transition. The
+     * host sampler owns those boundaries; the fused GPU sampler deliberately
+     * stays on the ordinary generation path until it has the same primitive. */
+    if (dit->inpaint_video_source) return 0;
     const char *cpu = getenv("H3_CPU_SAMPLER");
     if (cpu && *cpu && strcmp(cpu, "0")) return 0;
     const char *value = getenv("H3_GPU_SAMPLER");
@@ -3912,6 +4378,46 @@ static const float *preview_estimate(float *destination, const float *sample,
     return destination;
 }
 
+static void impose_inpaint_video(h3_dit *dit, float *latent,
+                                 const float *noise, float source_level) {
+    if (!dit->inpaint_video_source || !dit->inpaint_video_generate_rows)
+        return;
+    int patch_width = dit->latent_w / 2;
+    int patch_height = dit->latent_h / 2;
+    for (int channel = 0; channel < VIDEO_CHANNELS; channel++)
+        for (int time = 0; time < dit->latent_t; time++)
+            for (int y = 0; y < dit->latent_h; y++)
+                for (int x = 0; x < dit->latent_w; x++) {
+                    size_t row = ((size_t)time * (size_t)patch_height +
+                                  (size_t)(y / 2)) * (size_t)patch_width +
+                                 (size_t)(x / 2);
+                    if (dit->inpaint_video_generate_rows[row]) continue;
+                    size_t index = (((size_t)channel * (size_t)dit->latent_t +
+                                     (size_t)time) * (size_t)dit->latent_h +
+                                    (size_t)y) * (size_t)dit->latent_w +
+                                   (size_t)x;
+                    latent[index] = source_level *
+                                        dit->inpaint_video_source[index] +
+                                    (1.0f - source_level) * noise[index];
+                }
+}
+
+static void impose_inpaint_audio(h3_dit *dit, float *latent) {
+    if (!dit->inpaint_audio_source || !dit->inpaint_audio_generate_rows)
+        return;
+    for (int channel = 0; channel < AUDIO_CHANNELS; channel++)
+        for (int stereo = 0; stereo < AUDIO_STREAMS; stereo++)
+            for (int time = 0; time < dit->audio_t; time++) {
+                size_t row = (size_t)stereo * (size_t)dit->audio_t +
+                             (size_t)time;
+                if (dit->inpaint_audio_generate_rows[row]) continue;
+                size_t index = ((size_t)channel * AUDIO_STREAMS +
+                                (size_t)stereo) * (size_t)dit->audio_t +
+                               (size_t)time;
+                latent[index] = dit->inpaint_audio_source[index];
+            }
+}
+
 int h3_dit_denoise_euler_preview(
                          h3_dit *dit, float *video_latent,
                          float *audio_latent, int reuse_interval,
@@ -3960,7 +4466,11 @@ int h3_dit_denoise_euler_preview(
         ? malloc(audio_count * sizeof(*last_audio)) : NULL;
     float *previous_audio = reuse_interval > 1
         ? malloc(audio_count * sizeof(*previous_audio)) : NULL;
+    float *inpaint_video_noise = dit->inpaint_video_source
+        ? malloc(video_count * sizeof(*inpaint_video_noise)) : NULL;
     if (!video_velocity || !audio_velocity ||
+        (preview && !preview_video) ||
+        (dit->inpaint_video_source && !inpaint_video_noise) ||
         (reuse_interval > 1 &&
          (!last_video || !previous_video || !last_audio || !previous_audio))) {
         fail(error, error_size, "out of memory allocating Euler velocities");
@@ -3971,7 +4481,14 @@ int h3_dit_denoise_euler_preview(
         free(previous_video);
         free(last_audio);
         free(previous_audio);
+        free(inpaint_video_noise);
         return 0;
+    }
+    if (inpaint_video_noise) {
+        memcpy(inpaint_video_noise, video_latent,
+               video_count * sizeof(*inpaint_video_noise));
+        impose_inpaint_video(dit, video_latent, inpaint_video_noise, 0.999f);
+        impose_inpaint_audio(dit, audio_latent);
     }
     int ok = 1;
     int last_evaluated = -1;
@@ -4023,15 +4540,27 @@ int h3_dit_denoise_euler_preview(
             if (!ok) fail(error, error_size,
                           "Euler solver rejected step %d", step);
         }
-        if (ok && preview &&
-            preview(step + 1, dit->sigmas.steps,
-                    preview_estimate(preview_video, video_latent,
-                                     video_velocity, video_count,
-                                     dit->sigmas.video[step + 1]),
-                    video_count, preview_opaque)) {
-            fail(error, error_size, "denoising preview stopped at step %d",
-                 step + 1);
-            ok = 0;
+        if (ok && inpaint_video_noise) {
+            float level = step + 1 == dit->sigmas.steps ? 1.0f : 0.999f;
+            impose_inpaint_video(
+                dit, video_latent, inpaint_video_noise, level);
+            impose_inpaint_audio(dit, audio_latent);
+        }
+        if (ok && preview) {
+            const float *estimate = preview_estimate(
+                preview_video, video_latent, video_velocity, video_count,
+                dit->sigmas.video[step + 1]);
+            if (inpaint_video_noise) {
+                impose_inpaint_video(dit, preview_video,
+                                     inpaint_video_noise, 1.0f);
+                estimate = preview_video;
+            }
+            if (preview(step + 1, dit->sigmas.steps, estimate,
+                        video_count, preview_opaque)) {
+                fail(error, error_size,
+                     "denoising preview stopped at step %d", step + 1);
+                ok = 0;
+            }
         }
         if (ok) report(progress, progress_opaque, "denoise", step + 1,
                        dit->sigmas.steps);
@@ -4043,6 +4572,7 @@ int h3_dit_denoise_euler_preview(
     free(previous_video);
     free(last_audio);
     free(previous_audio);
+    free(inpaint_video_noise);
     h3_gpu_profile_mark(dit->gpu, "Euler denoise");
     return ok;
 }
@@ -4071,6 +4601,10 @@ void h3_dit_free(h3_dit *dit) {
     free(dit->reduced_row_maps);
     free(dit->final_audio_maps);
     free(dit->final_video_maps);
+    free(dit->inpaint_video_source);
+    free(dit->inpaint_video_generate_rows);
+    free(dit->inpaint_audio_source);
+    free(dit->inpaint_audio_generate_rows);
     free_tensor(&dit->refined_text);
     free_tensor(&dit->rope_cos);
     free_tensor(&dit->rope_sin);
@@ -4097,6 +4631,9 @@ void h3_dit_free(h3_dit *dit) {
     FREE(core_input); FREE(core_residual);
     FREE(mod_attention); FREE(qkv); FREE(query); FREE(key); FREE(value);
     FREE(query32); FREE(key32); FREE(value32); FREE(heads32);
+    FREE(sol_query_centroids); FREE(sol_key_centroids); FREE(sol_value_sums);
+    FREE(sol_key_means); FREE(sol_key_variances); FREE(sol_thresholds);
+    FREE(sol_routes);
     FREE(attention_heads); FREE(attention_output);
     FREE(token_pool_pairs); FREE(token_baseline_indices);
     FREE(token_expand_parents); FREE(token_original); FREE(mod_mlp); FREE(fc1);

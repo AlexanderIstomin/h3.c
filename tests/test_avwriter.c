@@ -1,7 +1,8 @@
 /* Writes a synthetic clip through the system muxer and reads it back, so a
- * broken mux fails here in seconds rather than after a generation. The
- * readback goes through the FFmpeg reader when one is available, which also
- * checks the two paths agree on what a file contains. */
+ * broken mux fails here in seconds rather than after a generation. Audio
+ * always comes back through AVFoundation; video additionally uses FFmpeg when
+ * available, checking that the two media paths agree on the container. */
+#include "h3_avreader.h"
 #include "h3_avwriter.h"
 #include "h3_ffmpeg.h"
 
@@ -12,6 +13,17 @@
 
 enum { WIDTH = 64, HEIGHT = 48, FRAMES = 12, FPS = 24,
        RATE = 32000, CHANNELS = 2 };
+
+static double tone_power(const float *pcm, int samples, int rate,
+                         double frequency) {
+    double real = 0.0, imaginary = 0.0;
+    for (int index = 0; index < samples; index++) {
+        double phase = 6.283185307179586 * frequency * index / rate;
+        real += pcm[index] * cos(phase);
+        imaginary += pcm[index] * sin(phase);
+    }
+    return real * real + imaginary * imaginary;
+}
 
 int main(void) {
     size_t pixels = (size_t)WIDTH * HEIGHT * 3;
@@ -29,17 +41,20 @@ int main(void) {
                 rgb[at + 2] = bar ? 20 : 200;
             }
 
-    int samples = RATE / 2;
+    int samples = RATE * 2;
     float *pcm = malloc((size_t)samples * CHANNELS * sizeof(*pcm));
     if (!pcm) return 1;
     for (int index = 0; index < samples; index++) {
-        float value = 0.25f * sinf(6.2831853f * 440.0f * index / RATE);
-        pcm[index * CHANNELS] = value;
-        pcm[index * CHANNELS + 1] = -value;
+        pcm[index] = 0.25f * (float)sin(
+            6.283185307179586 * 440.0 * (double)index / (double)RATE);
+        pcm[samples + index] =
+            0.25f * (float)sin(
+                6.283185307179586 * 880.0 * (double)index / (double)RATE);
     }
 
     char error[512];
     const char *path = "/tmp/h3-avwriter-test.mp4";
+    remove(path);
     if (!h3_avwriter_write_av_rgb24_f32(path, rgb, FRAMES, WIDTH, HEIGHT, FPS,
                                         pcm, samples, CHANNELS, RATE,
                                         error, sizeof(error))) {
@@ -77,6 +92,33 @@ int main(void) {
     } else {
         printf("skipped readback (no FFmpeg): %s\n", error);
     }
+
+    float *audio_back = NULL;
+    int audio_samples = 0;
+    if (!h3_avreader_read_audio_f32(path, samples, 1, &audio_back,
+                                    &audio_samples, error, sizeof(error))) {
+        fprintf(stderr, "FAIL audio readback: %s\n", error);
+        return 1;
+    }
+    if (audio_samples != samples) {
+        fprintf(stderr, "FAIL: decoded audio has %d rather than %d samples\n",
+                audio_samples, samples);
+        return 1;
+    }
+    double left_440 = tone_power(audio_back, audio_samples, RATE, 440.0);
+    double left_880 = tone_power(audio_back, audio_samples, RATE, 880.0);
+    double right_440 = tone_power(audio_back + audio_samples,
+                                  audio_samples, RATE, 440.0);
+    double right_880 = tone_power(audio_back + audio_samples,
+                                  audio_samples, RATE, 880.0);
+    free(audio_back);
+    if (left_440 < left_880 * 25.0 || right_880 < right_440 * 25.0) {
+        fprintf(stderr,
+                "FAIL: channel-major audio was not interleaved correctly\n");
+        return 1;
+    }
+    printf("read back %d correctly interleaved stereo samples\n",
+           audio_samples);
 
     free(rgb);
     free(pcm);

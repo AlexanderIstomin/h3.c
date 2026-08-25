@@ -592,11 +592,23 @@ const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule) {
 int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
                             const h3_layout *layout,
                             const uint8_t *text_tags, size_t text_tag_count,
+                            const uint8_t *video_generate_rows,
+                            size_t video_generate_count,
+                            const uint8_t *audio_generate_rows,
+                            size_t audio_generate_count,
                             uint32_t *rows, size_t row_count) {
     if (!schedule || step < 0 || step >= schedule->steps || !layout || !rows ||
         row_count != layout->seq_len || !layout->segments ||
-        (text_tags && text_tag_count != (size_t)layout->signature[0])) return 0;
+        (text_tags && text_tag_count != (size_t)layout->signature[0]) ||
+        (video_generate_rows
+             ? video_generate_count != layout->img_target_rows
+             : video_generate_count != 0) ||
+        (audio_generate_rows
+             ? audio_generate_count != layout->audio_target_rows
+             : audio_generate_count != 0)) return 0;
     size_t text_index = 0;
+    size_t video_target_index = 0;
+    size_t audio_target_index = 0;
     for (size_t seg_index = 0; seg_index < layout->segment_count; seg_index++) {
         const h3_segment *segment = &layout->segments[seg_index];
         if (segment->start > segment->stop || segment->stop > row_count)
@@ -625,13 +637,29 @@ int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
             tag = 2;
             break;
         case H3_SEG_AUDIO:
-            time_row = schedule->audio_rows[step];
-            tag = 2;
-            break;
+            if (audio_generate_rows && !schedule->audio_condition_rows)
+                return 0;
+            for (size_t row = segment->start; row < segment->stop; row++) {
+                time_row = !audio_generate_rows ||
+                           audio_generate_rows[audio_target_index]
+                    ? schedule->audio_rows[step]
+                    : schedule->audio_condition_rows[step];
+                rows[row] = time_row * H3_DIT_MODALITIES + 2u;
+                audio_target_index++;
+            }
+            continue;
         case H3_SEG_VIDEO:
-            time_row = schedule->video_rows[step];
-            tag = 0;
-            break;
+            if (video_generate_rows && !schedule->visual_condition_rows)
+                return 0;
+            for (size_t row = segment->start; row < segment->stop; row++) {
+                time_row = !video_generate_rows ||
+                           video_generate_rows[video_target_index]
+                    ? schedule->video_rows[step]
+                    : schedule->visual_condition_rows[step];
+                rows[row] = time_row * H3_DIT_MODALITIES;
+                video_target_index++;
+            }
+            continue;
         default:
             return 0;
         }
@@ -639,5 +667,7 @@ int h3_dit_schedule_row_map(const h3_dit_schedule *schedule, int step,
         for (size_t row = segment->start; row < segment->stop; row++)
             rows[row] = modulation;
     }
-    return text_index == (size_t)layout->signature[0];
+    return text_index == (size_t)layout->signature[0] &&
+           video_target_index == layout->img_target_rows &&
+           audio_target_index == layout->audio_target_rows;
 }

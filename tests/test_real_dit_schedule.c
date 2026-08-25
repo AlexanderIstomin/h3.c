@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     uint8_t text_tags[] = {1, 0, 0, 1, 1, 1};
     uint32_t row_map[25];
     if (!h3_dit_schedule_row_map(schedule, 0, &layout, text_tags, 6,
-                                  row_map, 25))
+                                  NULL, 0, NULL, 0, row_map, 25))
         die("cannot build step-0 row map");
     const uint32_t expected_text[] = {1, 0, 0, 1, 1, 1};
     for (size_t index = 0; index < 6; index++)
@@ -74,6 +74,13 @@ int main(int argc, char **argv) {
         if (row_map[index] != 2) die("bad audio modulation row");
     for (size_t index = 23; index < 25; index++)
         if (row_map[index] != 0) die("bad video modulation row");
+    uint8_t video_generate[] = {0, 1};
+    if (!h3_dit_schedule_row_map(schedule, 0, &layout, text_tags, 6,
+                                  video_generate, 2, NULL, 0,
+                                  row_map, 25))
+        die("cannot build masked step-0 row map");
+    if (row_map[23] != 117 || row_map[24] != 0)
+        die("masked video rows did not select condition and target levels");
 
     h3_st_header fixture;
     if (!h3_st_read_header(fixture_path, &fixture, error, sizeof(error)))

@@ -115,6 +115,11 @@ double h3_time_shift_slope(double sigma, double from_shift, double to_shift);
 int h3_schedule_build(int steps, h3_sigma_schedule *schedule);
 /* Released linear base grid: evaluations model forwards plus terminal zero. */
 int h3_serving_schedule_build(int evaluations, h3_sigma_schedule *schedule);
+/* Tail of a twice-as-long serving schedule. This is the flow-matching
+ * equivalent of an audio refinement sampler with denoise strength 0.5: the
+ * first audio sigma is 0.75 and only the requested tail evaluations run. */
+int h3_audio_refine_schedule_build(int evaluations,
+                                   h3_sigma_schedule *schedule);
 /* Sigmas at Beta(0.6, 0.6) quantiles mapped through the modality shifts,
  * matching the community "beta" scheduler that step-distilled turbo
  * checkpoints are trained against. */
@@ -129,6 +134,11 @@ void h3_rng_seed(h3_rng *rng, uint64_t seed);
 uint32_t h3_rng_u32(h3_rng *rng);
 float h3_rng_normal(h3_rng *rng);
 void h3_rng_fill_normal(h3_rng *rng, float *values, size_t count);
+
+/* Re-noise a clean flow-matching sample at sigma: (1-sigma)*clean +
+ * sigma*noise. sample may contain the clean values in place. */
+int h3_flow_renoise(float *sample, const float *noise, size_t count,
+                    float sigma);
 
 /* Resize interleaved RGB24 frames with Accelerate/vImage high-quality
  * resampling. The caller owns *output. Identity geometry still returns an

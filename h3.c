@@ -2,6 +2,7 @@
 #include "h3_audio_vae.h"
 #include "h3_host.h"
 #include "h3_dit.h"
+#include "h3_inpaint.h"
 #include "h3_ffmpeg.h"
 #include "h3_avwriter.h"
 #include "h3_avreader.h"
@@ -159,7 +160,12 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
                        render_width, render_height, params->frames,
                        params->reference_image_size) ||
         !h3_key_file(&key, "first", params->first_frame) ||
-        !h3_key_file(&key, "last", params->last_frame)) goto failed;
+        !h3_key_file(&key, "last", params->last_frame) ||
+        !h3_key_append(&key, "|inpaint-video-mask=%d|preserve-audio=%d",
+                       params->inpaint_mask_is_video,
+                       params->preserve_source_audio) ||
+        !h3_key_file(&key, "source-video", params->source_video) ||
+        !h3_key_file(&key, "inpaint-mask", params->inpaint_mask)) goto failed;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
         if (!h3_key_append(&key, "|ref=%d:%d", reference->kind,
@@ -716,6 +722,61 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "beta schedule must be zero or one");
         return 0;
     }
+    if (params->audio_refine_steps < 0 ||
+        params->audio_refine_steps > H3_MAX_STEPS / 2) {
+        h3_set_error(ctx, "audio refinement passes must be in [0, 500]");
+        return 0;
+    }
+    if (params->audio_refine_steps &&
+        (!params->use_beta_schedule || params->still_frame_only ||
+         params->audio_only || params->preview_denoise ||
+         params->source_video || params->denoise_reuse != 1 ||
+         params->core_reuse != 1 || params->block_cache ||
+         params->token_reduction ||
+         params->dit_layers != H3_DEFAULT_DIT_LAYERS)) {
+        h3_set_error(ctx,
+            "Turbo audio refinement requires video output, the beta schedule, "
+            "all 50 blocks, and exact uncached denoising");
+        return 0;
+    }
+    if (params->inpaint_mask_is_video != 0 &&
+        params->inpaint_mask_is_video != 1) {
+        h3_set_error(ctx, "inpainting mask kind must be still or video");
+        return 0;
+    }
+    if (params->preserve_source_audio != 0 &&
+        params->preserve_source_audio != 1) {
+        h3_set_error(ctx, "preserve source audio must be zero or one");
+        return 0;
+    }
+    int has_source_video = params->source_video && *params->source_video;
+    int has_inpaint_mask = params->inpaint_mask && *params->inpaint_mask;
+    if (has_source_video != has_inpaint_mask ||
+        (params->source_video && !*params->source_video) ||
+        (params->inpaint_mask && !*params->inpaint_mask)) {
+        h3_set_error(ctx,
+            "video inpainting requires both a source clip and a mask");
+        return 0;
+    }
+    if (has_source_video &&
+        (params->still_frame_only || params->audio_only)) {
+        h3_set_error(ctx, "video inpainting only produces video");
+        return 0;
+    }
+    if (has_source_video && params->render_width &&
+        (params->render_width != params->width ||
+         params->render_height != params->height)) {
+        h3_set_error(ctx,
+            "video inpainting does not use a lower internal render canvas");
+        return 0;
+    }
+    if (has_source_video &&
+        (params->denoise_reuse != 1 || params->core_reuse != 1 ||
+         params->block_cache || params->token_reduction)) {
+        h3_set_error(ctx,
+            "video inpainting requires every denoising pass and full target rows");
+        return 0;
+    }
     if (params->preview_denoise && !params->on_frame) {
         h3_set_error(ctx, "denoising preview requires a frame callback");
         return 0;
@@ -751,6 +812,16 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     if (params->reference_count && (params->first_frame || params->last_frame)) {
         h3_set_error(ctx, "full references cannot be combined with frame anchors");
+        return 0;
+    }
+    if (has_source_video && !params->reference_count) {
+        h3_set_error(ctx,
+            "video inpainting requires at least one ordered Ref2VA reference");
+        return 0;
+    }
+    if (has_source_video && (params->first_frame || params->last_frame)) {
+        h3_set_error(ctx,
+            "video inpainting cannot be combined with frame anchors");
         return 0;
     }
     size_t images = 0, videos = 0, audio_inputs = 0, visual = 0;
@@ -874,14 +945,34 @@ static int h3_video_decoder_prefetch_configured(const h3_ctx *ctx) {
 typedef struct {
     h3_generation_progress *generation;
     h3_video_decoder_prefetch *prefetch;
+    const char *phase_prefix;
+    int prefetch_on_final_step;
 } h3_denoise_progress;
 
 static void h3_denoise_progress_bridge(const char *phase, int completed,
                                         int total, void *opaque) {
     h3_denoise_progress *progress = opaque;
-    if (!strcmp(phase, "denoise") && total > 0 && completed == total - 1)
+    if (progress->prefetch_on_final_step && !strcmp(phase, "denoise") &&
+        total > 0 && completed == total - 1)
         h3_video_decoder_prefetch_start(progress->prefetch);
-    h3_progress_emit(progress->generation, phase, completed, total);
+    if (!progress->phase_prefix) {
+        h3_progress_emit(progress->generation, phase, completed, total);
+        return;
+    }
+    char labeled[128];
+    if (!strcmp(phase, "denoise")) {
+        snprintf(labeled, sizeof(labeled), "%s", progress->phase_prefix);
+    } else if (!strcmp(phase, "refine text")) {
+        snprintf(labeled, sizeof(labeled), "%s text",
+                 progress->phase_prefix);
+    } else if (!strncmp(phase, "denoise ", 8)) {
+        snprintf(labeled, sizeof(labeled), "%s %s",
+                 progress->phase_prefix, phase + 8);
+    } else {
+        snprintf(labeled, sizeof(labeled), "%s %s",
+                 progress->phase_prefix, phase);
+    }
+    h3_progress_emit(progress->generation, labeled, completed, total);
 }
 
 /* Reference media goes through the system frameworks first, so no external
@@ -1260,6 +1351,23 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_live_preview live_preview;
     memset(&live_preview, 0, sizeof(live_preview));
     float *video = NULL, *audio = NULL;
+    float *audio_refine_noise = NULL;
+    float *audio_refine_frozen_video = NULL;
+    uint8_t *audio_refine_video_rows = NULL;
+    float *inpaint_source_pixels = NULL;
+    int inpaint_source_frames = 0;
+    float *inpaint_mask_pixels = NULL;
+    int inpaint_mask_frames = 0;
+    float *inpaint_source_pcm = NULL;
+    int inpaint_source_samples = 0;
+    uint8_t *inpaint_video_rows = NULL;
+    uint8_t *inpaint_audio_rows = NULL;
+    h3_video_latent inpaint_video_latent;
+    memset(&inpaint_video_latent, 0, sizeof(inpaint_video_latent));
+    h3_audio_latent inpaint_audio_latent;
+    memset(&inpaint_audio_latent, 0, sizeof(inpaint_audio_latent));
+    h3_dit_inpaint inpaint;
+    memset(&inpaint, 0, sizeof(inpaint));
     h3_video_frames frames;
     memset(&frames, 0, sizeof(frames));
     h3_audio_waveform waveform;
@@ -1324,6 +1432,21 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     char *audio_vae_path = h3_path(ctx->model_dir, optimized ?
         "vae/minimax_h3_audio_vae_fp32.safetensors" :
         (ref2va ? "Ref2VA/audio_vae" : "FL2VA/audio_vae"));
+    /* A local diagnostic can substitute only the transformer while retaining
+     * the selected package's tokenizer and VAEs. This makes BF16-vs-INT8
+     * parity tests possible without copying a 40 GB checkpoint into a second
+     * package. The app never sets this variable for ordinary generations. */
+    const char *dit_override = getenv("H3_DIT_PATH");
+    if (dit_override && *dit_override) {
+        char *overridden_path = strdup(dit_override);
+        if (!overridden_path) {
+            h3_set_error(ctx,
+                         "out of memory resolving the DiT diagnostic override");
+            goto cleanup;
+        }
+        free(dit_path);
+        dit_path = overridden_path;
+    }
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
         !audio_vae_path || (optimized && ref2va &&
                             (!full_ref_path || !hybrid_overlay_path))) {
@@ -1431,7 +1554,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
     }
     h3_progress_emit(&progress, "tokenizer", 0, 1);
-    tokenizer = h3_tokenizer_load(tokenizer_path, detail, sizeof(detail));
+    tokenizer = h3_tokenizer_load_minimax_h3(
+        tokenizer_path, detail, sizeof(detail));
     if (!tokenizer) {
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
@@ -1852,6 +1976,138 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             fprintf(stderr, "h3: conditioning cache miss; stored exact BF16\n");
     }
     }
+    if (params->source_video) {
+        if (!h3_read_video_f32(
+                params->source_video, render_width, render_height,
+                temporal.frame_count, &inpaint_source_pixels,
+                &inpaint_source_frames, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        if (inpaint_source_frames != temporal.frame_count) {
+            h3_set_error(ctx,
+                "source clip resolves to %d frames at 24 fps; this request needs %d",
+                inpaint_source_frames, temporal.frame_count);
+            goto cleanup;
+        }
+        if (params->inpaint_mask_is_video) {
+            if (!h3_read_video_f32(
+                    params->inpaint_mask, render_width, render_height,
+                    temporal.frame_count, &inpaint_mask_pixels,
+                    &inpaint_mask_frames, detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            if (inpaint_mask_frames != temporal.frame_count) {
+                h3_set_error(ctx,
+                    "video mask resolves to %d frames at 24 fps; the source has %d",
+                    inpaint_mask_frames, temporal.frame_count);
+                goto cleanup;
+            }
+        } else {
+            if (!h3_read_image_f32(
+                    params->inpaint_mask, render_width, render_height,
+                    H3_IMAGE_FIT_STRETCH, &inpaint_mask_pixels,
+                    detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            inpaint_mask_frames = 1;
+        }
+        if (!h3_video_vae_encode(
+                vae_path, "h3_shaders.metal", inpaint_source_pixels,
+                inpaint_source_frames, render_height, render_width,
+                h3_video_encoder_progress_bridge, &progress,
+                &inpaint_video_latent, detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        if (inpaint_video_latent.time != temporal.video_t ||
+            inpaint_video_latent.height != latent_h ||
+            inpaint_video_latent.width != latent_w) {
+            h3_set_error(ctx,
+                "source clip VAE produced unexpected latent geometry");
+            goto cleanup;
+        }
+        size_t target_video_rows = (size_t)temporal.video_t *
+            (size_t)(latent_h / 2) * (size_t)(latent_w / 2);
+        inpaint_video_rows = malloc(target_video_rows);
+        if (!inpaint_video_rows || !h3_inpaint_hard_mask_rows(
+                inpaint_mask_pixels, inpaint_mask_frames,
+                temporal.frame_count, render_height, render_width,
+                temporal.video_t, latent_h, latent_w,
+                inpaint_video_rows, target_video_rows,
+                detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", inpaint_video_rows ? detail :
+                         "out of memory reducing the inpainting mask");
+            goto cleanup;
+        }
+        inpaint.video_source = inpaint_video_latent.values;
+        inpaint.video_source_elements =
+            (size_t)24 * (size_t)temporal.video_t *
+            (size_t)latent_h * (size_t)latent_w;
+        inpaint.video_generate_rows = inpaint_video_rows;
+        inpaint.video_generate_count = target_video_rows;
+
+        if (params->preserve_source_audio) {
+            int wanted_samples = temporal.audio_t *
+                (32000 / H3_AUDIO_LATENT_FPS);
+            if (!h3_read_audio_f32(
+                    params->source_video, wanted_samples, 1,
+                    &inpaint_source_pcm, &inpaint_source_samples,
+                    detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            if (inpaint_source_samples != wanted_samples) {
+                float *padded = calloc(
+                    (size_t)2 * (size_t)wanted_samples, sizeof(*padded));
+                if (!padded) {
+                    h3_set_error(ctx,
+                        "out of memory padding the source soundtrack");
+                    goto cleanup;
+                }
+                int copied = inpaint_source_samples < wanted_samples
+                    ? inpaint_source_samples : wanted_samples;
+                for (int channel = 0; channel < 2; channel++)
+                    memcpy(padded + (size_t)channel * (size_t)wanted_samples,
+                           inpaint_source_pcm +
+                               (size_t)channel *
+                               (size_t)inpaint_source_samples,
+                           (size_t)copied * sizeof(*padded));
+                free(inpaint_source_pcm);
+                inpaint_source_pcm = padded;
+                inpaint_source_samples = wanted_samples;
+            }
+            if (!h3_audio_vae_encode(
+                    audio_vae_path, "h3_shaders.metal", inpaint_source_pcm,
+                    inpaint_source_samples,
+                    h3_audio_encoder_progress_bridge, &progress,
+                    &inpaint_audio_latent, detail, sizeof(detail))) {
+                h3_set_error(ctx, "%s", detail);
+                goto cleanup;
+            }
+            if (inpaint_audio_latent.channels != 32 ||
+                inpaint_audio_latent.stereo != 2 ||
+                inpaint_audio_latent.length != temporal.audio_t) {
+                h3_set_error(ctx,
+                    "source soundtrack VAE produced unexpected latent geometry");
+                goto cleanup;
+            }
+            size_t target_audio_rows = (size_t)2 * (size_t)temporal.audio_t;
+            inpaint_audio_rows = calloc(target_audio_rows, 1);
+            if (!inpaint_audio_rows) {
+                h3_set_error(ctx,
+                    "out of memory allocating the source audio mask");
+                goto cleanup;
+            }
+            inpaint.audio_source = inpaint_audio_latent.values;
+            inpaint.audio_source_elements =
+                (size_t)32 * (size_t)2 * (size_t)temporal.audio_t;
+            inpaint.audio_generate_rows = inpaint_audio_rows;
+            inpaint.audio_generate_count = target_audio_rows;
+        }
+    }
     if (conditioned && !h3_augment_conditions(
             params, ref2va, render_width, render_height, layout_references,
             condition_video_rows, condition_video_elements,
@@ -1913,7 +2169,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->lora_path, params->lora_strength,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
+            params->source_video ? &inpaint : NULL,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
+    } else if (params->source_video && params->preserve_source_audio) {
+    free(audio);
+    audio = NULL;
+    waveform.channels = 2;
+    waveform.samples = inpaint_source_samples;
+    waveform.sample_rate = 32000;
+    waveform.pcm = inpaint_source_pcm;
+    inpaint_source_pcm = NULL;
     } else {
         dit = h3_dit_load_t2va(
             dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
@@ -1944,7 +2209,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "%s", detail);
         goto cleanup;
     }
-    if (ctx->cache_enabled && !dit_is_cached) {
+    if (ctx->cache_enabled && !dit_is_cached &&
+        !params->audio_refine_steps) {
         char *key_copy = strdup(prepared_key);
         if (!key_copy) {
             fprintf(stderr, "h3: warning: could not retain prepared DiT key\n");
@@ -1955,11 +2221,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             fprintf(stderr, "h3: prepared DiT cache miss; model retained\n");
         }
     }
-    h3_text_embedding_free(&text);
-    free(condition_video_rows);
-    condition_video_rows = NULL;
-    free(condition_audio_rows);
-    condition_audio_rows = NULL;
+    if (!params->audio_refine_steps) {
+        h3_text_embedding_free(&text);
+        free(condition_video_rows);
+        condition_video_rows = NULL;
+        free(condition_audio_rows);
+        condition_audio_rows = NULL;
+    }
     if (progress.cancelled) goto cleanup;
     if (params->preview_denoise) {
         /* A packaged tiny autoencoder decodes previews in milliseconds with
@@ -2033,7 +2301,9 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     h3_rng_fill_normal(&audio_rng, audio, audio_count);
     h3_denoise_progress denoise_progress = {
         .generation = &progress,
-        .prefetch = &decoder_prefetch
+        .prefetch = &decoder_prefetch,
+        .phase_prefix = NULL,
+        .prefetch_on_final_step = !params->audio_refine_steps
     };
     if (!h3_dit_denoise_euler_preview(
             dit, video, audio, params->denoise_reuse,
@@ -2050,8 +2320,115 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         goto cleanup;
     }
-    if (!dit_is_cached) h3_dit_free(dit);
-    dit = NULL;
+    if (progress.cancelled) goto cleanup;
+    if (params->audio_refine_steps) {
+        /* A prepared DiT owns the full primary schedule and cannot be retimed
+         * in place. Release it before loading the short refinement schedule;
+         * retaining both would add roughly a complete transformer's residency
+         * on the weak machines this experiment is intended to help. */
+        if (dit_is_cached) {
+            ctx->dit = NULL;
+            free(ctx->dit_key);
+            ctx->dit_key = NULL;
+            dit_is_cached = 0;
+        }
+        h3_dit_free(dit);
+        dit = NULL;
+
+        h3_sigma_schedule refine_sigmas;
+        if (!h3_audio_refine_schedule_build(
+                params->audio_refine_steps, &refine_sigmas)) {
+            h3_set_error(ctx, "cannot construct the audio refinement schedule");
+            goto cleanup;
+        }
+        audio_refine_noise = malloc(audio_count * sizeof(*audio_refine_noise));
+        audio_refine_frozen_video = malloc(
+            video_count * sizeof(*audio_refine_frozen_video));
+        audio_refine_video_rows = calloc(layout.img_target_rows, 1);
+        if (!audio_refine_noise || !audio_refine_frozen_video ||
+            !audio_refine_video_rows) {
+            h3_set_error(ctx,
+                "out of memory preparing audio-only refinement");
+            goto cleanup;
+        }
+        memcpy(audio_refine_frozen_video, video,
+               video_count * sizeof(*audio_refine_frozen_video));
+        h3_dit_inpaint audio_refine_inpaint = {
+            .video_source = audio_refine_frozen_video,
+            .video_source_elements = video_count,
+            .video_generate_rows = audio_refine_video_rows,
+            .video_generate_count = layout.img_target_rows
+        };
+        h3_denoise_progress refine_progress = {
+            .generation = &progress,
+            .prefetch = &decoder_prefetch,
+            .phase_prefix = "audio refine",
+            .prefetch_on_final_step = 1
+        };
+        dit = h3_dit_load_conditioned(
+            dit_path, use_hybrid ? hybrid_overlay_path : NULL,
+            "h3_shaders.metal", &text, &layout, &refine_sigmas,
+            (unsigned)params->dit_layers, 1, 0, dit_ssd_streaming,
+            spatial_rope_scale,
+            params->use_slower_bf16_mlp,
+            params->use_slower_bf16_qkv,
+            params->use_slower_bf16_attention_output,
+            params->use_slower_row_major_attention_output,
+            params->use_slower_unfused_int8_inputs,
+            params->use_slower_unfused_qkv_rope,
+            params->use_slower_scalar_qkv_rms,
+            params->use_slower_uncached_int8_scales,
+            params->use_slower_dynamic_fc1_k,
+            params->use_slower_grouped_quantizer,
+            params->use_int8_row_fc2,
+            params->lora_path, params->lora_strength,
+            condition_video_rows, condition_video_elements,
+            condition_audio_rows, condition_audio_elements,
+            &audio_refine_inpaint,
+            h3_denoise_progress_bridge, &refine_progress,
+            detail, sizeof(detail));
+        if (!dit) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        h3_text_embedding_free(&text);
+        free(condition_video_rows);
+        condition_video_rows = NULL;
+        free(condition_audio_rows);
+        condition_audio_rows = NULL;
+        free(audio_refine_video_rows);
+        audio_refine_video_rows = NULL;
+
+        h3_rng_seed(&audio_rng, params->seed);
+        h3_rng_fill_normal(&audio_rng, audio_refine_noise, audio_count);
+        if (!h3_flow_renoise(audio, audio_refine_noise, audio_count,
+                             refine_sigmas.audio[0])) {
+            h3_set_error(ctx, "cannot re-noise the audio refinement latent");
+            goto cleanup;
+        }
+        if (!h3_dit_denoise_euler(
+                dit, video, audio, 1,
+                h3_denoise_progress_bridge, &refine_progress,
+                detail, sizeof(detail))) {
+            h3_set_error(ctx, "%s", detail);
+            goto cleanup;
+        }
+        if (memcmp(video, audio_refine_frozen_video,
+                   video_count * sizeof(*video))) {
+            h3_set_error(ctx,
+                "audio refinement changed the frozen video latent");
+            goto cleanup;
+        }
+        h3_dit_free(dit);
+        dit = NULL;
+        free(audio_refine_noise);
+        audio_refine_noise = NULL;
+        free(audio_refine_frozen_video);
+        audio_refine_frozen_video = NULL;
+    } else {
+        if (!dit_is_cached) h3_dit_free(dit);
+        dit = NULL;
+    }
     if (progress.cancelled) goto cleanup;
     if (decoder_prefetch.attempted) {
         h3_progress_emit(&progress, "video VAE load", 0, 36);
@@ -2175,6 +2552,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         output_width = params->width;
         output_height = params->height;
     }
+    if (params->source_video && !h3_inpaint_composite_rgb24(
+            rgb8, output_frames, output_height, output_width,
+            inpaint_source_pixels, inpaint_mask_pixels, inpaint_mask_frames,
+            detail, sizeof(detail))) {
+        h3_set_error(ctx, "%s", detail);
+        goto cleanup;
+    }
     if (params->on_frame) {
         size_t frame_bytes = (size_t)output_width * (size_t)output_height * 3;
         for (int index = 0; index < frames.frames; index++) {
@@ -2262,6 +2646,16 @@ cleanup:
     if (!dit_is_cached) h3_dit_free(dit);
     if (!decoder_is_cached) h3_video_vae_decoder_free(preview_decoder);
     h3_tae_free(preview_tae);
+    free(inpaint_source_pixels);
+    free(inpaint_mask_pixels);
+    free(inpaint_source_pcm);
+    free(inpaint_video_rows);
+    free(inpaint_audio_rows);
+    h3_video_latent_free(&inpaint_video_latent);
+    h3_audio_latent_free(&inpaint_audio_latent);
+    free(audio_refine_noise);
+    free(audio_refine_frozen_video);
+    free(audio_refine_video_rows);
     free(video); free(audio); free(rgb8);
     h3_video_frames_free(&frames);
     h3_audio_waveform_free(&waveform);

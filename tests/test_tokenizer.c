@@ -34,7 +34,8 @@ int main(int argc, char **argv) {
     const char *path = argc > 1 ? argv[1] :
                                   "MiniMax-H3/tokenizer/tokenizer.json";
     char error[512];
-    h3_tokenizer *tokenizer = h3_tokenizer_load(path, error, sizeof(error));
+    h3_tokenizer *tokenizer = h3_tokenizer_load_minimax_h3(
+        path, error, sizeof(error));
     if (!tokenizer) {
         fprintf(stderr, "FAIL tests/test_tokenizer.c: %s\n", error);
         return 1;
@@ -51,6 +52,12 @@ int main(int argc, char **argv) {
                sizeof(emoji) / sizeof(emoji[0]));
     const uint32_t special[] = {151644};
     check_case(tokenizer, "<|im_start|>", special, 1);
+    const uint32_t h3_special[] = {151669, 151670, 151671, 151672,
+                                   151673, 151674, 151675};
+    check_case(tokenizer,
+               "<d></d><|cutoff|><|lyrics_start|><|lyrics_end|>"
+               "<|caption_start|><|caption_end|>",
+               h3_special, sizeof(h3_special) / sizeof(h3_special[0]));
     const uint32_t cinematic[] = {32, 64665, 3265, 5239, 315, 264, 8866,
                                   1778, 11958, 4633, 10971, 13};
     check_case(tokenizer,
@@ -68,6 +75,7 @@ int main(int argc, char **argv) {
     h3_tokenizer_ids_free(ids);
 
     h3_tokenizer_free(tokenizer);
-    printf("ok: %d tokenizer checks against released Qwen vocabulary\n", checks);
+    printf("ok: %d tokenizer checks against released MiniMax H3 vocabulary\n",
+           checks);
     return 0;
 }

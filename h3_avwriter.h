@@ -12,7 +12,7 @@
 int h3_avwriter_available(void);
 
 /* Same contract as h3_ffmpeg_write_av_rgb24_f32: tightly packed RGB24 frames
- * and interleaved F32 PCM to an MP4. Passing no audio writes video only. */
+ * and channel-major F32 PCM to an MP4. Passing no audio writes video only. */
 int h3_avwriter_write_av_rgb24_f32(const char *path, const uint8_t *frames,
                                    int frame_count, int width, int height,
                                    int fps, const float *pcm, int samples,
