@@ -13,6 +13,9 @@
 #define H3_DIT_TIME_DIM 2688u
 #define H3_DIT_MODALITIES 3u
 #define H3_DIT_ADALN_SLOTS 6u
+#define H3_FASTH3_MIN_SHORT_EDGE 480
+#define H3_FASTH3_MIN_FRAMES 124
+#define H3_FASTH3_MAX_FRAMES 362
 
 typedef struct h3_dit_schedule h3_dit_schedule;
 
@@ -46,6 +49,19 @@ double h3_dit_schedule_gate_score(const h3_dit_schedule *schedule,
 void h3_dit_schedule_prune(h3_dit_schedule *schedule,
                            const uint8_t *active_blocks, size_t count);
 const h3_gpu_tensor *h3_dit_schedule_final(const h3_dit_schedule *schedule);
+
+/* Whether an exact precomputed FastH3 table describes this request. The v1
+ * table is deliberately narrow: four serving-grid evaluations, no visual or
+ * audio conditioning rows, and the seven stored T2VA timestep rows in the
+ * same order prepare_rows assigns them. */
+int h3_dit_fasth3_schedule_compatible(
+    const h3_sigma_schedule *sigmas, int visual_condition,
+    int audio_condition, const float *stored_times, size_t stored_count);
+
+/* FastH3 Preview v1 was released for 5--15 second clips and a minimum
+ * 480-pixel short edge. Tiny native plumbing shapes execute but do not remain
+ * on the checkpoint's trained image distribution. */
+int h3_dit_fasth3_shape_compatible(int width, int height, int frames);
 
 /* Build the row map consumed by the fused AdaLN/gate kernels. text_tags may be
  * NULL (all tag 1), or one tag per text row. Qwen vision presentation spans use

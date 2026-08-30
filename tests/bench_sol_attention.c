@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    char error[512];
+    char error[8192];
     h3_gpu *gpu = h3_gpu_create(shaders, error, sizeof(error));
     if (!gpu) {
         fprintf(stderr, "FAIL Sol-Attn Metal setup: %s\n", error);

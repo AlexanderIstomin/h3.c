@@ -1,6 +1,7 @@
 #include "h3_host.h"
 #include "h3_checkpoint.h"
 #include "h3_dit.h"
+#include "h3_dit_schedule.h"
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
@@ -26,6 +27,33 @@ static int tests_run;
 
 static int close_enough(double value, double expected, double tolerance) {
     return fabs(value - expected) <= tolerance;
+}
+
+static void test_vsa_tile64_geometry(void) {
+    const uint32_t prefix[] = {70, 5, 130};
+    h3_vsa_geometry geometry;
+    char error[256];
+    CHECK(h3_vsa_geometry_build(prefix, 3, 9, 10, 13, &geometry,
+                                error, sizeof(error)));
+    CHECK(geometry.sequence == 205 + 9 * 10 * 13);
+    CHECK(geometry.prefix_tiles == 6);
+    CHECK(geometry.video_tiles == 3 * 3 * 4);
+    CHECK(geometry.tiles == 42);
+    const uint32_t expected_prefix[] = {64, 6, 5, 64, 64, 2};
+    CHECK(memcmp(geometry.block_sizes, expected_prefix,
+                 sizeof(expected_prefix)) == 0);
+    CHECK(geometry.block_sizes[geometry.tiles - 1] == 2);
+    for (uint32_t row = 0; row < geometry.sequence; row++) {
+        uint32_t tiled = geometry.packed_to_tiled[row];
+        CHECK(tiled < geometry.padded_rows);
+        CHECK(geometry.tiled_to_packed[tiled] == row);
+        CHECK(tiled % 64u < geometry.block_sizes[tiled / 64u]);
+    }
+    uint32_t first_video = 205;
+    uint32_t t = 8, h = 9, w = 12;
+    uint32_t corner = first_video + (t * 10 + h) * 13 + w;
+    CHECK(geometry.packed_to_tiled[corner] / 64u == geometry.tiles - 1);
+    h3_vsa_geometry_free(&geometry);
 }
 
 static void test_temporal_and_canvas(void) {
@@ -77,6 +105,11 @@ static void test_schedule(void) {
     CHECK(defaults.steps == 20);
     CHECK(defaults.use_reference_rope == 0);
     CHECK(defaults.audio_refine_steps == 0);
+    CHECK(!h3_dit_fasth3_shape_compatible(256, 256, 124));
+    CHECK(!h3_dit_fasth3_shape_compatible(512, 512, 22));
+    CHECK(h3_dit_fasth3_shape_compatible(832, 480, 124));
+    CHECK(h3_dit_fasth3_shape_compatible(512, 512, 362));
+    CHECK(!h3_dit_fasth3_shape_compatible(512, 512, 379));
 
     h3_sigma_schedule schedule;
     CHECK(h3_schedule_build(20, &schedule));
@@ -116,12 +149,33 @@ static void test_schedule(void) {
     CHECK(close_enough(schedule.video[1], 36.0 / 37.0, 1e-7));
     CHECK(close_enough(schedule.audio[1], 9.0 / 10.0, 1e-7));
     CHECK(schedule.video[4] == 0.0f && schedule.audio[4] == 0.0f);
+    const float fasth3_times[] = {
+        0.0f, 1.0f / 37.0f, 0.1f, 1.0f / 13.0f,
+        0.25f, 0.2f, 0.5f
+    };
+    CHECK(h3_dit_fasth3_schedule_compatible(
+        &schedule, 0, 0, fasth3_times,
+        sizeof(fasth3_times) / sizeof(*fasth3_times)));
+    CHECK(!h3_dit_fasth3_schedule_compatible(
+        &schedule, 1, 0, fasth3_times,
+        sizeof(fasth3_times) / sizeof(*fasth3_times)));
+    float wrong_times[7];
+    memcpy(wrong_times, fasth3_times, sizeof(wrong_times));
+    wrong_times[3] += 0.01f;
+    CHECK(!h3_dit_fasth3_schedule_compatible(
+        &schedule, 0, 0, wrong_times,
+        sizeof(wrong_times) / sizeof(*wrong_times)));
     for (int index = 0; index < schedule.steps; index++) {
         CHECK(schedule.video[index] > schedule.video[index + 1]);
         CHECK(schedule.audio[index] > schedule.audio[index + 1]);
     }
     CHECK(!h3_serving_schedule_build(1, &schedule));
     CHECK(!h3_serving_schedule_build(H3_MAX_STEPS + 1, &schedule));
+
+    CHECK(h3_beta_schedule_build(4, &schedule));
+    CHECK(!h3_dit_fasth3_schedule_compatible(
+        &schedule, 0, 0, fasth3_times,
+        sizeof(fasth3_times) / sizeof(*fasth3_times)));
 
     CHECK(h3_audio_refine_schedule_build(2, &schedule));
     CHECK(schedule.steps == 2);
@@ -346,6 +400,27 @@ static void write_probe_fixture(const char *path, const char *tensor_name) {
     CHECK(close(descriptor) == 0);
 }
 
+static void write_u32_probe_fixture(const char *path, const char *tensor_name,
+                                    uint32_t payload) {
+    int descriptor = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    CHECK(descriptor >= 0);
+    char json[512];
+    int json_length = snprintf(
+        json, sizeof(json),
+        "{\"%s\":{\"dtype\":\"U32\",\"shape\":[1],"
+        "\"data_offsets\":[0,4]}}",
+        tensor_name);
+    CHECK(json_length > 0 && (size_t)json_length < sizeof(json));
+    uint64_t length = (uint64_t)json_length;
+    unsigned char prefix[8];
+    for (unsigned index = 0; index < 8; index++)
+        prefix[index] = (unsigned char)(length >> (8 * index));
+    write_all(descriptor, prefix, sizeof(prefix));
+    write_all(descriptor, json, (size_t)json_length);
+    write_all(descriptor, &payload, sizeof(payload));
+    CHECK(close(descriptor) == 0);
+}
+
 static void test_optimized_model_probe(void) {
     char root[] = "/tmp/h3_optimized_probe_XXXXXX";
     CHECK(mkdtemp(root) != NULL);
@@ -389,6 +464,7 @@ static void test_optimized_model_probe(void) {
     char error[512];
     CHECK(h3_probe_model_dir(root, &model, error, sizeof(error)));
     CHECK(model.layout == H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE);
+    CHECK(model.generation_profile == H3_MODEL_PROFILE_STANDARD);
     CHECK(model.generation_supported == 1);
     CHECK(model.text_encoder.files == 1 && model.text_encoder.tensors == 1);
     CHECK(model.fl2va_transformer.files == 1 &&
@@ -402,6 +478,19 @@ static void test_optimized_model_probe(void) {
     CHECK(h3_model(context)->layout ==
           H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE);
     h3_free(context);
+
+    CHECK(unlink(paths[0]) == 0);
+    write_u32_probe_fixture(paths[0], "h3.fasth3.version", 3);
+    CHECK(!h3_probe_model_dir(root, &model, error, sizeof(error)));
+    CHECK(strstr(error, "unsupported FastH3 package version 3") != NULL);
+    CHECK(unlink(paths[0]) == 0);
+    write_u32_probe_fixture(paths[0], "h3.fasth3.version", 2);
+    CHECK(!h3_probe_model_dir(root, &model, error, sizeof(error)));
+    CHECK(strstr(error, "FastH3 VSA package") != NULL);
+    CHECK(unlink(paths[0]) == 0);
+    write_u32_probe_fixture(paths[0], "h3.fasth3.version", 1);
+    CHECK(h3_probe_model_dir(root, &model, error, sizeof(error)));
+    CHECK(model.generation_profile == H3_MODEL_PROFILE_FASTH3);
 
     char hybrid[768];
     CHECK(snprintf(
@@ -606,6 +695,7 @@ static void test_checkpoint_round_trip(void) {
 
 int main(void) {
     test_temporal_and_canvas();
+    test_vsa_tile64_geometry();
     test_schedule();
     test_dit_reuse_schedule();
     test_layout_tiny();

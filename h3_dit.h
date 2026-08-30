@@ -10,6 +10,28 @@
 
 typedef struct h3_dit h3_dit;
 
+/* Exact VSA-H3 tile-64 geometry. Prefix segments are chunked independently,
+ * then the generated-video tail is packed in 4x4x4 (time, height, width)
+ * tiles. `packed_to_tiled` and `tiled_to_packed` are inverse on valid rows;
+ * padded slots in the latter are UINT32_MAX. */
+typedef struct {
+    uint32_t sequence;
+    uint32_t padded_rows;
+    uint32_t tiles;
+    uint32_t prefix_tiles;
+    uint32_t video_tiles;
+    uint32_t *packed_to_tiled;
+    uint32_t *tiled_to_packed;
+    uint32_t *block_sizes;
+} h3_vsa_geometry;
+
+int h3_vsa_geometry_build(const uint32_t *prefix_segments,
+                          size_t prefix_segment_count,
+                          uint32_t video_t, uint32_t video_h,
+                          uint32_t video_w, h3_vsa_geometry *geometry,
+                          char *error, size_t error_size);
+void h3_vsa_geometry_free(h3_vsa_geometry *geometry);
+
 /* Optional target rows that are partly supplied by source media. A generate
  * mask value of one follows the normal denoising schedule; zero pins the row
  * to clean conditioning and writes the encoded source back after every step.

@@ -405,6 +405,17 @@ block regardless of the approximation threshold, and compares the result
 against dense attention. Synthetic speedups are not a substitute for a
 matched end-to-end quality comparison with real H3 activations.
 
+FastH3 VSA is separate from that experiment and is selected only by a
+validated format-2 checkpoint. It uses the checkpoint's learned gate plus the
+published segment-pure/4x4x4 tile geometry and cannot fall back to Sol or dense
+attention without changing the trained model. Its deterministic ragged-tile
+GPU-vs-CPU parity check is:
+
+```sh
+make h3_vsa_attention_bench
+./h3_vsa_attention_bench h3_shaders.metal
+```
+
 ### 8. Add image, video, and audio references
 
 First/last-frame anchors select the FL2VA path:

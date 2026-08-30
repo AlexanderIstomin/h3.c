@@ -3,6 +3,7 @@
 #include "h3_checkpoint.h"
 #include "h3_host.h"
 #include "h3_dit.h"
+#include "h3_dit_schedule.h"
 #include "h3_inpaint.h"
 #include "h3_ffmpeg.h"
 #include "h3_avwriter.h"
@@ -35,6 +36,56 @@ static const char h3_optimized_ref_transformer[] =
 static const char h3_optimized_hybrid_adaln[] =
     "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot_"
     "hybrid_adaln_25_49.safetensors";
+
+static int h3_probe_fasth3_vsa(const h3_st_header *header,
+                               char *error, size_t error_size) {
+    const h3_st_tensor *tile = h3_st_find(
+        header, "h3.fasth3.vsa.tile_size");
+    const h3_st_tensor *sparsity = h3_st_find(
+        header, "h3.fasth3.vsa.sparsity");
+    uint32_t tile_size = 0;
+    float sparsity_value = 0.0f;
+    if (!tile || tile->dtype != H3_DTYPE_U32 || tile->ndim != 1 ||
+        tile->shape[0] != 1 ||
+        !h3_st_read_data(header, tile, &tile_size, sizeof(tile_size),
+                         error, error_size) || tile_size != 64 ||
+        !sparsity || sparsity->dtype != H3_DTYPE_F32 ||
+        sparsity->ndim != 1 || sparsity->shape[0] != 1 ||
+        !h3_st_read_data(header, sparsity, &sparsity_value,
+                         sizeof(sparsity_value), error, error_size) ||
+        fabsf(sparsity_value - 0.9f) > 1.0e-6f) {
+        if (error && error_size && !error[0])
+            snprintf(error, error_size,
+                     "FastH3 VSA package requires tile size 64 and sparsity 0.9");
+        return 0;
+    }
+    for (unsigned block = 0; block < 50; block++) {
+        char name[128];
+        snprintf(name, sizeof(name),
+                 "blocks.%u.attn.vsa_gate.weight", block);
+        const h3_st_tensor *gate = h3_st_find(header, name);
+        if (!gate || gate->dtype != H3_DTYPE_I8 || gate->ndim != 2 ||
+            gate->shape[0] != 5376 || gate->shape[1] != 7168) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "FastH3 VSA gate has the wrong schema: %s", name);
+            return 0;
+        }
+        snprintf(name, sizeof(name),
+                 "blocks.%u.attn.vsa_gate.weight_scale", block);
+        const h3_st_tensor *scale = h3_st_find(header, name);
+        if (!scale || scale->dtype != H3_DTYPE_F32 ||
+            !((scale->ndim == 1 && scale->shape[0] == 7168) ||
+              (scale->ndim == 2 && scale->shape[0] == 7168 &&
+               scale->shape[1] == 1))) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "FastH3 VSA gate scale has the wrong schema: %s", name);
+            return 0;
+        }
+    }
+    return 1;
+}
 
 typedef struct {
     char *text;
@@ -497,6 +548,42 @@ static int h3_probe_optimized_int8(const char *root, h3_model_info *model,
                            &model->video_vae, error, error_size) ||
         !h3_inventory_root(root, audio_vae, 1,
                            &model->audio_vae, error, error_size)) return 0;
+    char *transformer_path = h3_path(root, h3_optimized_fl_transformer);
+    if (!transformer_path) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "out of memory resolving transformer profile");
+        return 0;
+    }
+    h3_st_header transformer_header;
+    int read_header = h3_st_read_header(
+        transformer_path, &transformer_header, error, error_size);
+    free(transformer_path);
+    if (!read_header) return 0;
+    const h3_st_tensor *fasth3 = h3_st_find(
+        &transformer_header, "h3.fasth3.version");
+    if (fasth3) {
+        uint32_t version = 0;
+        if (fasth3->dtype != H3_DTYPE_U32 || fasth3->ndim != 1 ||
+            fasth3->shape[0] != 1 ||
+            !h3_st_read_data(&transformer_header, fasth3, &version,
+                             sizeof(version), error, error_size) ||
+            (version != 1 && version != 2)) {
+            if (error && error_size &&
+                (!error[0] || (version != 1 && version != 2)))
+                snprintf(error, error_size,
+                         "unsupported FastH3 package version %u", version);
+            h3_st_free_header(&transformer_header);
+            return 0;
+        }
+        if (version == 2 &&
+            !h3_probe_fasth3_vsa(&transformer_header, error, error_size)) {
+            h3_st_free_header(&transformer_header);
+            return 0;
+        }
+        model->generation_profile = H3_MODEL_PROFILE_FASTH3;
+    }
+    h3_st_free_header(&transformer_header);
     /* Ordered references need the companion Ref2VA checkpoint. A package
      * without it is still complete for every other mode, so its absence rules
      * out that one mode rather than the package. */
@@ -1357,6 +1444,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
                                                params->width;
     int render_height = params->render_height ? params->render_height :
                                                  params->height;
+    if (ctx->model.generation_profile == H3_MODEL_PROFILE_FASTH3 &&
+        !h3_dit_fasth3_shape_compatible(
+            render_width, render_height, params->frames)) {
+        h3_set_error(ctx,
+            "FastH3 Preview v1 requires a short edge of at least %d pixels "
+            "and %d..%d frames",
+            H3_FASTH3_MIN_SHORT_EDGE, H3_FASTH3_MIN_FRAMES,
+            H3_FASTH3_MAX_FRAMES);
+        return NULL;
+    }
     /* Stills ride the trained 5-frame first chunk, the shortest legal clip
      * — about a third of the 22-frame sequence cost. Video and audio jobs
      * keep the full-chunk floor. */

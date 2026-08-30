@@ -11,7 +11,11 @@ enum {
     COMPACT_TIME_INPUT = 8,
     TIME_HIDDEN = 5376,
     BLOCK_OUTPUT = H3_DIT_MODALITIES * H3_DIT_ADALN_SLOTS * H3_DIT_HIDDEN,
-    FINAL_OUTPUT = 2 * H3_DIT_HIDDEN
+    FINAL_OUTPUT = 2 * H3_DIT_HIDDEN,
+    FASTH3_DENSE_VERSION = 1,
+    FASTH3_VSA_VERSION = 2,
+    FASTH3_STEPS = 4,
+    FASTH3_TIME_ROWS = 7
 };
 
 struct h3_dit_schedule {
@@ -90,6 +94,121 @@ static h3_gpu_tensor *weight_f16_f32_2d(
 static void free_tensor(h3_gpu_tensor **tensor) {
     h3_gpu_tensor_free(*tensor);
     *tensor = NULL;
+}
+
+int h3_dit_fasth3_schedule_compatible(
+    const h3_sigma_schedule *sigmas, int visual_condition,
+    int audio_condition, const float *stored_times, size_t stored_count) {
+    if (!sigmas || sigmas->steps != FASTH3_STEPS || visual_condition ||
+        audio_condition || !stored_times || stored_count != FASTH3_TIME_ROWS)
+        return 0;
+    float actual[FASTH3_TIME_ROWS];
+    size_t count = 0;
+    for (int step = 0; step < sigmas->steps; step++) {
+        float video = 1.0f - sigmas->video[step];
+        float audio = 1.0f - sigmas->audio[step];
+        if (video == audio) {
+            actual[count++] = video;
+        } else if (video < audio) {
+            actual[count++] = video;
+            actual[count++] = audio;
+        } else {
+            actual[count++] = audio;
+            actual[count++] = video;
+        }
+    }
+    if (count != stored_count) return 0;
+    for (size_t index = 0; index < count; index++)
+        if (!isfinite(stored_times[index]) ||
+            fabsf(actual[index] - stored_times[index]) > 2e-6f) return 0;
+    return 1;
+}
+
+int h3_dit_fasth3_shape_compatible(int width, int height, int frames) {
+    int short_edge = width < height ? width : height;
+    return short_edge >= H3_FASTH3_MIN_SHORT_EDGE &&
+           frames >= H3_FASTH3_MIN_FRAMES &&
+           frames <= H3_FASTH3_MAX_FRAMES;
+}
+
+static int read_u32_marker(const h3_weight_store *weights, const char *name,
+                           uint32_t *value, char *error,
+                           size_t error_size) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(weights, name, &header);
+    unsigned char bytes[4];
+    if (!tensor || !header || tensor->dtype != H3_DTYPE_U32 ||
+        tensor->ndim != 1 || tensor->shape[0] != 1 ||
+        !h3_st_read_data(header, tensor, bytes, sizeof(bytes),
+                         error, error_size)) {
+        if (!error || !error[0])
+            fail(error, error_size, "invalid FastH3 marker: %s", name);
+        return 0;
+    }
+    *value = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
+             ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
+    return 1;
+}
+
+static int load_fasth3_schedule(
+    h3_dit_schedule *schedule, const h3_weight_store *weights,
+    const h3_weight_store *late_adaln_overlay, const h3_sigma_schedule *sigmas,
+    int visual_condition, int audio_condition, const float *actual_times,
+    h3_dit_schedule_progress progress, void *progress_opaque,
+    char *error, size_t error_size) {
+    uint32_t version = 0, steps = 0;
+    if (!read_u32_marker(weights, "h3.fasth3.version", &version,
+                         error, error_size) ||
+        !read_u32_marker(weights, "h3.fasth3.steps", &steps,
+                         error, error_size) ||
+        (version != FASTH3_DENSE_VERSION && version != FASTH3_VSA_VERSION) ||
+        steps != FASTH3_STEPS) {
+        if (!error || !error[0])
+            fail(error, error_size,
+                 "unsupported FastH3 table version or step count");
+        return 0;
+    }
+    if (late_adaln_overlay) {
+        fail(error, error_size,
+             "FastH3 Preview v1 cannot use a reference AdaLN overlay");
+        return 0;
+    }
+    float stored_times[FASTH3_TIME_ROWS];
+    const h3_st_header *times_header = NULL;
+    const h3_st_tensor *times = h3_weight_find(
+        weights, "h3.fasth3.times", &times_header);
+    if (!times || !times_header || times->dtype != H3_DTYPE_F32 ||
+        times->ndim != 1 || times->shape[0] != FASTH3_TIME_ROWS ||
+        !h3_st_read_data(times_header, times, stored_times,
+                         sizeof(stored_times), error, error_size) ||
+        !h3_dit_fasth3_schedule_compatible(
+            sigmas, visual_condition, audio_condition, stored_times,
+            FASTH3_TIME_ROWS)) {
+        if (!error || !error[0])
+            fail(error, error_size,
+                 "FastH3 Preview v1 requires its exact four-step T2VA serving schedule");
+        return 0;
+    }
+    for (size_t index = 0; index < FASTH3_TIME_ROWS; index++)
+        if (fabsf(stored_times[index] - actual_times[index]) > 2e-6f) {
+            fail(error, error_size,
+                 "FastH3 stored timestep rows do not match the request");
+            return 0;
+        }
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++) {
+        char name[96];
+        snprintf(name, sizeof(name), "h3.fasth3.blocks.%u.adaln", block);
+        schedule->blocks[block] = weight_bf16_2d(
+            weights, schedule->gpu, name, FASTH3_TIME_ROWS, BLOCK_OUTPUT,
+            error, error_size);
+        if (!schedule->blocks[block]) return 0;
+        if (progress) progress((int)block + 1, (int)H3_DIT_BLOCKS,
+                               progress_opaque);
+    }
+    schedule->final = weight_bf16_2d(
+        weights, schedule->gpu, "h3.fasth3.final.adaln",
+        FASTH3_TIME_ROWS, FINAL_OUTPUT, error, error_size);
+    return schedule->final != NULL;
 }
 
 static int prepare_rows(h3_dit_schedule *schedule,
@@ -374,6 +493,16 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     float *times = NULL;
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
                       &times, error, error_size)) goto failed;
+    if (h3_weight_find(weights, "h3.fasth3.version", NULL)) {
+        int ok = load_fasth3_schedule(
+            schedule, weights, late_adaln_overlay, sigmas, visual_condition,
+            audio_condition, times, progress, progress_opaque,
+            error, error_size);
+        free(times);
+        times = NULL;
+        if (!ok) goto failed;
+        return schedule;
+    }
     int compact = h3_weight_find(weights, "adaln_t_table", NULL) != NULL;
     h3_gpu_tensor *time = compact ?
         compact_time_curve(weights, gpu, schedule->time_rows, times,

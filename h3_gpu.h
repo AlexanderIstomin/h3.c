@@ -35,6 +35,11 @@ typedef struct {
 
 h3_gpu *h3_gpu_create(const char *shader_source_path,
                       char *error, size_t error_size);
+/* VSA-H3 packages require the separately compiled sparse-attention library.
+ * Ordinary contexts keep avoiding its template-heavy compile cost. */
+h3_gpu *h3_gpu_create_with_sparse_attention(
+                      const char *shader_source_path,
+                      char *error, size_t error_size);
 /* Compile or load the process-wide Metal library. Safe to call repeatedly;
  * later GPU contexts reuse the same device, library, and pipelines. Missing
  * shader files return success so handshake can run without weights. */
@@ -45,6 +50,7 @@ int h3_gpu_is_m5(const h3_gpu *gpu);
 int h3_gpu_has_nax_mlp(const h3_gpu *gpu);
 int h3_gpu_has_int8_mlp(const h3_gpu *gpu);
 int h3_gpu_has_sol_attention(const h3_gpu *gpu);
+int h3_gpu_has_vsa_attention(const h3_gpu *gpu);
 
 h3_gpu_tensor *h3_gpu_tensor_new_f32(h3_gpu *gpu, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_new_f16(h3_gpu *gpu, size_t elements);
@@ -711,6 +717,26 @@ int h3_gpu_sol_attention_bf16(
                                 uint32_t head_dim, uint32_t sink_tokens,
                                 float scale, float tau,
                                 int head_major_output);
+/* Learned VSA-H3 tile-64 attention. Q/K/V/gate arrive in the packed H3 row
+ * order. The implementation tiles them, pools in FP32 using true ragged tile
+ * sizes, selects the top video keys, evaluates exact sparse token attention,
+ * and adds the checkpoint's gated pooled-compression branch. */
+int h3_gpu_vsa_attention_bf16(
+                                h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *query,
+                                const h3_gpu_tensor *key,
+                                const h3_gpu_tensor *value,
+                                const h3_gpu_tensor *gate,
+                                h3_gpu_tensor *tiled_qkvg,
+                                h3_gpu_tensor *pooled_qkv,
+                                h3_gpu_tensor *selected_video_tiles,
+                                const h3_gpu_tensor *block_sizes,
+                                const h3_gpu_tensor *tiled_to_packed,
+                                uint32_t sequence, uint32_t padded_rows,
+                                uint32_t tiles, uint32_t prefix_tiles,
+                                uint32_t video_tiles, uint32_t topk,
+                                uint32_t heads, uint32_t head_dim,
+                                float scale);
 /* Materialize Sol-Attn's block routing mask for calibration. This is kept
  * separate from the production kernel so ordinary generations never allocate
  * sequence-squared diagnostics or pay for readback. Call it after

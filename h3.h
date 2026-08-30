@@ -209,6 +209,11 @@ typedef enum {
     H3_MODEL_LAYOUT_OPTIMIZED_INT8_SINGLE_FILE = 2
 } h3_model_layout;
 
+typedef enum {
+    H3_MODEL_PROFILE_STANDARD = 0,
+    H3_MODEL_PROFILE_FASTH3 = 1
+} h3_model_profile;
+
 typedef struct {
     h3_component_info text_encoder;
     h3_component_info fl2va_transformer;
@@ -216,6 +221,7 @@ typedef struct {
     h3_component_info video_vae;
     h3_component_info audio_vae;
     h3_model_layout layout;
+    h3_model_profile generation_profile;
     int generation_supported;
 } h3_model_info;
 

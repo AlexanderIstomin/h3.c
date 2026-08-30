@@ -64,6 +64,14 @@ Copyright (c) 2025 Comfy Org. All rights reserved.
 
 Source and license: https://github.com/Comfy-Org/comfy-kitchen
 
+The learned VSA-H3 tile geometry, top-k selection, sparse-attention mask, and
+pooled compression-gate semantics in `h3_dit.c` and
+`h3_sol_attention.metal` are adapted from FastVideo's
+`video_sparse_attn_h3.py` at commit
+`b2db0c0a137e610fa2406d942a3c32c0179f047c`, distributed under the Apache
+License 2.0. Source and license:
+https://github.com/hao-ai-lab/FastVideo
+
 The experimental Sol-Attn routing and tiled attention implementation in
 `h3_sol_attention.metal` is adapted from `ComfyUI-SolAttn-MPS` at commit
 `45071126b0c1ee30b0e6b7103fa9d70924828ba5`, distributed under the MIT
